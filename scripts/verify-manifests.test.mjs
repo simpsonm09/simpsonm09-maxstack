@@ -350,3 +350,41 @@ test('an ownership record at ownedSchema 1 is refused, and the message says to r
   assert.equal(run.status, 1, failureOf(run));
   assert.match(failureOf(run), /ownedSchema must be 2; run Install-Workspace\.ps1 -Apply once/);
 });
+
+// The source block each layer keeps in stack.lock.json. The shape check is shared with the workspace verifier, so these
+// cases run the manifest verifier's --lock check on a lock that holds one layer's source.
+const COMMIT = 'a'.repeat(40);
+const GIT_SOURCE = { kind: 'git', url: 'https://github.com/simpsonm09/pstack-claude.git', ref: 'feat', commit: COMMIT, override: true };
+const LOCAL_SOURCE = { kind: 'local', url: null, ref: null, commit: COMMIT, dirty: false, override: true, path: 'projects/repos/checkout' };
+
+function lockWithSource(source) {
+  return { ownedSchema: 2, owned: [], layers: [{ name: 'pstack', source }] };
+}
+
+test('a git or local source block passes the lock shape check, and a legacy source string passes too', { skip }, () => {
+  for (const source of [GIT_SOURCE, LOCAL_SOURCE, 'https://github.com/simpsonm09/pstack-claude.git']) {
+    const run = runVerifier({ lock: lockWithSource(source) });
+    assert.equal(run.status, 0, `${JSON.stringify(source)}: ${failureOf(run)}`);
+  }
+});
+
+test('a malformed source block is refused, with the rule it breaks', { skip }, () => {
+  const { ref: _ref, ...withoutRef } = GIT_SOURCE;
+  const cases = [
+    [{ ...GIT_SOURCE, kind: 'svn' }, /source kind must be one of/],
+    [{ ...GIT_SOURCE, commit: 'ABC' }, /commit must be a 40-character lowercase commit SHA/],
+    [{ ...GIT_SOURCE, override: 'yes' }, /source override must be true or false/],
+    [withoutRef, /must hold exactly/],
+    [{ ...GIT_SOURCE, url: 'https://github.com/simpsonm09/pstack-claude .git' }, /url must be a source URL with no spaces/],
+    [{ ...LOCAL_SOURCE, dirty: null }, /dirty must be true or false where there is a commit/],
+    [{ ...LOCAL_SOURCE, commit: null }, /dirty must be null where there is no commit/],
+    [{ ...LOCAL_SOURCE, path: '' }, /path must name the checkout folder/],
+    [{ ...LOCAL_SOURCE, extra: 1 }, /must hold exactly/],
+    [null, /source must be an object, or the legacy string/],
+  ];
+  for (const [source, reason] of cases) {
+    const run = runVerifier({ lock: lockWithSource(source) });
+    assert.equal(run.status, 1, `${JSON.stringify(source)} passed`);
+    assert.match(failureOf(run), reason, JSON.stringify(source));
+  }
+});
