@@ -278,3 +278,66 @@ function Get-RecordedOverrides {
     }
     return $overrides
 }
+
+# The source a lock records for a layer, or the one its layers.json entry implies when the lock predates the source
+# block. A legacy layer is a local checkout when it has a path, and a git pin otherwise.
+function Get-RecordedSourceOf {
+    param($Record)
+
+    $block = Get-Field $Record 'source'
+    if ($block -is [pscustomobject]) { return $block }
+    $local = $null -ne (Get-Field $Record 'path')
+    return [pscustomobject]@{
+        kind     = $(if ($local) { 'local' } else { 'git' })
+        url      = $(if ($local) { $null } else { Get-Field $Record 'source' })
+        ref      = $null
+        commit   = Get-Field $Record 'commit'
+        dirty    = $null
+        override = $false
+        path     = Get-Field $Record 'path'
+    }
+}
+
+# The lines of the layer-source block: every override, every local source, and every source whose ref moves. A git
+# source that is pinned by commit and not overridden is at its committed pin, so it is not listed. Empty when none is.
+function Get-SourcePinLines {
+    param([object[]] $Entries)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $Entries) {
+        $source = $entry.source
+        if ($source.kind -eq 'git') {
+            if ($source.override) { $lines.Add("  $($entry.name): override, git $($source.url) ref $($source.ref) at $($source.commit)") }
+            continue
+        }
+        $state = if ($null -eq $source.dirty) { 'not a git checkout' } elseif ($source.dirty) { 'uncommitted changes' } else { 'clean' }
+        $where = if ($null -ne $source.commit) { "HEAD $($source.commit), $state" } else { $state }
+        $kind = if ($source.override) { 'override, local' } else { 'local, default' }
+        $lines.Add("  $($entry.name): $kind $($source.path) ($where)")
+    }
+    return $lines.ToArray()
+}
+
+# Prints the block at the top of -Status and of an audit, so a workspace never runs from a test source unnoticed.
+function Write-SourcePinBlock {
+    param([object[]] $Entries)
+
+    $lines = @(Get-SourcePinLines -Entries $Entries)
+    if ($lines.Count -eq 0) { return }
+    Write-Host 'Layer sources not at their committed pin:'
+    foreach ($line in $lines) { Write-Host $line }
+}
+
+# The entries -Status reads from the lock, and the entries an audit reads from the layers it resolved.
+function Get-RecordedSourceEntries {
+    param($Stack)
+
+    if ($null -eq $Stack) { return @() }
+    return @(@($Stack.layers) | ForEach-Object { [pscustomobject]@{ name = $_.name; source = Get-RecordedSourceOf $_ } })
+}
+
+function Get-ResolvedSourceEntries {
+    param([object[]] $Layers)
+
+    return @($Layers | ForEach-Object { [pscustomobject]@{ name = $_.name; source = New-SourceRecord $_ } })
+}

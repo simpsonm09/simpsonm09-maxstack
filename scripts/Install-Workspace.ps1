@@ -3043,6 +3043,7 @@ if ($Status) {
         $legacyNote = if ($null -eq (Get-Field $priorStack 'selection')) { ' (the lock predates the selection, so all)' } else { '' }
         Write-Host ((Format-Selection -Runtimes $selectedRuntimes -Layers $selectedLayers) + $legacyNote)
     }
+    Write-SourcePinBlock -Entries (Get-RecordedSourceEntries $priorStack)
     if ($null -eq $priorOwned) {
         Write-Host 'no ownership record; run -Apply once to create it'
         if ($Strict) { exit 1 }
@@ -3065,6 +3066,7 @@ if ($Status) {
 if (-not $Apply) {
     Write-Host "Workspace:      $Workspace"
     Write-Host (Format-Selection -Runtimes $selectedRuntimes -Layers $selectedLayers)
+    Write-SourcePinBlock -Entries (Get-ResolvedSourceEntries -Layers $allLayers)
     foreach ($layer in $layers) {
         $where = if ($layer.root) { $layer.root } else { "pinned $($layer.url) at $($layer.commit)" }
         Write-Host ("Layer:          {0} ({1}) at {2}" -f $layer.name, $layer.kind, $where)

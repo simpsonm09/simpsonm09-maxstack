@@ -3397,3 +3397,54 @@ withWorkspace('an overridden layer is removed by -Uninstall like any other', (ct
   assert.equal(existsSync(lockPath(ctx)), false, 'the lock remains');
   assert.equal(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin')), false, 'the overridden folder remains');
 }, {});
+
+// The layer-source block: -Status and an audit name every override, every local source, and no pin that holds.
+const STATE_ROW = /^(matching|drifted|modified|missing|untracked|not selected)\s/;
+
+// The lines between the block's header and the first state row, or none when the block is absent.
+function sourceBlockOf(stdout) {
+  const lines = stdout.split(/\r?\n/);
+  const header = lines.indexOf('Layer sources not at their committed pin:');
+  if (header < 0) return null;
+  const firstState = lines.findIndex((line, index) => index > header && STATE_ROW.test(line));
+  return { header, lines: lines.slice(header + 1, firstState < 0 ? undefined : firstState), firstState };
+}
+
+withWorkspace('-Status prints the layer-source block above the state rows, with each override and each local source', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false, env: githubEnv(ctx) });
+  assertOk(status);
+
+  const block = sourceBlockOf(status.stdout);
+  assert.ok(block, `no source block:\n${status.stdout}`);
+  assert.ok(block.firstState > block.header, 'the block is below a state row');
+  const text = block.lines.join('\n');
+  assert.match(text, new RegExp(`pstack: override, git \\S+ ref feat at ${featCommit}`), text);
+  assert.match(text, /simpsonm09-org-ai-plugin: local, default /, text);
+  assert.doesNotMatch(text, /pstack: .*local/, 'a pinned git layer is listed as local');
+}, {});
+
+withWorkspace('a default workspace lists its local layers in the block and no git pin', (ctx) => {
+  mustApply(ctx);
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  const block = sourceBlockOf(status.stdout);
+  assert.ok(block, status.stdout);
+  const text = block.lines.join('\n');
+  assert.match(text, /simpsonm09-org-ai-plugin: local, default/);
+  assert.match(text, /simpsonm09-personal-ai-plugin: local, default/);
+  assert.doesNotMatch(text, /pstack/, 'the pinned pstack layer is listed');
+}, {});
+
+withWorkspace('an audit names the source it would install, and writes nothing', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx);
+  const before = snapshotTree(ctx.workspace);
+  const audit = runInstaller(shell, ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { apply: false, env: githubEnv(ctx) });
+  assertOk(audit);
+  const block = sourceBlockOf(audit.stdout);
+  assert.ok(block, audit.stdout);
+  assert.match(block.lines.join('\n'), new RegExp(`pstack: override, git \\S+ ref feat at ${featCommit}`));
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'an audit changed the workspace');
+}, {});
