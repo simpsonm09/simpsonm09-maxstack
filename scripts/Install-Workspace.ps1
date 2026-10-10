@@ -4,6 +4,10 @@ param(
     [string] $Workspace = 'D:\dev\simpsonm09',
     [string] $LayersFile = '',
     [string[]] $LayerSource = @(),
+    # Per-run layer sources: name=owner/repo@ref, name=https://host/path.git@ref, name=local:<absolute path>, or
+    # name=default to drop an override. Repeatable, and comma-separable like -LayerSource.
+    [Alias('Source')]
+    [string[]] $SourceOverrides = @(),
     # The Copilot CLI to wrap: a command name on PATH, or a path. A match inside .maxstack\bin is never used.
     [string] $CopilotCommand = 'copilot',
     # The Pi CLI to wrap, by the same rule as CopilotCommand.
@@ -38,10 +42,13 @@ $namesRequested = $PSBoundParameters.ContainsKey('RequestedRuntimes') -or $PSBou
 if ($Status -and $namesRequested) { throw '-Status reports the recorded selection and takes no -Runtimes or -Layers. Select with an apply.' }
 if ($Uninstall -and $namesRequested) { throw '-Uninstall removes everything the lock records, so it takes no -Runtimes or -Layers. Use -Remove to name what to remove.' }
 if ($Remove -and -not $namesRequested) { throw '-Remove names what to remove: give -Runtimes or -Layers. Use -Uninstall to remove everything.' }
+$sourceNamed = $PSBoundParameters.ContainsKey('SourceOverrides') -or $PSBoundParameters.ContainsKey('LayerSource')
+if (($Status -or $Remove -or $Uninstall) -and $sourceNamed) { throw '-Source sets a layer source for an apply or an audit. -Status, -Remove, and -Uninstall read the recorded sources.' }
 $removing = [bool] $Remove
 $uninstalling = [bool] $Uninstall
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'Install-LayerSources.ps1')
 $layersPath = if ($LayersFile) { $LayersFile } else { Join-Path $repoRoot 'layers.json' }
 $baseConfigFile = Join-Path $repoRoot 'workspace\opencode.jsonc'
 $configTarget = Join-Path $Workspace 'opencode.jsonc'
@@ -160,24 +167,25 @@ function New-LayerModel {
 
     $source = Get-Field $Raw 'source'
     $path = $null
-    $url = $null
-    $sourcePath = $null
+    $defaultUrl = $null
+    $defaultRef = $null
+    $sourcePath = '.'
     $commit = $null
     if ($source -is [string]) {
         $path = Get-Field $Raw 'path'
         if (-not (Test-RelativePath $path)) { throw "Layer '$name' needs a relative checkout path." }
-        $sourceText = $source
+        $defaultUrl = $source
     } elseif ($null -ne $source) {
         if ($kind -ne 'plugin') { throw "Layer '$name' is pinned to a git source, so its kind must be plugin." }
-        $url = Get-Field $source 'url'
+        $defaultUrl = Get-Field $source 'url'
         $sourcePath = Get-Field $source 'path'
         $commit = Get-Field $source 'commit'
-        if (-not (Test-NonEmptyString $url)) { throw "Layer '$name' source needs a url." }
+        $defaultRef = Get-Field $source 'ref'
+        if (-not (Test-NonEmptyString $defaultUrl)) { throw "Layer '$name' source needs a url." }
         if (-not (Test-RelativePath $sourcePath)) { throw "Layer '$name' source.path must be a relative path inside the repository." }
         if (-not (Test-NonEmptyString $commit) -or $commit -cnotmatch '^[0-9a-f]{40}$') {
             throw "Layer '$name' source.commit must be a 40-character lowercase commit SHA."
         }
-        $sourceText = $url
     } else {
         throw "Layer '$name' needs a source."
     }
@@ -193,18 +201,31 @@ function New-LayerModel {
     }
 
     return [pscustomobject]@{
-        name       = $name
-        kind       = $kind
-        path       = $path
-        url        = $url
-        sourcePath = $sourcePath
-        commit     = $commit
-        source     = $sourceText
+        name          = $name
+        kind          = $kind
+        # The default source, from layers.json. defaultGit is true for a git pin, and false for a local checkout at path.
+        defaultGit    = ($source -isnot [string]) -and ($null -ne $source)
+        defaultUrl    = $defaultUrl
+        defaultRef    = $defaultRef
+        defaultCommit = $commit
+        path          = $path
+        # The folder inside the repository the plugin lives in. '.' names the whole repository.
+        sourcePath    = $sourcePath
         # The runtimes the manifest declares. runtimes narrows to the selection, and declared keeps the
         # item lists a copy needs even when opencode is not selected.
-        declared   = $runtimes
-        runtimes   = $runtimes
-        root       = $null
+        declared      = $runtimes
+        runtimes      = $runtimes
+        # The effective source for this run, set by Set-LayerChoice. url is set only for a git source.
+        sourceKind    = $null
+        url           = $null
+        recordUrl     = $null
+        ref           = $null
+        commit        = $null
+        dirty         = $null
+        override      = $false
+        localPath     = $null
+        repoRoot      = $null
+        root          = $null
     }
 }
 
@@ -291,6 +312,11 @@ function Get-ClaudeRecord {
     }
     $items = @(Get-OpenCodeItems -Layer $Layer -Root $Layer.root)
     if ($items -notcontains '.claude-plugin') {
+        # A layer pinned in layers.json is a whole folder for Claude, whatever its OpenCode items name, so a local
+        # checkout of it (-Source pstack=local:...) is copied whole too. Any other layer must name the manifest.
+        if ($Layer.defaultGit) {
+            return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'copy'; items = $null }
+        }
         throw "Layer '$($Layer.name)' has a claude runtime but its file list omits .claude-plugin, so the installed copy would not carry the manifest."
     }
     if (-not $Layer.runtimes.ContainsKey('opencode')) {
@@ -672,6 +698,15 @@ function Copy-LayerItems {
     }
 }
 
+# Copies a whole layer folder for Claude. A repository root holds the cache's .git, which is not part of the plugin.
+function Copy-WholeFolder {
+    param([string] $Root, [string] $Destination)
+
+    Copy-Item -LiteralPath $Root -Destination $Destination -Recurse -Force
+    $git = Join-Path $Destination '.git'
+    if (Test-Path -LiteralPath $git) { Remove-OwnedTree $git }
+}
+
 # The hash of a tree from its lines: sorted, one line per entry, then the SHA-256 of that text.
 function Get-TreeLinesSha256 {
     param([string[]] $Lines)
@@ -733,14 +768,20 @@ function Sync-GitPlugin {
         & git -C $cache config core.eol lf
     }
     & git -C $cache remote set-url origin $Layer.url
-    & git -C $cache sparse-checkout set $Layer.sourcePath
+    if ($Layer.sourcePath -eq '.') {
+        & git -C $cache sparse-checkout disable
+    } else {
+        & git -C $cache sparse-checkout set $Layer.sourcePath
+    }
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout of $($Layer.sourcePath) failed in $cache." }
 
     & git -C $cache cat-file -e "$($Layer.commit)^{commit}" 2>$null
     if ($LASTEXITCODE -ne 0) {
         & git -C $cache fetch --quiet --filter=blob:none origin $Layer.commit
         if ($LASTEXITCODE -ne 0) {
-            throw "Could not fetch the pinned commit $($Layer.commit) from $($Layer.url) for '$($Layer.name)'. Check source.commit in layers.json."
+            $what = if ($Layer.override) { 'commit' } else { 'pinned commit' }
+            $hint = if ($Layer.override) { 'Check the -Source spec.' } else { 'Check source.commit in layers.json.' }
+            throw "Could not fetch the $what $($Layer.commit) from $($Layer.url) for '$($Layer.name)'. $hint"
         }
     }
     & git -C $cache -c advice.detachedHead=false checkout --quiet --detach $Layer.commit
@@ -770,7 +811,7 @@ function Get-LayerRoot {
 
     if ($null -eq $Layer.url) { return $Layer.root }
     if (-not (Test-CacheAtPin $Layer)) { return $null }
-    return (Join-Path (Join-Path $claudeCacheTarget $Layer.name) ($Layer.sourcePath -replace '/', '\'))
+    return (Join-SourceSub (Join-Path $claudeCacheTarget $Layer.name) $Layer.sourcePath)
 }
 
 # Whether a claude child is missing, differs from what the last apply recorded, or
@@ -945,14 +986,21 @@ function Get-PiLayerRecord {
 
     if (-not $Layer.runtimes.ContainsKey('pi')) { return $null }
     $pinned = $null -ne $Layer.url
-    $sourceRoot = if ($pinned) { Join-Path $claudeCacheTarget $Layer.name } else { $Layer.root }
-    $pluginSource = if ($pinned) { Join-Path $sourceRoot ($Layer.sourcePath -replace '/', '\') } else { $Layer.root }
-    $manifest = Join-Path $sourceRoot 'package.json'
+    $repo = if ($pinned) { Join-Path $claudeCacheTarget $Layer.name } else { $Layer.repoRoot }
+    $pluginSource = Join-SourceSub $repo $Layer.sourcePath
+    $manifest = Join-Path $repo 'package.json'
     $piKey = $null
     if (Test-Path -LiteralPath $manifest -PathType Leaf) {
         $piKey = Get-Field (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json) 'pi'
     }
     $installed = ".claude/plugins/$($Layer.name)"
+    # The pi key names paths from the repository root, and the installed copy of a folder inside a repository has
+    # no package.json at its root. Only a package at the repository root can be the Pi package, so a local source
+    # with a subfolder keeps the skills folder and loses the rest of the key.
+    if (($null -ne $piKey) -and -not $pinned -and ($Layer.sourcePath -ne '.')) {
+        Write-Warning "Layer '$($Layer.name)' is a local source with the folder $($Layer.sourcePath). Its package.json pi key names the repository root, so Pi gets its skills folder only, not the pi key's other entries."
+        $piKey = $null
+    }
     return [pscustomobject]@{
         layer   = $Layer.name
         pi      = $piKey
@@ -1392,7 +1440,7 @@ function Get-OwnedPlan {
         }
         $root = Get-LayerRoot $layerByName[$record.layer]
         $sha = $null
-        if ($null -ne $root -and $record.kind -eq 'copy') { $sha = Get-ItemsTreeSha256 -Root $root -Items $record.items }
+        if ($null -ne $root -and $record.kind -eq 'copy' -and $null -ne $record.items) { $sha = Get-ItemsTreeSha256 -Root $root -Items $record.items }
         elseif ($null -ne $root) { $sha = Get-TreeSha256 $root }
         $records.Add((New-OwnedRecord -Path $path -Kind 'dir' -Sha256 $sha -Runtime 'claude' -Layers @($record.layer)))
     }
@@ -2667,23 +2715,16 @@ $layers = @($layerManifest.layers | ForEach-Object { New-LayerModel $_ })
 $layerNames = @($layers | ForEach-Object { $_.name })
 if (@($layerNames | Select-Object -Unique).Count -ne $layerNames.Count) { throw 'layers.json names a layer twice.' }
 
-# Each -LayerSource entry is name=path. Under pwsh -File, separate tokens do not bind
-# to an array, so entries may also be comma-separated in one token.
-$sourceOverrides = @{}
-foreach ($entry in @($LayerSource | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
-    $overrideName, $overridePath = $entry -split '=', 2
-    if (-not (Test-NonEmptyString $overridePath)) { throw "LayerSource expects name=path, got '$entry'." }
-    $target = $layers | Where-Object { $_.name -eq $overrideName }
-    if (-not $target) { throw "LayerSource names an unknown layer: $overrideName" }
-    if ($null -eq $target.path) { throw "LayerSource applies to a local checkout, and $overrideName is pinned to a git source in layers.json." }
-    $sourceOverrides[$overrideName] = $overridePath
-}
+# The per-run sources the command line names: -Source, and -LayerSource as its local alias. A name not in layers.json is refused.
+$explicitSources = Read-SourceSpecs -Specs $SourceOverrides -LayerSpecs $LayerSource -LayerNames $layerNames
 
 # The previous lock records what the last apply installed. It is read before anything is resolved,
 # because its selection decides which layers and runtimes this run touches. Audit compares against
 # it, and apply removes only the folders it recorded.
 $priorStack = $null
 $priorLayers = @{}
+# The source overrides the lock records. A plain apply reuses them until -Source name=default drops one.
+$recordedOverrides = @{}
 $priorPi = $null
 # The ownership list the previous apply wrote. $null means the lock predates it, or there is no lock.
 $priorOwned = $null
@@ -2698,6 +2739,7 @@ if (Test-Path -LiteralPath $stackTarget -PathType Leaf) {
     foreach ($priorLayer in @($priorStack.layers)) {
         $priorLayers[$priorLayer.name] = $priorLayer
     }
+    $recordedOverrides = Get-RecordedOverrides $priorStack
     $priorPi = Get-Field $priorStack 'pi'
     if ($null -ne $priorStack.PSObject.Properties['owned']) { $priorOwned = @($priorStack.owned | Where-Object { $null -ne $_ }) }
     if ($null -ne $priorStack.PSObject.Properties['createdDirs']) { $priorCreatedDirs = @($priorStack.createdDirs) }
@@ -2795,18 +2837,17 @@ foreach ($layer in $allLayers) {
     }
     $layer.runtimes = $active
 }
+# Every layer's source is chosen before the active set is cut, so an unselected layer's lock record is right too.
+Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $false
 $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
 $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notcontains $_ })
 
 foreach ($layer in $layers) {
-    if ($null -eq $layer.path) { continue }
-    $root = Join-Path $Workspace $layer.path
-    if ($sourceOverrides.ContainsKey($layer.name)) { $root = $sourceOverrides[$layer.name] }
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "Layer '$($layer.name)' is not checked out at $root."
+    if ($layer.sourceKind -ne 'local') { continue }
+    if (-not (Test-Path -LiteralPath $layer.root -PathType Container)) {
+        throw "Layer '$($layer.name)' is not checked out at $($layer.root)."
     }
-    $layer.root = $root
 }
 
 # Before any write, an apply records what already exists: the directories an install may create, the
@@ -2832,7 +2873,7 @@ if ($Apply) {
 if ($Apply) {
     foreach ($layer in @($layers | Where-Object { $null -ne $_.url })) {
         $cache = Sync-GitPlugin $layer
-        $layer.root = Join-Path $cache ($layer.sourcePath -replace '/', '\')
+        $layer.root = Join-SourceSub $cache $layer.sourcePath
         if (-not (Test-Path -LiteralPath $layer.root -PathType Container)) {
             throw "Layer '$($layer.name)' has no $($layer.sourcePath) folder at the pinned commit."
         }
@@ -3137,7 +3178,8 @@ foreach ($layer in $openCodeLayers) {
     $shippedLocks = Get-ShippedLocks $installDir
     if ((Test-Path -LiteralPath (Join-Path $installDir 'package.json') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $installDir 'node_modules\@opencode\plugin'))) {
         Write-Host 'Installing plugin dependencies'
-        & npm install --prefix $installDir --omit=dev --no-audit --no-fund
+        # --ignore-scripts: a layer's own install scripts, and its dependencies', never run from a checkout the installer reads.
+        & npm install --prefix $installDir --omit=dev --no-audit --no-fund --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw "npm install failed in $installDir" }
     }
     Resolve-NpmLocks -Folder $installDir -Shipped $shippedLocks
@@ -3190,14 +3232,18 @@ if ($claudeSelected) {
                 New-Item -ItemType Junction -Path $child -Target $target | Out-Null
                 Write-Host "Linked Claude plugin '$($record.plugin)' to $target"
             }
-        } elseif ($record.kind -eq 'copy') {
+        } elseif ($record.kind -eq 'copy' -and $null -ne $record.items) {
             Remove-ClaudeChild $child
             Copy-LayerItems -Root $layerByName[$record.layer].root -Items $record.items -Destination $child
             Write-Host "Copied Claude plugin '$($record.plugin)' from $($layerByName[$record.layer].root)"
         } else {
             Remove-ClaudeChild $child
-            Copy-Item -LiteralPath $layerByName[$record.layer].root -Destination $child -Recurse -Force
-            Write-Host "Copied Claude plugin '$($record.plugin)' from $($record.url) at $($record.commit)"
+            Copy-WholeFolder -Root $layerByName[$record.layer].root -Destination $child
+            if ($null -ne (Get-Field $record 'url')) {
+                Write-Host "Copied Claude plugin '$($record.plugin)' from $($record.url) at $($record.commit)"
+            } else {
+                Write-Host "Copied Claude plugin '$($record.plugin)' from $($layerByName[$record.layer].root)"
+            }
         }
         $declared = Get-Field (Get-Content -LiteralPath (Join-Path $child '.claude-plugin\plugin.json') -Raw | ConvertFrom-Json) 'name'
         if ($declared -ne $record.plugin) {
@@ -3276,11 +3322,6 @@ foreach ($record in $claudeRecords) { $claudeByLayer[$record.layer] = $record }
 # A layer that installs nothing this run is recorded disabled, and a pinned one keeps its pin.
 $layerRecords = foreach ($layer in $allLayers) {
     $record = $claudeByLayer[$layer.name]
-    $commit = $layer.commit
-    if (($null -eq $layer.url) -and ($activeLayerNames -contains $layer.name)) {
-        $head = (& git -C $layer.root rev-parse HEAD 2>$null)
-        $commit = if ($head) { $head.Trim() } else { $null }
-    }
     if ($record) {
         $child = Join-Path $claudePluginsTarget $record.plugin
         $treeSha = Get-LegacyTreeSha256 $child
@@ -3346,9 +3387,9 @@ $layerRecords = foreach ($layer in $allLayers) {
     [pscustomobject]@{
         name     = $layer.name
         kind     = $layer.kind
-        path     = $layer.path
-        source   = $layer.source
-        commit   = $commit
+        path     = $layer.localPath
+        source   = New-SourceRecord $layer
+        commit   = $layer.commit
         claude   = $claude
         opencode = $opencode
         copilot  = $copilotRecord

@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import {
   appendFileSync,
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -249,7 +250,7 @@ function layerNamed(manifest, name) {
 }
 
 // Runs the installer. Copilot and Pi are the stand-ins unless the caller names their command.
-function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = writeLayers(ctx) } = {}) {
+function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = writeLayers(ctx), env = undefined } = {}) {
   const copilot = extra.includes('-CopilotCommand') ? [] : ['-CopilotCommand', ctx.fakeCopilot];
   const pi = extra.includes('-PiCommand') ? [] : ['-PiCommand', ctx.fakePi];
   const args = [
@@ -261,7 +262,7 @@ function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = write
     ...(apply ? ['-Apply'] : []),
     ...extra,
   ];
-  return spawnSync(shell, args, { encoding: 'utf8', env: ctx.env });
+  return spawnSync(shell, args, { encoding: 'utf8', env: env ?? ctx.env });
 }
 
 // A junction reports as a symbolic link to lstat.
@@ -339,7 +340,8 @@ withWorkspace('the lock records each layer once, with its runtimes and no absolu
   for (const record of lock.layers) {
     assert.equal(typeof record.name, 'string');
     assert.equal(typeof record.kind, 'string');
-    assert.equal(typeof record.source, 'string', `layer ${record.name} records its source`);
+    assert.equal(typeof record.source, 'object', `layer ${record.name} records its source block`);
+    assert.ok(['git', 'local'].includes(record.source.kind), `layer ${record.name} names its source kind`);
     for (const runtime of ['claude', 'opencode', 'copilot', 'pi']) {
       assert.equal(typeof record[runtime]?.enabled, 'boolean', `layer ${record.name} has a ${runtime} record`);
     }
@@ -682,15 +684,17 @@ withWorkspace('removing the claude runtime removes only its link and keeps the i
   assert.equal(lock.layers.find((record) => record.name === 'simpsonm09-org-ai-plugin').claude.enabled, false);
 }, {});
 
-withWorkspace('LayerSource overrides a local checkout, and refuses a git layer', (ctx) => {
+withWorkspace('LayerSource overrides a local checkout, and now also a git-pinned layer', (ctx) => {
   const alternate = join(ctx.base, 'alternate-org');
   writeLayerStub(alternate, { claudePlugin: 'simpsonm09-org-ai-plugin', extra: { 'from-override.txt': 'override\n' } });
   mustApply(ctx, ['-LayerSource', `simpsonm09-org-ai-plugin=${alternate}`]);
   assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'from-override.txt')));
 
-  const refused = runInstaller(shell, ctx, ['-LayerSource', `pstack=${alternate}`]);
-  assert.notEqual(refused.status, 0, 'LayerSource accepted a git layer');
-  assert.match(plainOutput(refused), /LayerSource applies to a local checkout, and pstack is pinned/);
+  // -LayerSource is the local alias of -Source, so it reads pstack from a checkout of the fork as well.
+  const pstackCheckout = join(ctx.base, 'pstack-checkout');
+  cpSync(join(ctx.fixture.dir), pstackCheckout, { recursive: true });
+  mustApply(ctx, ['-LayerSource', `pstack=${pstackCheckout}`]);
+  assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'pstack', 'opencode', 'index.ts')), 'pstack was not installed from the checkout');
 }, {});
 
 withWorkspace('the installer has no live-server check and no skip switch', (ctx) => {
@@ -3207,4 +3211,189 @@ withWorkspace('a plain apply keeps a journaled quarantine whose files changed, n
   const kept = readJson(lockPath(ctx));
   assert.equal(ownedRecord(kept, ORG_FOLDER, 'dir').quarantine, 'simpsonm09-org-ai-plugin.maxstack-removing', 'the journal was dropped');
   assert.doesNotMatch(run.stdout, /Rerun -Uninstall/, run.stdout);
+}, {});
+
+// ---- Layer sources: -Source, the -LayerSource alias, and the recorded override -----------------------------------
+// A git command in a folder. A failing command fails the test, so a fixture that did not build is never a result.
+function gitRun(dir, args) {
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8' });
+  assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
+  return run.stdout.trim();
+}
+
+// The test stand-in for github.com. MAXSTACK_TEST_GITHUB_ROOT names the folder, and owner/repo resolves to
+// <root>/<owner>/<repo>.git. GIT_TERMINAL_PROMPT stops git from waiting for a credential.
+function githubEnv(ctx) {
+  return { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(ctx.base, 'github'), GIT_TERMINAL_PROMPT: '0' };
+}
+
+function remoteUrl(ctx, owner, repo) {
+  return join(ctx.base, 'github', owner, `${repo}.git`).replace(/\\/g, '/');
+}
+
+// Serves a copy of a repository as <owner>/<repo>.git under the test GitHub root, and returns the bare path.
+function serveRepo(ctx, owner, repo, sourceDir) {
+  const bare = join(ctx.base, 'github', owner, `${repo}.git`);
+  mkdirSync(dirname(bare), { recursive: true });
+  gitRun(ctx.base, ['clone', '--bare', '--quiet', sourceDir, bare]);
+  gitRun(bare, ['config', 'uploadpack.allowFilter', 'true']);
+  gitRun(bare, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);
+  return bare;
+}
+
+// Commits one file on a branch of a served repository, starting from the branch or from the default branch, and
+// pushes it there. Returns the new commit.
+function commitToBranch(ctx, bare, branch, relPath, content) {
+  const work = join(ctx.base, 'work');
+  if (!existsSync(work)) gitRun(ctx.base, ['clone', '--quiet', bare, work]);
+  gitRun(work, ['fetch', '--quiet', 'origin']);
+  const hasBranch = spawnSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).status === 0;
+  gitRun(work, ['checkout', '-q', '-B', branch, hasBranch ? `origin/${branch}` : 'origin/HEAD']);
+  writeFile(work, relPath, content);
+  gitRun(work, ['add', '-A']);
+  gitRun(work, ['commit', '-q', '-m', `change on ${branch}`]);
+  gitRun(work, ['push', '-q', 'origin', branch]);
+  return gitRun(work, ['rev-parse', 'HEAD']);
+}
+
+const SKILL_PATH = 'plugins/pstack/skills/poteto-mode/SKILL.md';
+const SKILL_FEAT = '---\nname: poteto-mode\ndescription: fixture\n---\nfeat body\n';
+const installedSkill = (ctx) => join(ctx.workspace, '.opencode', 'plugins', 'pstack', 'skills', 'poteto-mode', 'SKILL.md');
+
+// pstack served as simpsonm09/pstack-claude, with a feat branch that changes its skill.
+function servedFeature(ctx) {
+  const bare = serveRepo(ctx, 'simpsonm09', 'pstack-claude', ctx.fixture.dir);
+  const featCommit = commitToBranch(ctx, bare, 'feat', SKILL_PATH, SKILL_FEAT);
+  return { bare, featCommit };
+}
+
+function sourceOf(ctx, name) {
+  const record = readJson(lockPath(ctx)).layers.find((layer) => layer.name === name);
+  assert.ok(record, `the lock has no record for ${name}`);
+  return record;
+}
+
+withWorkspace('-Source owner/repo@branch installs the branch commit, and the lock records it as an override', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/, 'the branch content was not installed');
+
+  const pstack = sourceOf(ctx, 'pstack');
+  assert.deepEqual(pstack.source, { kind: 'git', url: remoteUrl(ctx, 'simpsonm09', 'pstack-claude'), ref: 'feat', commit: featCommit, override: true });
+  assert.equal(pstack.commit, featCommit, 'the layer commit is the resolved branch commit');
+  assert.equal(sourceOf(ctx, 'simpsonm09-org-ai-plugin').source.override, false, 'a layer no flag names is not an override');
+}, {});
+
+withWorkspace('a recorded override persists across a plain apply, and -Source name=default drops it', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  mustApply(ctx, [], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').source.override, true, 'the plain apply dropped the override');
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'the plain apply moved the recorded commit');
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/);
+
+  mustApply(ctx, ['-Source', 'pstack=default'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').source.override, false, '-Source name=default kept the override');
+  assert.equal(sourceOf(ctx, 'pstack').commit, ctx.fixture.commit, 'the default pin is installed again');
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /fixture body/);
+}, {});
+
+withWorkspace('a local source installs the working tree as it is, and the lock records HEAD and the dirty flag', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const head = gitRun(checkout, ['rev-parse', 'HEAD']);
+  writeFile(checkout, 'index.ts', 'export default { edited: true };\n');
+
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assert.match(readFileSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'index.ts'), 'utf8'), /edited: true/);
+  const org = sourceOf(ctx, 'simpsonm09-org-ai-plugin');
+  assert.deepEqual(org.source, { kind: 'local', url: null, ref: null, commit: head, dirty: true, override: true, path: checkout });
+  assert.equal(org.commit, head);
+}, {});
+
+withWorkspace('pstack installs from a local checkout, comma-separated with another layer, and a folder that is not git records no commit', (ctx) => {
+  const pstackCheckout = join(ctx.base, 'pstack-checkout');
+  cpSync(ctx.fixture.dir, pstackCheckout, { recursive: true });
+  const head = gitRun(pstackCheckout, ['rev-parse', 'HEAD']);
+  writeFile(pstackCheckout, SKILL_PATH, '---\nname: poteto-mode\ndescription: fixture\n---\nlocal edit\n');
+  const orgCheckout = join(ctx.base, 'org-plain');
+  writeLayerStub(orgCheckout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+
+  mustApply(ctx, ['-Source', `pstack=local:${pstackCheckout},simpsonm09-org-ai-plugin=local:${orgCheckout}`]);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /local edit/, 'pstack was not installed from its checkout');
+  assert.ok(existsSync(join(ctx.workspace, '.claude', 'plugins', 'pstack', '.claude-plugin', 'plugin.json')), 'the Claude copy lacks the manifest');
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'plugins', 'pstack', '.git')), false, 'the Claude copy carries .git');
+  assert.deepEqual(sourceOf(ctx, 'pstack').source, { kind: 'local', url: null, ref: null, commit: head, dirty: true, override: true, path: pstackCheckout });
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'cache', 'pstack')), false, 'a local source keeps no git cache');
+
+  const org = sourceOf(ctx, 'simpsonm09-org-ai-plugin');
+  assert.equal(org.commit, null, 'a folder that is not a git checkout records no commit');
+  assert.equal(org.source.dirty, null, 'a folder that is not a git checkout records no dirty flag');
+}, {});
+
+const REFUSED_SOURCES = [
+  ['pstack=http://github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=ssh://git@github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=file:///tmp/pstack.git@feat', 'only https'],
+  ['pstack=https://user@github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=simpsonm09/pstack-claude@feat..x', 'holds [.][.]'],
+  ['pstack=simpsonm09/pstack-claude@-feat', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat~1', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat.lock', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat x', 'space or a control character'],
+  ['pstack=simpsonm09/pstack claude@feat', 'space or a control character'],
+  ['pstack=-simpsonm09/pstack-claude@feat', 'starts with a dash'],
+  ['pstack=simpsonm09/pstack-claude', 'needs @ref'],
+  ['pstack=simpsonm09/..x@feat', 'holds \\.\\.'],
+  ['pstack=local:relative/checkout', 'needs an absolute path'],
+  ['nosuchlayer=simpsonm09/pstack-claude@feat', 'names an unknown layer'],
+];
+
+withWorkspace('malformed -Source specs and unknown layers are refused before anything is written', (ctx) => {
+  for (const [spec, reason] of REFUSED_SOURCES) {
+    const run = runInstaller(shell, ctx, ['-Source', spec]);
+    assert.notEqual(run.status, 0, `the installer accepted -Source ${spec}`);
+    assert.match(plainOutput(run), new RegExp(reason), `${spec}: ${run.stdout}\n${run.stderr}`);
+    assert.equal(existsSync(lockPath(ctx)), false, `${spec} wrote a lock`);
+    assert.equal(existsSync(join(ctx.workspace, '.claude')), false, `${spec} wrote under .claude`);
+  }
+}, {});
+
+withWorkspace('a local source is refused for the workspace itself and for each folder the installer writes', (ctx) => {
+  for (const folder of [ctx.workspace, join(ctx.workspace, '.claude'), join(ctx.workspace, '.claude', 'cache')]) {
+    mkdirSync(folder, { recursive: true });
+    const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${folder}`]);
+    assert.notEqual(run.status, 0, `the installer accepted ${folder}`);
+    assert.match(plainOutput(run), /cannot be a layer source/, run.stdout);
+  }
+  assert.equal(existsSync(lockPath(ctx)), false, 'a refused local source wrote a lock');
+}, {});
+
+withWorkspace('an https source that cannot be reached fails with the reason, and leaves the install untouched', (ctx) => {
+  mustApply(ctx);
+  const before = snapshotTree(ctx.workspace);
+  const run = runInstaller(shell, ctx, ['-Source', 'pstack=https://127.0.0.1:1/simpsonm09/pstack-claude.git@feat'], { env: githubEnv(ctx) });
+  assert.notEqual(run.status, 0, 'an unreachable source was accepted');
+  assert.match(plainOutput(run), /could not read the refs of https:\/\/127\.0\.0\.1:1/, run.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a failed source changed the install');
+}, {});
+
+withWorkspace('-Status, -Remove, and -Uninstall refuse -Source, which only an apply or an audit takes', (ctx) => {
+  for (const args of [['-Status'], ['-Remove', '-Layers', 'pstack'], ['-Uninstall']]) {
+    const run = runInstaller(shell, ctx, [...args, '-Source', 'pstack=simpsonm09/pstack-claude@feat'], { apply: false });
+    assert.notEqual(run.status, 0, `${args.join(' ')} accepted -Source`);
+    assert.match(plainOutput(run), /-Source sets a layer source for an apply or an audit/, run.stdout);
+  }
+}, {});
+
+withWorkspace('an overridden layer is removed by -Uninstall like any other', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assertOk(removal(ctx, ['-Uninstall']));
+  assert.equal(existsSync(lockPath(ctx)), false, 'the lock remains');
+  assert.equal(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin')), false, 'the overridden folder remains');
 }, {});
