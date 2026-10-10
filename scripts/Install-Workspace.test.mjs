@@ -3689,7 +3689,8 @@ withWorkspace('a recorded local override whose folder is gone is reported by -St
   assertOk(runInstaller(shell, ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], { apply: false }));
   const refused = removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']);
   assert.notEqual(refused.status, 0, 'a removal rewrote the config without the missing fragment');
-  assert.match(plainOutput(refused), /is not checked out at .* drop the override with -Source simpsonm09-org-ai-plugin=default/, refused.stdout);
+  assert.match(plainOutput(refused), /has no folder at .*Restore the folder, then rerun/, refused.stdout);
+  assert.doesNotMatch(plainOutput(refused), /-Source/, refused.stdout);
   assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-personal-ai-plugin')), 'a refused removal removed the layer');
 
   mustApply(ctx, ['-Source', 'simpsonm09-org-ai-plugin=default']);
@@ -4089,4 +4090,34 @@ test('a junction under the temp folder that leads outside it does not turn on th
   } finally {
     rmdirSync(junction);
   }
+}, {});
+
+// Round 2, H: the refusal for a missing layer folder names the absolute folder, and the command that fits the mode.
+const ORG_DEFAULT_FOLDER = (ctx) => join(ctx.workspace, 'projects', 'repos', 'simpsonm09-org-ai-plugin');
+
+withWorkspace('a missing default layer folder is refused with its absolute path and no -Source advice', (ctx) => {
+  rmSync(ORG_DEFAULT_FOLDER(ctx), { recursive: true, force: true });
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote past a missing default folder');
+  assert.ok(plainOutput(apply).includes(`has no folder at ${ORG_DEFAULT_FOLDER(ctx)}. Restore the folder, then rerun`), plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /-Source|drop the override/, plainOutput(apply));
+}, {});
+
+withWorkspace('a missing override folder is refused with its absolute path and the -Source repair that applies', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  rmSync(checkout, { recursive: true, force: true });
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote past a missing override folder');
+  assert.ok(plainOutput(apply).includes(`has no folder at ${checkout}. Restore the folder or drop the override with -Source simpsonm09-org-ai-plugin=default -Apply, then rerun`), plainOutput(apply));
+}, {});
+
+withWorkspace('a removal refused for a missing layer folder gives no -Source advice, since -Remove takes no -Source', (ctx) => {
+  mustApply(ctx);
+  rmSync(ORG_DEFAULT_FOLDER(ctx), { recursive: true, force: true });
+  const removed = removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']);
+  assert.notEqual(removed.status, 0, 'a removal rewrote the config without a missing fragment');
+  assert.match(plainOutput(removed), /has no folder at .*Restore the folder, then rerun/, plainOutput(removed));
+  assert.doesNotMatch(plainOutput(removed), /-Source/, plainOutput(removed));
 }, {});

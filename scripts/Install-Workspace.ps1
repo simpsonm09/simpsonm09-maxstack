@@ -2900,7 +2900,10 @@ $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notconta
 # config from every selected layer's fragment. Every other run reports the folder and goes on.
 foreach ($layer in $layers) {
     if ($layer.sourceKind -ne 'local' -or -not $layer.folderMissing) { continue }
-    if ($Apply) { throw "Layer '$($layer.name)' is not checked out at $($layer.localPath). Restore the folder, or drop the override with -Source $($layer.name)=default, then rerun." }
+    if (-not $Apply) { continue }
+    # -Source is an apply or audit option, so only a plain apply names it, and only for an override that it would drop.
+    $repair = if (-not $removing -and $layer.override) { " or drop the override with -Source $($layer.name)=default -Apply" } else { '' }
+    throw "Layer '$($layer.name)' has no folder at $($layer.repoRoot). Restore the folder$repair, then rerun."
 }
 
 # Before any write, an apply records what already exists: the directories an install may create, the
