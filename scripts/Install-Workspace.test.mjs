@@ -4400,3 +4400,10 @@ withWorkspace('an apply whose npm scan cannot read a scoped folder still writes 
   assert.doesNotMatch(plainOutput(run), /ignore-scripts/, plainOutput(run));
   assert.ok(existsSync(lockPath(ctx)), 'the apply stopped before the lock was written');
 }, NPM);
+
+// Finding 6: a long-path prefix is dropped only from a drive path. \\?\UNC\server\share names a share, and stays one.
+withWorkspace('a long-path UNC share is refused as a share root, not read as a folder under the current directory', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', 'simpsonm09-org-ai-plugin=local:\\\\?\\UNC\\server\\share'], { apply: false });
+  assert.notEqual(run.status, 0, 'a long-path UNC share was accepted as a layer source');
+  assert.match(plainOutput(run), /is a drive or share root, which cannot be a layer source/, run.stdout);
+}, {});

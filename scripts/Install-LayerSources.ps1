@@ -35,13 +35,13 @@ function Test-TestSeam {
     return ($env:MAXSTACK_TEST_MODE -eq '1')
 }
 
-# The form of a path that comparisons use: a \\?\ long-path prefix is dropped, and each junction or symbolic link on the
+# The form of a path that comparisons use: a long-path prefix is dropped, and each junction or symbolic link on the
 # way is followed, so a path through a link compares equal to the folder it names. Case is ignored. A drive that is not
 # present yields the path as written, so a folder on it compares as missing rather than failing the run.
 function Get-NormalPath {
     param([string] $Path)
 
-    $text = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
+    $text = [IO.Path]::GetFullPath((Remove-LongPathPrefix $Path))
     $root = [IO.Path]::GetPathRoot($text)
     $current = $root
     foreach ($segment in @($text.Substring($root.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))) {
@@ -307,12 +307,22 @@ function Test-SafeRefName {
     return ((Invoke-GitGuarded -Arguments @('check-ref-format', "refs/heads/$Ref")).code -eq 0)
 }
 
+# A long-path prefix is dropped from a drive path only: \\?\C:\x becomes C:\x. A UNC share keeps its share form, so
+# \\?\UNC\server\share becomes \\server\share and is not read as a folder under the current directory. Other forms are kept.
+function Remove-LongPathPrefix {
+    param([string] $Path)
+
+    if ($Path -cmatch '^\\\\\?\\UNC\\') { return ('\\' + $Path.Substring(8)) }
+    if ($Path -cmatch '^\\\\\?\\[A-Za-z]:') { return $Path.Substring(4) }
+    return $Path
+}
+
 # The full path of a folder. A trailing separator is dropped, except on a root, which keeps its own: C:\ stays C:\ and
 # does not become the drive-relative C:.
 function Get-FullFolderPath {
     param([string] $Path)
 
-    $full = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
+    $full = [IO.Path]::GetFullPath((Remove-LongPathPrefix $Path))
     $root = [IO.Path]::GetPathRoot($full)
     if ($full.Length -gt $root.Length) { return $full.TrimEnd('\') }
     return $full
