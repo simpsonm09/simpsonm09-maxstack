@@ -17,6 +17,22 @@ function Get-GitHubRemoteUrl {
     return "https://github.com/$Owner/$Repo.git"
 }
 
+# Whether the test seam is on. The tests set MAXSTACK_TEST_MODE, and a real run never does.
+function Test-TestSeam {
+    return ($env:MAXSTACK_TEST_MODE -eq '1')
+}
+
+# The options every git command the installer runs starts with. They stop git from running a program that a checkout
+# names (core.fsmonitor and hooks), refuse every transport but https, and skip optional index locks. The test seam also
+# allows file, since its remotes are local bare repositories. Two variables stop git from waiting on a credential prompt.
+function Get-GitGuardArgs {
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $env:GCM_INTERACTIVE = 'never'
+    $guard = @('-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always')
+    if (Test-TestSeam) { $guard += @('-c', 'protocol.file.allow=always') }
+    return ($guard + '--no-optional-locks')
+}
+
 # The reason a git -Source spec is refused, or $null when its characters and parts are acceptable.
 function Get-SpecFault {
     param([string] $Spec)
@@ -41,7 +57,7 @@ function Test-SafeRefName {
 
     if (Test-CommitRef $Ref) { return $true }
     if ($Ref.StartsWith('-') -or $Ref -match '\s' -or $Ref.Contains('..')) { return $false }
-    & git check-ref-format "refs/heads/$Ref" 2>$null
+    & git @(Get-GitGuardArgs) check-ref-format "refs/heads/$Ref" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -141,9 +157,9 @@ function Get-LocalCheckoutState {
 
     $none = [pscustomobject]@{ commit = $null; dirty = $null }
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $none }
-    $head = (& git -C $Root rev-parse HEAD 2>$null)
+    $head = (& git @(Get-GitGuardArgs) -C $Root rev-parse HEAD 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $head) { return $none }
-    $changes = @(& git --no-optional-locks -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
+    $changes = @(& git @(Get-GitGuardArgs) -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
     return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
 }
 
@@ -152,7 +168,7 @@ function Get-LocalCheckoutState {
 function Find-GitRefCommit {
     param([string] $Url, [string] $Ref)
 
-    $output = @(& git -C $repoRoot ls-remote -- $Url 2>&1 | ForEach-Object { "$_" })
+    $output = @(& git @(Get-GitGuardArgs) ls-remote -- $Url 2>&1 | ForEach-Object { "$_" })
     if ($LASTEXITCODE -ne 0) { throw "could not read the refs of ${Url}: $($output -join ' ')" }
     $refs = [hashtable]::new([StringComparer]::Ordinal)
     foreach ($line in $output) {
@@ -373,7 +389,7 @@ function Test-CachedCommit {
     param([string] $Cache, [string] $Commit)
 
     if ([string]::IsNullOrEmpty($Commit) -or -not (Test-Path -LiteralPath (Join-Path $Cache '.git'))) { return $false }
-    & git --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
+    & git @(Get-GitGuardArgs) --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -387,7 +403,7 @@ function Get-MoveFilesNote {
         return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
     }
     if (-not (Test-CachedCommit $cache $OldCommit)) { return 'changed files unknown: the old commit is not in the cache' }
-    $changed = @(& git --no-lazy-fetch -C $cache diff --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null | Where-Object { $_ })
+    $changed = @(& git @(Get-GitGuardArgs) --no-lazy-fetch -C $cache diff --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null | Where-Object { $_ })
     return "$($changed.Count) files changed under $($Layer.sourcePath)"
 }
 

@@ -249,6 +249,12 @@ function layerNamed(manifest, name) {
   return manifest.layers.find((layer) => layer.name === name);
 }
 
+// The environment a test run gives the installer. MAXSTACK_TEST_MODE turns on the test seam, which lets the fixtures'
+// file remotes be read, so every installer run in these tests sets it. A test of the unset seam builds its own env.
+function testEnvironment(base) {
+  return { ...(base ?? process.env), MAXSTACK_TEST_MODE: '1' };
+}
+
 // Runs the installer. Copilot and Pi are the stand-ins unless the caller names their command.
 function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = writeLayers(ctx), env = undefined } = {}) {
   const copilot = extra.includes('-CopilotCommand') ? [] : ['-CopilotCommand', ctx.fakeCopilot];
@@ -262,7 +268,7 @@ function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = write
     ...(apply ? ['-Apply'] : []),
     ...extra,
   ];
-  return spawnSync(shell, args, { encoding: 'utf8', env: env ?? ctx.env });
+  return spawnSync(shell, args, { encoding: 'utf8', env: testEnvironment(env ?? ctx.env) });
 }
 
 // A junction reports as a symbolic link to lstat.
@@ -3645,4 +3651,19 @@ withWorkspace('a config layer pinned by -Source and audited without -Apply names
   assertOk(audit);
   assert.match(audit.stdout, /Drift: .*opencode\.jsonc: unknown until -Apply syncs the layer cache/, audit.stdout);
   assert.equal(existsSync(join(ctx.workspace, '.claude', 'cache')), false, 'an audit fetched the cache');
+}, {});
+
+// Finding 2: a local tree is read with git, and its .git/config may name a program git runs. An audit must run none of it.
+withWorkspace('an audit of a -Source local tree runs no program that its .git/config names', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'fsmonitor-marker');
+  gitRun(checkout, ['config', 'core.fsmonitor', `touch '${marker.split('\\').join('/')}'`]);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the command that core.fsmonitor names');
 }, {});
