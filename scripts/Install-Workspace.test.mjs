@@ -4265,11 +4265,8 @@ withWorkspace('a tree that names exactly 100 filter drivers is still read', (ctx
   gitRun(checkout, ['add', '-A']);
   gitRun(checkout, ['commit', '-q', '-m', 'layer']);
   appendFileSync(join(checkout, '.git', 'config'), manyFilters(100));
-  // The user's global config may name filters of its own, such as git-lfs, so the count is taken with an empty global file.
-  const emptyGlobal = join(ctx.base, 'empty-gitconfig');
-  writeFileSync(emptyGlobal, '');
-
-  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env: { ...process.env, GIT_CONFIG_GLOBAL: emptyGlobal, GIT_CONFIG_NOSYSTEM: '1' } });
+  // The user's global config may name filters of its own, such as git-lfs, so the count is taken with an empty global config.
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env: homeEnv(join(ctx.base, 'empty-home')) });
   assertOk(audit);
   assert.doesNotMatch(plainOutput(audit), /unreadable/, plainOutput(audit));
   assert.match(plainOutput(audit), /simpsonm09-org-ai-plugin: override, local .*HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
@@ -4293,11 +4290,20 @@ function runGit(dir, args, env = process.env) {
   return run.stdout.trim();
 }
 
-// The environment with a global config file that holds one setting. The file is outside the checkout and the test system config is off.
+// The environment whose HOME holds a .gitconfig with the given settings, which is the user's global config. The installer's git
+// children read the global config from HOME, since GIT_CONFIG_GLOBAL is not passed to them. XDG and the system config are off,
+// so the only global config is this one.
+function homeEnv(home, settings = []) {
+  mkdirSync(home, { recursive: true });
+  const file = join(home, '.gitconfig');
+  writeFileSync(file, '');
+  for (const [key, value] of settings) runGit(home, ['config', '-f', file, key, value]);
+  return { ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+// The environment with a user global config that holds one setting. The file is outside the checkout.
 function globalGitEnv(ctx, key, value) {
-  const file = join(ctx.base, 'global-gitconfig');
-  runGit(ctx.base, ['config', '-f', file, key, value]);
-  return { ...process.env, GIT_CONFIG_GLOBAL: file, GIT_CONFIG_NOSYSTEM: '1' };
+  return homeEnv(join(ctx.base, 'home'), [[key, value]]);
 }
 
 // A local checkout with one committed file, and a .gitattributes that names the mark filter on text files.
@@ -4611,6 +4617,78 @@ test('a git command that names no tree runs outside every repository, so the fol
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+}, {});
+
+// Finding 6: git takes its repository, its worktree, and its settings from variables the installer inherits. The guard removes
+// the variables that name a repository, a config, or a program from each child, and leaves the installer's own environment alone.
+function committedRepo(base, name, text) {
+  const dir = join(base, name);
+  writeFile(dir, 'a.txt', text);
+  runGit(dir, ['init', '-q']);
+  runGit(dir, ['add', '-A']);
+  runGit(dir, ['commit', '-q', '-m', text]);
+  return dir;
+}
+
+function checkoutStateScript(root) {
+  return `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $state = Get-LocalCheckoutState -Root '${root.replace(/\\/g, '/')}'; "COMMIT=$($state.commit) DIRTY=$($state.dirty) UNREADABLE=$($state.unreadable)"`;
+}
+
+test('a checkout state reads its own HEAD, not the HEAD of the repository that GIT_DIR names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-gitdir-'));
+  try {
+    const mine = committedRepo(base, 'mine', 'mine\n');
+    const other = committedRepo(base, 'other', 'other\n');
+    const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
+    const env = { ...testEnvironment(), GIT_DIR: join(other, '.git') };
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} `), run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+test('a checkout state reads its own worktree, not the worktree that GIT_WORK_TREE names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-worktree-'));
+  try {
+    const mine = committedRepo(base, 'mine', 'mine\n');
+    writeFile(mine, 'a.txt', 'changed\n');
+    const clean = committedRepo(base, 'clean', 'clean\n');
+    const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
+    const env = { ...testEnvironment(), GIT_WORK_TREE: clean };
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} DIRTY=True `), run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+withWorkspace('an audit runs no core.fsmonitor that the installer environment names in GIT_CONFIG_PARAMETERS', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  const marker = join(ctx.base, 'params-marker.txt');
+  const command = `sh -c "touch ${marker.replace(/\\/g, '/')}"`;
+  const env = { ...process.env, GIT_CONFIG_PARAMETERS: `'core.fsmonitor'='${command}'` };
+  runGit(checkout, ['status', '--porcelain'], env);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the fsmonitor command that GIT_CONFIG_PARAMETERS names');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the fsmonitor command that GIT_CONFIG_PARAMETERS names');
+}, {});
+
+test('the child environment loses each inherited git variable that names a repository, config, or program, and keeps the rest', { skip }, () => {
+  const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXTERNAL_DIFF',
+    'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'];
+  // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_NOSYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
 }, {});
 
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the

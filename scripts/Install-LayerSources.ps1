@@ -105,13 +105,23 @@ function Get-GitChildVariables {
     return $variables
 }
 
-# Sets a git child's environment to those variables. The child inherits the installer's environment, so any GIT_CONFIG_* entry
-# it holds is removed from the child first. Only the child's environment is set, never the installer's.
+# git's variables that name a repository, a worktree, a config, or a program. A child inherits them from the installer, so one of
+# them could point git at another repository, or add a setting or run a program that the guard does not name. They are removed
+# from the child only. GIT_CONFIG_NOSYSTEM is not here: it is a hardening flag, so the user's choice is left as it is.
+$script:GitInheritedVariables = @(
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+    'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'
+)
+
+# Sets a git child's environment to those variables. The child inherits the installer's environment, so the variables in
+# GitInheritedVariables and any GIT_CONFIG_* entry it holds are removed from the child first. Names match case-insensitively,
+# as Windows environment names do. Only the child's environment is set, never the installer's.
 function Set-GitChildEnvironment {
     param($Environment, $Settings)
 
     foreach ($key in @($Environment.Keys)) {
-        if ($key -cmatch '^GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+)\z') { [void] $Environment.Remove($key) }
+        if ($key -match '^GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+)\z' -or $key -in $script:GitInheritedVariables) { [void] $Environment.Remove($key) }
     }
     foreach ($entry in (Get-GitChildVariables -Settings $Settings).GetEnumerator()) {
         $Environment[$entry.Key] = $entry.Value
