@@ -136,6 +136,14 @@ function Read-LocalSpec {
     return [pscustomobject]@{ kind = 'local'; path = ([IO.Path]::GetFullPath($Path).TrimEnd('\')) }
 }
 
+# Whether a url is an https address with a host and a path. A -Source spec and a recorded override both use this rule.
+# \z, not $, so a trailing newline is not accepted.
+function Test-HttpsGitUrl {
+    param([string] $Url)
+
+    return ($Url -cmatch '^https://[^/\\?#@]+/[^\\?#@]+\z')
+}
+
 # A git spec is owner/repo@ref, or https://host/path@ref. The ref is the part after the last @.
 function Read-GitSpec {
     param([string] $Name, [string] $Spec)
@@ -147,7 +155,7 @@ function Read-GitSpec {
     if (-not (Test-SafeRefName $ref)) { throw "-Source $Name=${Spec}: '$ref' is not a safe git ref name." }
     if ($location -match '^([A-Za-z]:[\\/]|[\\/])') { throw "-Source $Name=${Spec} names a folder with an @ref, which is not a git source: did you mean local:${location}?" }
     if ($location -match '^[A-Za-z][A-Za-z0-9+.-]*:') {
-        if ($location -cnotmatch '^https://[^/\\?#@]+/[^\\?#@]+$') {
+        if (-not (Test-HttpsGitUrl $location)) {
             throw "-Source $Name=${Spec}: only https:// URLs with a host and a path are allowed."
         }
         return [pscustomobject]@{ kind = 'git'; url = $location; ref = $ref }
@@ -377,47 +385,63 @@ function New-SourceRecord {
     return [pscustomobject]@{ kind = 'local'; url = $Layer.recordUrl; ref = $null; commit = $Layer.commit; dirty = $Layer.dirty; override = $Layer.override; path = $Layer.localPath }
 }
 
-# The source block of each layer the lock records as an override. A plain apply reuses these, after each is checked.
+# The recorded overrides the lock holds, split into those that pass the -Source rules and those that do not. A plain apply
+# reuses the valid ones. An invalid one is never used: the caller decides whether it stops the run or is ignored.
 function Get-RecordedOverrides {
     param($Stack)
 
     $overrides = @{}
+    $invalid = @{}
     foreach ($layer in @($Stack.layers)) {
         $block = Get-Field $layer 'source'
-        if (($block -is [pscustomobject]) -and ((Get-Field $block 'override') -eq $true)) {
-            Assert-RecordedSource -Name $layer.name -Block $block
-            $overrides[$layer.name] = $block
-        }
+        if (-not (($block -is [pscustomobject]) -and ((Get-Field $block 'override') -eq $true))) { continue }
+        $fault = Get-RecordedSourceFault $block
+        if ($fault) { $invalid[$layer.name] = $fault } else { $overrides[$layer.name] = $block }
     }
-    return $overrides
+    return [pscustomobject]@{ overrides = $overrides; invalid = $invalid }
 }
 
-# Stops on a field of a recorded override that the -Source rules refuse. The lock is a file a user can edit, so its
-# url, ref, commit, and path are checked before any git command or path use takes them.
-function Assert-RecordField {
-    param([string] $Name, [string] $Field, [string] $Reason)
-
-    if ($Reason) { throw "stack.lock.json: layer '$Name' has an invalid ${Field}: $Reason Fix the lock, or drop the override with -Source $Name=default." }
-}
-
-# Checks a recorded override. A git record holds an https url (or a local path under the test seam), a safe ref, and a
-# full commit. A local record holds a path that passes Get-LocalPathFault.
-function Assert-RecordedSource {
-    param([string] $Name, $Block)
+# The first field of a recorded override that the -Source rules refuse, as { field; reason }, or $null when every field
+# passes. The lock is a file a user can edit, so its url, ref, commit, and path are checked before a git command or a
+# path use takes them. A git record holds an https url (or a local path under the test seam), a safe ref, and a full
+# commit. A local record holds a path that passes Get-LocalPathFault.
+function Get-RecordedSourceFault {
+    param($Block)
 
     $kind = Get-Field $Block 'kind'
     if ($kind -eq 'local') {
-        Assert-RecordField -Name $Name -Field 'path' -Reason (Get-LocalPathFault (Get-Field $Block 'path'))
-        return
+        $reason = Get-LocalPathFault (Get-Field $Block 'path')
+        if ($reason) { return [pscustomobject]@{ field = 'path'; reason = $reason } }
+        return $null
     }
-    if ($kind -ne 'git') { Assert-RecordField -Name $Name -Field 'kind' -Reason 'it is neither git nor local.' }
+    if ($kind -ne 'git') { return [pscustomobject]@{ field = 'kind'; reason = 'it is neither git nor local.' } }
     $url = Get-Field $Block 'url'
-    $httpsUrl = (Test-NonEmptyString $url) -and ($url -cmatch '^https://[^/\\?#@]+/[^\\?#@]+$')
-    $seamUrl = (Test-TestSeam) -and (Test-NonEmptyString $url) -and ($url -cmatch '^([A-Za-z]:/|/)[^\x00-\x1f\x7f@]+$')
-    if (-not ($httpsUrl -or $seamUrl)) { Assert-RecordField -Name $Name -Field 'url' -Reason 'it is not an https address with a host and a path.' }
+    $httpsUrl = (Test-NonEmptyString $url) -and (Test-HttpsGitUrl $url)
+    $seamUrl = (Test-TestSeam) -and (Test-NonEmptyString $url) -and ($url -cmatch '^([A-Za-z]:/|/)[^\x00-\x1f\x7f@]+\z')
+    if (-not ($httpsUrl -or $seamUrl)) { return [pscustomobject]@{ field = 'url'; reason = 'it is not an https address with a host and a path.' } }
     $ref = Get-Field $Block 'ref'
-    if (-not ((Test-NonEmptyString $ref) -and (Test-SafeRefName $ref))) { Assert-RecordField -Name $Name -Field 'ref' -Reason 'it is not a safe git ref name.' }
-    if (-not (Test-CommitRef (Get-Field $Block 'commit'))) { Assert-RecordField -Name $Name -Field 'commit' -Reason 'it is not a full 40-character lowercase commit SHA.' }
+    if (-not ((Test-NonEmptyString $ref) -and (Test-SafeRefName $ref))) { return [pscustomobject]@{ field = 'ref'; reason = 'it is not a safe git ref name.' } }
+    if (-not (Test-CommitRef (Get-Field $Block 'commit'))) { return [pscustomobject]@{ field = 'commit'; reason = 'it is not a full 40-character lowercase commit SHA.' } }
+    return $null
+}
+
+# The one-line words for a layer's invalid recorded override.
+function Format-RecordedFault {
+    param([string] $Name, $Fault)
+
+    return "stack.lock.json: layer '$Name' has an invalid $($Fault.field): $($Fault.reason)"
+}
+
+# Warns about each invalid recorded override that this run does not write, and prints the report line for it. A layer
+# named in -Source is replaced by that spec, so it is not reported. The layer takes its layers.json source for this run.
+function Write-InvalidRecordedSources {
+    param($Invalid, [string[]] $Skip)
+
+    foreach ($name in @($Invalid.Keys | Sort-Object)) {
+        if ($Skip -ccontains $name) { continue }
+        Write-Warning "$(Format-RecordedFault $name $Invalid[$name]). This run ignores the recorded override and uses the layers.json source. Repair it with -Source $name=default -Apply."
+        Write-Host "  ${name}: invalid recorded source, ignored for this run"
+    }
 }
 
 # The source a lock records for a layer, or the one its layers.json entry implies when the lock predates the source

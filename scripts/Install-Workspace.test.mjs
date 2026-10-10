@@ -3797,7 +3797,9 @@ function sourceBlockIn(lock, name) {
   return lock.layers.find((layer) => layer.name === name).source;
 }
 
-withWorkspace('a git override the lock holds with a bad url, ref, or commit is refused by layer and field, before git runs', (ctx) => {
+// Round 2, B: an invalid recorded override is a warning for every mode that does not write its layer. A plain apply that
+// would write the layer stops before any write, and names the one command that repairs it.
+withWorkspace('a git override the lock holds with a bad url, ref, or commit is ignored with a warning, and a plain apply refuses it', (ctx) => {
   servedFeature(ctx);
   mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
   const good = readJson(lockPath(ctx));
@@ -3806,20 +3808,22 @@ withWorkspace('a git override the lock holds with a bad url, ref, or commit is r
     mutate(sourceBlockIn(lock, 'pstack'));
     setLock(ctx, lock);
     const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
-    assert.notEqual(status.status, 0, `-Status read a lock whose ${field} is invalid`);
-    assert.match(plainOutput(status), new RegExp(`layer 'pstack'.*${field}`), plainOutput(status));
+    assertOk(status);
+    assert.match(plainOutput(status), new RegExp(`layer 'pstack' has an invalid ${field}`), plainOutput(status));
+    assert.match(status.stdout, /pstack: invalid recorded source, ignored for this run/, status.stdout);
   }
   const lock = structuredClone(good);
   sourceBlockIn(lock, 'pstack').url = 'ext::sh -c touch x';
   setLock(ctx, lock);
   const before = snapshotTree(ctx.workspace);
   const apply = runInstaller(shell, ctx, [], { env: githubEnv(ctx) });
-  assert.notEqual(apply.status, 0, 'an apply read a lock whose url is invalid');
-  assert.match(plainOutput(apply), /layer 'pstack'.*url/, plainOutput(apply));
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded url is invalid');
+  assert.match(plainOutput(apply), /layer 'pstack' has an invalid url/, plainOutput(apply));
+  assert.match(plainOutput(apply), /-Source pstack=default -Apply/, plainOutput(apply));
   assert.deepEqual(snapshotTree(ctx.workspace), before, 'a refused lock changed the install');
 }, {});
 
-withWorkspace('a local override the lock holds with a relative path is refused by layer and field', (ctx) => {
+withWorkspace('a local override the lock holds with a relative path is ignored by -Status, and a plain apply refuses it', (ctx) => {
   const checkout = join(ctx.base, 'org-checkout');
   writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
   mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
@@ -3827,8 +3831,26 @@ withWorkspace('a local override the lock holds with a relative path is refused b
   sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = 'relative/checkout';
   setLock(ctx, lock);
   const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
-  assert.notEqual(status.status, 0, '-Status read a relative local path');
-  assert.match(plainOutput(status), /layer 'simpsonm09-org-ai-plugin'.*path/, plainOutput(status));
+  assertOk(status);
+  assert.match(plainOutput(status), /layer 'simpsonm09-org-ai-plugin' has an invalid path/, plainOutput(status));
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded path is relative');
+  assert.match(plainOutput(apply), /-Source simpsonm09-org-ai-plugin=default -Apply/, plainOutput(apply));
+}, {});
+
+withWorkspace('an invalid recorded override is ignored by -Update, -Remove, and -Uninstall, and -Source name=default -Apply repairs it', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'pstack').url = 'ext::sh -c touch x';
+  setLock(ctx, lock);
+  for (const args of [['-Update', '-Check'], ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], ['-Uninstall']]) {
+    const run = runInstaller(shell, ctx, args, { apply: false, env: githubEnv(ctx) });
+    assertOk(run);
+    assert.match(run.stdout, /pstack: invalid recorded source, ignored for this run/, `${args.join(' ')}: ${run.stdout}`);
+  }
+  mustApply(ctx, ['-Source', 'pstack=default']);
+  assert.equal(sourceOf(ctx, 'pstack').source.override, false, 'the repair did not drop the invalid override');
 }, {});
 
 // Finding 7: git never waits on a credential prompt, and ls-remote gives up after its time limit with the reason.

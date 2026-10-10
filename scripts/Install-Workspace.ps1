@@ -2759,6 +2759,7 @@ $priorStack = $null
 $priorLayers = @{}
 # The source overrides the lock records. A plain apply reuses them until -Source name=default drops one.
 $recordedOverrides = @{}
+$recordedInvalid = @{}
 $priorPi = $null
 # The ownership list the previous apply wrote. $null means the lock predates it, or there is no lock.
 $priorOwned = $null
@@ -2773,7 +2774,9 @@ if (Test-Path -LiteralPath $stackTarget -PathType Leaf) {
     foreach ($priorLayer in @($priorStack.layers)) {
         $priorLayers[$priorLayer.name] = $priorLayer
     }
-    $recordedOverrides = Get-RecordedOverrides $priorStack
+    $recorded = Get-RecordedOverrides $priorStack
+    $recordedOverrides = $recorded.overrides
+    $recordedInvalid = $recorded.invalid
     $priorPi = Get-Field $priorStack 'pi'
     if ($null -ne $priorStack.PSObject.Properties['owned']) { $priorOwned = @($priorStack.owned | Where-Object { $null -ne $_ }) }
     if ($null -ne $priorStack.PSObject.Properties['createdDirs']) { $priorCreatedDirs = @($priorStack.createdDirs) }
@@ -2818,6 +2821,7 @@ if ($updating) {
     if ($null -eq (Get-Field $priorStack 'selection')) { throw "stack.lock.json predates the selection, so -Update cannot tell which layers and runtimes to update. Run Install-Workspace.ps1 -Apply once, then -Update." }
 }
 if ($uninstalling) {
+    Write-InvalidRecordedSources -Invalid $recordedInvalid -Skip @($explicitSources.Keys)
     Invoke-UninstallFlow
     return
 }
@@ -2877,6 +2881,15 @@ foreach ($layer in $allLayers) {
     $layer.runtimes = $active
 }
 # Every layer's source is chosen before the active set is cut, so an unselected layer's lock record is right too.
+# A plain apply writes every selected layer, so it stops on an invalid recorded override that it would write, before any
+# write, and names the command that repairs it. The other modes warn, and the layer takes its layers.json source.
+if ($Apply) {
+    foreach ($name in @($recordedInvalid.Keys | Sort-Object)) {
+        if (($explicitSources.ContainsKey($name)) -or ($selectedLayers -cnotcontains $name)) { continue }
+        throw "$(Format-RecordedFault $name $recordedInvalid[$name]). Repair it with: pwsh -File scripts/Install-Workspace.ps1 -Source $name=default -Apply"
+    }
+}
+Write-InvalidRecordedSources -Invalid $recordedInvalid -Skip @($explicitSources.Keys)
 Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $updating -SelectedLayers $selectedLayers
 $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
