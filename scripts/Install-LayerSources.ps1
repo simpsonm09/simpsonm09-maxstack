@@ -298,6 +298,15 @@ function Get-RecordedSourceOf {
     }
 }
 
+# The dirty flag as the block words it. A record from before the flag was kept has none, and says so rather than guessing.
+function Format-DirtyLabel {
+    param($Dirty)
+
+    if ($null -eq $Dirty) { return 'dirty state not recorded' }
+    if ($Dirty) { return 'uncommitted changes' }
+    return 'clean'
+}
+
 # The lines of the layer-source block: every override, every local source, and every source whose ref moves. A git
 # source that is pinned by commit and not overridden is at its committed pin, so it is not listed. Empty when none is.
 function Get-SourcePinLines {
@@ -310,8 +319,7 @@ function Get-SourcePinLines {
             if ($source.override) { $lines.Add("  $($entry.name): override, git $($source.url) ref $($source.ref) at $($source.commit)") }
             continue
         }
-        $state = if ($null -eq $source.dirty) { 'not a git checkout' } elseif ($source.dirty) { 'uncommitted changes' } else { 'clean' }
-        $where = if ($null -ne $source.commit) { "HEAD $($source.commit), $state" } else { $state }
+        $where = if ($null -eq $source.commit) { 'not a git checkout' } else { "HEAD $($source.commit), $(Format-DirtyLabel $source.dirty)" }
         $kind = if ($source.override) { 'override, local' } else { 'local, default' }
         $lines.Add("  $($entry.name): $kind $($source.path) ($where)")
     }

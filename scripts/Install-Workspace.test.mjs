@@ -3589,3 +3589,20 @@ withWorkspace('-Update prints the pin hint when layers.json\'s branch has moved,
   assert.match(run.stdout, /-Update never moves a pin/, run.stdout);
   assert.equal(readFileSync(lockPath(ctx), 'utf8'), lockBefore, 'the hint changed the lock');
 }, {});
+
+withWorkspace('a lock from before the source block lists its local layers as defaults, and names no dirty state it never recorded', (ctx) => {
+  mustApply(ctx);
+  const lock = readJson(lockPath(ctx));
+  const LEGACY_COMMIT = 'b'.repeat(40);
+  for (const layer of lock.layers) {
+    layer.source = layer.source.url;
+  }
+  lock.layers.find((layer) => layer.name === 'simpsonm09-org-ai-plugin').commit = LEGACY_COMMIT;
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  const text = sourceBlockOf(status.stdout).lines.join('\n');
+  assert.match(text, new RegExp(`simpsonm09-org-ai-plugin: local, default \\S+ \\(HEAD ${LEGACY_COMMIT}, dirty state not recorded\\)`), text);
+  assert.doesNotMatch(text, /pstack/, 'the pinned pstack layer is listed');
+}, {});
