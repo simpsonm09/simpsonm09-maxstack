@@ -4058,3 +4058,18 @@ withWorkspace('an audit of a -Source local tree runs no clean filter that its .g
   assertOk(audit);
   assert.equal(existsSync(marker), false, 'the audit ran the clean filter that .git/config names');
 }, {});
+
+// Round 2, E: the installer needs PowerShell 7. Windows PowerShell 5.1 must stop with that requirement, not a parse error.
+const windowsPowerShell = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']).status === 0;
+test('the installer under Windows PowerShell 5.1 stops with the PowerShell 7 requirement, not a parse error', { skip: windowsPowerShell ? false : 'powershell.exe is not available' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-requires-'));
+  try {
+    const run = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', join(base, 'missing')], { encoding: 'utf8' });
+    const text = plainOutput(run);
+    assert.notEqual(run.status, 0, text);
+    assert.match(text, /#requires.*7\.0/i, text);
+    assert.doesNotMatch(text, /ParserError|Unexpected token|Array index expression/, text);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});

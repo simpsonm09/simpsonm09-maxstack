@@ -1,4 +1,5 @@
 # platforms: windows
+#requires -Version 7.0
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [string] $Workspace = 'D:\dev\simpsonm09',

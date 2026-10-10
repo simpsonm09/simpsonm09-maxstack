@@ -1,5 +1,7 @@
 # Install and reload
 
+> **Requires PowerShell 7 or later (`pwsh`).** `scripts/Install-Workspace.ps1` declares `#requires -Version 7.0`. Windows PowerShell 5.1 (`powershell.exe`) stops at once with that requirement and does not run the installer. Every installer command in this document is written as `pwsh -File`.
+
 ## Model
 
 maxstack sets no model. The workspace `opencode.jsonc` has no `model` or `small_model` key, and the installed agent profiles have no `model:` line, so each agent runs the model the session uses. You pick that model in the harness: the T3 Code model picker for a thread or project, or your own OpenCode, Claude Code, or Copilot settings. The PStack Claude plugin's per-role models are set with its own `/setup-pstack` command.
