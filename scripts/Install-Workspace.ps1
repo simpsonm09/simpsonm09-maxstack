@@ -2933,7 +2933,7 @@ foreach ($layer in $allLayers) {
 if ($Apply) {
     foreach ($name in @($recordedInvalid.Keys | Sort-Object)) {
         if (($explicitSources.ContainsKey($name)) -or ($selectedLayers -cnotcontains $name)) { continue }
-        throw "$(Format-RecordedFault $name $recordedInvalid[$name]). Repair it with: pwsh -File scripts/Install-Workspace.ps1 -Source $name=default -Apply"
+        throw "$(Format-RecordedFault $name $recordedInvalid[$name]) Repair it with: pwsh -File scripts/Install-Workspace.ps1 -Source $name=default -Apply"
     }
 }
 Write-InvalidRecordedSources -Invalid $recordedInvalid -Skip @($explicitSources.Keys)

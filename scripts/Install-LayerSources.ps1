@@ -679,7 +679,7 @@ function Write-InvalidRecordedSources {
 
     foreach ($name in @($Invalid.Keys | Sort-Object)) {
         if ($Skip -ccontains $name) { continue }
-        Write-Warning "$(Format-RecordedFault $name $Invalid[$name]). This run ignores the recorded override and uses the layers.json source. Repair it with -Source $name=default -Apply."
+        Write-Warning "$(Format-RecordedFault $name $Invalid[$name]) This run ignores the recorded override and uses the layers.json source. Repair it with -Source $name=default -Apply."
         Write-Host "  ${name}: invalid recorded source, ignored for this run"
     }
 }

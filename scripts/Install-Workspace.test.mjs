@@ -4419,3 +4419,23 @@ withWorkspace('a SHA-256 checkout reads its dirty state as unknown, since the st
   assertOk(audit);
   assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{64}, dirty state not recorded\)/, plainOutput(audit));
 }, {});
+
+// Finding 9: a recorded fault already ends in a period, so the warning and the refusal join it with a space, not a second period.
+withWorkspace('a recorded override with a relative path is warned and refused with one period after the reason', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = 'relative/checkout';
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /has an invalid path: needs an absolute path\. This run ignores/, plainOutput(status));
+  assert.doesNotMatch(plainOutput(status), /absolute path\.\./, plainOutput(status));
+
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded path is relative');
+  assert.match(plainOutput(apply), /has an invalid path: needs an absolute path\. Repair it with/, plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /absolute path\.\./, plainOutput(apply));
+}, {});
