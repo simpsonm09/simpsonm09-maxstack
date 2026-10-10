@@ -4832,6 +4832,24 @@ test('the guard turns core.fsmonitor off with the empty string, which no git ver
   assert.match(run.stdout, /FSM=\[\] COUNT=1/, run.stdout);
 }, {});
 
+// Finding 11: the eol attributes that the status now reads must not hide a real change. A changed eol=crlf file is dirty.
+withWorkspace('a changed eol=crlf file reads as uncommitted changes, so the tree attributes do not hide an edit', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, '.gitattributes', '*.ps1 text eol=crlf\n');
+  writeFile(checkout, 'tool.ps1', 'one\r\ntwo\r\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['config', 'core.autocrlf', 'false']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, 'tool.ps1', 'one\r\nthree\r\n');
+  bumpMtime(join(checkout, 'tool.ps1'));
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {
