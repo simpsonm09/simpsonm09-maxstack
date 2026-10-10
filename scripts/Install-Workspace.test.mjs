@@ -2582,7 +2582,7 @@ withWorkspace('the removal switches refuse each other, -Status, and a missing se
     [['-Uninstall', '-Status'], /Choose -Status, -Remove, or -Uninstall/],
     [['-Uninstall', '-Runtimes', 'pi'], /takes no -Runtimes or -Layers/],
     [['-Remove'], /names what to remove/],
-    [['-Strict'], /applies to -Status, -Remove, and -Uninstall/],
+    [['-Strict'], /applies to -Status, -Remove, -Uninstall, and -Update/],
   ];
   for (const [args, pattern] of cases) {
     const run = runInstaller(shell, ctx, args, { apply: false });
@@ -3447,4 +3447,145 @@ withWorkspace('an audit names the source it would install, and writes nothing', 
   assert.ok(block, audit.stdout);
   assert.match(block.lines.join('\n'), new RegExp(`pstack: override, git \\S+ ref feat at ${featCommit}`));
   assert.deepEqual(snapshotTree(ctx.workspace), before, 'an audit changed the workspace');
+}, {});
+
+// -Update: a branch or tag override moves to its current commit, a commit pin and a default pin do not, and a local
+// source is re-read. A check writes nothing. A failed resolve leaves the install as it was.
+const SKILL_FEAT_TWO = '---\nname: poteto-mode\ndescription: fixture\n---\nfeat body two\n';
+
+// Moves the feat branch on the served repository to a new commit, which the workspace has not fetched.
+function moveFeat(ctx, bare) {
+  return commitToBranch(ctx, bare, 'feat', SKILL_PATH, SKILL_FEAT_TWO);
+}
+
+withWorkspace('-Update moves a branch override to its current commit and records it, and a dry run changes nothing', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lockBefore = readFileSync(lockPath(ctx), 'utf8');
+  const featTwo = moveFeat(ctx, bare);
+
+  const dry = runInstaller(shell, ctx, ['-Update'], { apply: false, env: githubEnv(ctx) });
+  assertOk(dry);
+  assert.match(dry.stdout, new RegExp(`feat ${featCommit} -> ${featTwo}`), dry.stdout);
+  assert.equal(readFileSync(lockPath(ctx), 'utf8'), lockBefore, 'a dry -Update changed the lock');
+
+  mustApply(ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featTwo, 'the branch override did not move');
+  assert.equal(sourceOf(ctx, 'pstack').source.override, true);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body two/, 'the moved content was not installed');
+}, {});
+
+withWorkspace('-Update does not move a commit pin, even when its branch has moved', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', `pstack=simpsonm09/pstack-claude@${featCommit}`], { env: githubEnv(ctx) });
+  moveFeat(ctx, bare);
+  mustApply(ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'a commit pin moved');
+  assert.equal(sourceOf(ctx, 'pstack').source.ref, featCommit);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/);
+  assert.doesNotMatch(readFileSync(installedSkill(ctx), 'utf8'), /feat body two/);
+}, {});
+
+withWorkspace('-Update -Check writes nothing, not even the cache, and reports the move and the drift', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const featTwo = moveFeat(ctx, bare);
+  const before = snapshotTree(ctx.workspace);
+  const lockBefore = readFileSync(lockPath(ctx));
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.match(check.stdout, new RegExp(`feat ${featCommit} -> ${featTwo}`), check.stdout);
+  assert.match(check.stdout, /needs fetch/, check.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, '-Update -Check changed the tree or the cache');
+  assert.deepEqual(readFileSync(lockPath(ctx)), lockBefore, '-Update -Check changed the lock');
+
+  const strict = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false, env: githubEnv(ctx) });
+  assert.equal(strict.status, 1, `-Strict did not exit 1 when a source would move:\n${strict.stdout}`);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'the strict check changed the tree or the cache');
+}, {});
+
+withWorkspace('-Update -Check -Strict exits 0 when nothing would change', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx);
+  const strict = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false, env: githubEnv(ctx) });
+  assert.equal(strict.status, 0, `${strict.stdout}\n${strict.stderr}`);
+  assert.match(strict.stdout, /Nothing would change/, strict.stdout);
+}, {});
+
+withWorkspace('-Update needs a lock with a selection, and refuses the flags it does not take', (ctx) => {
+  const none = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assert.notEqual(none.status, 0, '-Update ran without a lock');
+  assert.match(plainOutput(none), /needs a stack\.lock\.json with a selection/, none.stdout);
+
+  mustApply(ctx);
+  const lock = readJson(lockPath(ctx));
+  delete lock.selection;
+  setLock(ctx, lock);
+  const legacy = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assert.notEqual(legacy.status, 0, '-Update ran on a lock with no selection');
+  assert.match(plainOutput(legacy), /predates the selection/, legacy.stdout);
+
+  mustApply(ctx);
+  for (const [args, reason] of [
+    [['-Update', '-Remove', '-Layers', 'pstack'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Uninstall'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Status'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Source', 'pstack=simpsonm09/pstack-claude@feat'], /Set a source with -Source and an apply/],
+    [['-Update', '-Layers', 'pstack'], /applies the recorded selection/],
+    [['-Check'], /-Check applies to -Update/],
+    [['-Update', '-Check', '-Apply'], /-Check writes nothing/],
+    [['-Update', '-Apply', '-Strict'], /reports and writes nothing/],
+  ]) {
+    const run = runInstaller(shell, ctx, args, { apply: false, env: githubEnv(ctx) });
+    assert.notEqual(run.status, 0, `${args.join(' ')} was accepted`);
+    assert.match(plainOutput(run), reason, `${args.join(' ')}: ${run.stdout}\n${run.stderr}`);
+  }
+}, {});
+
+withWorkspace('-Update re-reads a local source, and an apply then installs what the checkout holds', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, 'index.ts', 'export default { edit: 1 };\n');
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+
+  writeFile(checkout, 'index.ts', 'export default { edit: 2 };\n');
+  const installed = join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'index.ts');
+  const check = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false });
+  assert.equal(check.status, 1, `the edited checkout was not reported:\n${check.stdout}`);
+  assert.match(readFileSync(installed, 'utf8'), /edit: 1/, 'the check changed the install');
+
+  mustApply(ctx, ['-Update']);
+  assert.match(readFileSync(installed, 'utf8'), /edit: 2/, '-Update did not re-read the checkout');
+  assert.equal(sourceOf(ctx, 'simpsonm09-org-ai-plugin').source.dirty, true);
+}, {});
+
+withWorkspace('a -Update whose branch cannot be resolved fails with the reason, and leaves the install untouched', (ctx) => {
+  const { bare } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  gitRun(bare, ['update-ref', '-d', 'refs/heads/feat']);
+  const before = snapshotTree(ctx.workspace);
+  const run = runInstaller(shell, ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.notEqual(run.status, 0, '-Update resolved a branch that is gone');
+  assert.match(plainOutput(run), /has no branch or tag named feat/, run.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a failed -Update changed the install');
+}, {});
+
+withWorkspace('-Update prints the pin hint when layers.json\'s branch has moved, and moves no pin', (ctx) => {
+  mustApply(ctx);
+  const lockBefore = readFileSync(lockPath(ctx), 'utf8');
+  gitRun(ctx.fixture.dir, ['checkout', '-q', '-b', 'test']);
+  writeFile(ctx.fixture.dir, SKILL_PATH, '---\nname: poteto-mode\ndescription: fixture\n---\nnewer\n');
+  gitRun(ctx.fixture.dir, ['add', '-A']);
+  gitRun(ctx.fixture.dir, ['commit', '-q', '-m', 'newer']);
+  const newer = gitRun(ctx.fixture.dir, ['rev-parse', 'HEAD']);
+
+  const run = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assertOk(run);
+  assert.match(run.stdout, new RegExp(`layers\\.json pins ${ctx.fixture.commit}, and test is at ${newer}`), run.stdout);
+  assert.match(run.stdout, /-Update never moves a pin/, run.stdout);
+  assert.equal(readFileSync(lockPath(ctx), 'utf8'), lockBefore, 'the hint changed the lock');
 }, {});

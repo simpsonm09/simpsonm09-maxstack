@@ -341,3 +341,141 @@ function Get-ResolvedSourceEntries {
 
     return @($Layers | ForEach-Object { [pscustomobject]@{ name = $_.name; source = New-SourceRecord $_ } })
 }
+
+# ---- -Update: move branch and tag overrides to their current commit, re-read local sources, and report the change ----
+
+function Format-Commit {
+    param($Commit)
+
+    if ($null -eq $Commit) { return 'none' }
+    return [string] $Commit
+}
+
+function Format-DirtyState {
+    param($Dirty)
+
+    if ($null -eq $Dirty) { return 'unknown' }
+    if ($Dirty) { return 'yes' }
+    return 'no'
+}
+
+# Whether a commit is in a layer's cache. The check reads the cache and never fetches: --no-lazy-fetch stops git from
+# pulling a missing object from origin, so a check leaves the cache byte for byte as it was.
+function Test-CachedCommit {
+    param([string] $Cache, [string] $Commit)
+
+    if ([string]::IsNullOrEmpty($Commit) -or -not (Test-Path -LiteralPath (Join-Path $Cache '.git'))) { return $false }
+    & git --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# What a git source's move changes under the layer's folder, read from the cache. A commit the cache does not hold
+# is named as needing a fetch, since a check writes nothing and cannot read it.
+function Get-MoveFilesNote {
+    param($Layer, [string] $OldCommit)
+
+    $cache = Join-Path $claudeCacheTarget $Layer.name
+    if (-not (Test-CachedCommit $cache $Layer.commit)) {
+        return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
+    }
+    if (-not (Test-CachedCommit $cache $OldCommit)) { return 'changed files unknown: the old commit is not in the cache' }
+    $changed = @(& git --no-lazy-fetch -C $cache diff --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null | Where-Object { $_ })
+    return "$($changed.Count) files changed under $($Layer.sourcePath)"
+}
+
+# One layer's line in the -Update report, and whether the layer's source changes. A branch or tag override moves to its
+# current commit. A commit pin never moves, and neither does a layers.json pin. A local source is read again, and its
+# HEAD and dirty flag are compared with the record. The owned paths an apply would rewrite are reported separately.
+function Get-SourceUpdate {
+    param($Layer, $PriorSource)
+
+    $oldCommit = Get-Field $PriorSource 'commit'
+    if ($Layer.sourceKind -eq 'local') {
+        $was = Format-DirtyState (Get-Field $PriorSource 'dirty')
+        $now = Format-DirtyState $Layer.dirty
+        $head = "HEAD $(Format-Commit $oldCommit) -> $(Format-Commit $Layer.commit)"
+        return [pscustomobject]@{
+            line    = "  $($Layer.name): local $($Layer.localPath): $head, uncommitted changes $was -> $now"
+            changed = (($oldCommit -cne $Layer.commit) -or ($was -cne $now))
+        }
+    }
+    if (-not $Layer.override) {
+        return [pscustomobject]@{ line = "  $($Layer.name): pinned at $($Layer.commit) in layers.json"; changed = $false }
+    }
+    if (Test-CommitRef $Layer.ref) {
+        return [pscustomobject]@{ line = "  $($Layer.name): override pinned to commit $($Layer.commit), not moved"; changed = $false }
+    }
+    if ($oldCommit -ceq $Layer.commit) {
+        return [pscustomobject]@{ line = "  $($Layer.name): $($Layer.ref) is at $($Layer.commit), unchanged"; changed = $false }
+    }
+    $note = Get-MoveFilesNote -Layer $Layer -OldCommit $oldCommit
+    return [pscustomobject]@{ line = "  $($Layer.name): $($Layer.ref) $oldCommit -> $($Layer.commit); $note"; changed = $true }
+}
+
+# The hint for a layers.json pin whose branch has moved on. -Update never moves a pin, so the line names the change to
+# make by hand. A branch that cannot be read is named, and the report goes on, since no install depends on the hint.
+function Get-PinHint {
+    param($Layer)
+
+    if (-not $Layer.defaultGit -or (Test-CommitRef $Layer.defaultRef)) { return $null }
+    try {
+        $head = Find-GitRefCommit -Url $Layer.defaultUrl -Ref $Layer.defaultRef
+    } catch {
+        return "  $($Layer.name): cannot read $($Layer.defaultRef) to check the pin: $($_.Exception.Message)"
+    }
+    if ($head -ceq $Layer.defaultCommit) { return $null }
+    return "  $($Layer.name): layers.json pins $($Layer.defaultCommit), and $($Layer.defaultRef) is at $head. -Update never moves a pin. To move it, change source.commit in layers.json (and the matching pin in pstack.lock.json), then run verify-manifests."
+}
+
+# The record one layer has in the lock, or $null when the lock names none.
+function Get-PriorLayerRecord {
+    param($Stack, [string] $Name)
+
+    if ($null -eq $Stack) { return $null }
+    return (@($Stack.layers | Where-Object { $_.name -ceq $Name }) | Select-Object -First 1)
+}
+
+# The -Update report: each selected layer's source as it stands and as -Update would resolve it, the pin hints, and each
+# owned path an apply would rewrite. It writes nothing. Returns the number of changes, which -Strict counts.
+function Write-UpdateReport {
+    param(
+        [object[]] $Layers,
+        $PriorStack,
+        [string[]] $SelectedLayers,
+        [string[]] $SelectedRuntimes,
+        [object[]] $Plan,
+        $Owned,
+        [string[]] $NotSelected
+    )
+
+    Write-Host 'Layer sources (-Update):'
+    $changes = 0
+    foreach ($layer in @($Layers | Where-Object { $SelectedLayers -ccontains $_.name })) {
+        $prior = Get-PriorLayerRecord -Stack $PriorStack -Name $layer.name
+        $priorSource = $null
+        if ($null -ne $prior) { $priorSource = Get-RecordedSourceOf $prior }
+        $update = Get-SourceUpdate -Layer $layer -PriorSource $priorSource
+        Write-Host $update.line
+        if ($update.changed) { $changes++ }
+        $hint = Get-PinHint $layer
+        if ($hint) { Write-Host $hint }
+    }
+    if ($null -eq $Owned) {
+        Write-Host 'no ownership record; -Update -Apply writes one'
+        return $changes
+    }
+    $results = @(Get-OwnershipReport -Recorded $Owned -Plan $Plan -SelectedRuntimes $SelectedRuntimes -NotSelected $NotSelected)
+    $moving = @($results | Where-Object { $_.state -in @('drifted', 'modified', 'missing') })
+    foreach ($item in $moving) { Write-Host ('  would change {0,-9} {1}' -f $item.state, $item.label) }
+    return ($changes + $moving.Count)
+}
+
+function Write-UpdateSummary {
+    param([int] $Changes)
+
+    if ($Changes -eq 0) {
+        Write-Host 'Nothing would change.'
+        return
+    }
+    Write-Host "Would change: $Changes item(s)."
+}

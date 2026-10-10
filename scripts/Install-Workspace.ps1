@@ -26,8 +26,13 @@ param(
     [switch] $Remove,
     # Removes everything the ownership record names, then the lock files. A dry run unless -Apply.
     [switch] $Uninstall,
+    # Re-resolves the recorded layer sources: a branch or tag override moves to its current commit, a local source is
+    # read again, and a commit pin and a layers.json pin stay. Shows the change; -Apply applies it.
+    [switch] $Update,
+    # With -Update, writes nothing and exits 0 whatever it finds. With -Strict it exits 1 when anything would change.
+    [switch] $Check,
     # With -Status, exits 1 when a path is not matching, or when the workspace has no record. With -Remove or
-    # -Uninstall, exits 1 when anything was skipped.
+    # -Uninstall, exits 1 when anything was skipped. With -Update, exits 1 when anything would change.
     [switch] $Strict
 )
 
@@ -37,15 +42,22 @@ $ErrorActionPreference = 'Stop'
 if ($Apply -and $Status) { throw '-Apply writes the workspace and -Status only reports it. Choose one.' }
 if ($Remove -and $Uninstall) { throw '-Remove names what to remove and -Uninstall removes everything. Choose one.' }
 if (($Remove -or $Uninstall) -and $Status) { throw '-Status only reports. Choose -Status, -Remove, or -Uninstall.' }
-if ($Strict -and -not ($Status -or $Remove -or $Uninstall)) { throw '-Strict applies to -Status, -Remove, and -Uninstall.' }
+if ($Strict -and -not ($Status -or $Remove -or $Uninstall -or $Update)) { throw '-Strict applies to -Status, -Remove, -Uninstall, and -Update.' }
 $namesRequested = $PSBoundParameters.ContainsKey('RequestedRuntimes') -or $PSBoundParameters.ContainsKey('RequestedLayers')
 if ($Status -and $namesRequested) { throw '-Status reports the recorded selection and takes no -Runtimes or -Layers. Select with an apply.' }
 if ($Uninstall -and $namesRequested) { throw '-Uninstall removes everything the lock records, so it takes no -Runtimes or -Layers. Use -Remove to name what to remove.' }
 if ($Remove -and -not $namesRequested) { throw '-Remove names what to remove: give -Runtimes or -Layers. Use -Uninstall to remove everything.' }
 $sourceNamed = $PSBoundParameters.ContainsKey('SourceOverrides') -or $PSBoundParameters.ContainsKey('LayerSource')
 if (($Status -or $Remove -or $Uninstall) -and $sourceNamed) { throw '-Source sets a layer source for an apply or an audit. -Status, -Remove, and -Uninstall read the recorded sources.' }
+if ($Update -and ($Remove -or $Uninstall -or $Status)) { throw '-Update re-resolves the recorded sources. It is not -Remove, -Uninstall, or -Status.' }
+if ($Update -and $sourceNamed) { throw '-Update re-resolves the recorded sources. Set a source with -Source and an apply, then -Update.' }
+if ($Update -and $namesRequested) { throw '-Update applies the recorded selection. Change the selection with an apply.' }
+if ($Check -and -not $Update) { throw '-Check applies to -Update.' }
+if ($Check -and $Apply) { throw '-Check writes nothing. Drop -Apply, or drop -Check to apply the update.' }
+if ($Strict -and $Update -and $Apply) { throw '-Strict with -Update reports and writes nothing. Drop -Apply or -Strict.' }
 $removing = [bool] $Remove
 $uninstalling = [bool] $Uninstall
+$updating = [bool] $Update
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Install-LayerSources.ps1')
@@ -2778,6 +2790,11 @@ if ($removing -or $uninstalling) {
         return
     }
 }
+# -Update re-resolves the recorded sources, so it needs the lock and the selection the lock records.
+if ($updating) {
+    if ($null -eq $priorStack) { throw "-Update needs a stack.lock.json with a selection, and $Workspace has none. Run Install-Workspace.ps1 -Apply first." }
+    if ($null -eq (Get-Field $priorStack 'selection')) { throw "stack.lock.json predates the selection, so -Update cannot tell which layers and runtimes to update. Run Install-Workspace.ps1 -Apply once, then -Update." }
+}
 if ($uninstalling) {
     Invoke-UninstallFlow
     return
@@ -2838,7 +2855,7 @@ foreach ($layer in $allLayers) {
     $layer.runtimes = $active
 }
 # Every layer's source is chosen before the active set is cut, so an unselected layer's lock record is right too.
-Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $false
+Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $updating
 $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
 $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notcontains $_ })
@@ -3023,7 +3040,7 @@ if ($Apply -and -not $removing -and -not $uninstalling -and $null -ne $priorOwne
 }
 
 $plan = @()
-if ($Apply -or $removing -or ($Status -and $null -ne $priorOwned)) {
+if ($Apply -or $removing -or $updating -or ($Status -and $null -ne $priorOwned)) {
     $plan = Get-OwnedPlan -Document $document -Layers $layers -ClaudeRecords $claudeRecords -OpenCodeLayers $openCodeLayers `
         -OpenCodeSpecs $openCodeSpecs -CopilotCmdText $copilotCmdText -CopilotShText $copilotShText `
         -PiCmdText $piCmdText -PiShText $piShText -PiSettings $piSettings -PiPending $piPending -PiUnknown $piUnknown
@@ -3034,6 +3051,14 @@ if ($Apply -or $removing -or ($Status -and $null -ne $priorOwned)) {
 $staleOpenCodeFolders = @()
 if ($openCodeSelected) {
     $staleOpenCodeFolders = @(Get-StalePluginFolders -Wanted @($openCodeLayers | ForEach-Object { $_.name }) | Where-Object { $unselectedLayerNames -notcontains $_.Name })
+}
+
+# -Update reports what the recorded sources would move to before anything is applied, so the report is the same with or
+# without -Apply. Its count is the number of changes -Strict counts.
+$updateChanges = 0
+if ($updating) {
+    $updateChanges = Write-UpdateReport -Layers $allLayers -PriorStack $priorStack -SelectedLayers $selectedLayers `
+        -SelectedRuntimes $selectedRuntimes -Plan $plan -Owned $priorOwned -NotSelected @(Get-NotSelectedPaths -SelectedRuntimes $selectedRuntimes)
 }
 
 if ($Status) {
@@ -3127,6 +3152,12 @@ if (-not $Apply) {
     }
     if ($removing) {
         Write-RemovalDryRun -Records $priorOwned -Plan $plan -SelectedRuntimes $selectedRuntimes -SelectedLayers $selectedLayers
+        return
+    }
+    if ($updating) {
+        Write-UpdateSummary -Changes $updateChanges
+        Write-Host 'Dry run: nothing was written. Rerun with -Update -Apply to move the sources and apply the change.'
+        if ($Strict -and $updateChanges -gt 0) { exit 1 }
         return
     }
     Write-Host 'Audit only. No files or workspace configuration changed. Rerun with -Apply after reviewing.'
