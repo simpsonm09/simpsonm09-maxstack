@@ -726,7 +726,18 @@ function Write-IgnoredScriptWarning {
 
 # The installed packages under a folder's node_modules whose package.json declares a preinstall, install, or postinstall
 # script, or a gypfile. Scoped packages (@scope/name) are read one level down. A manifest that does not parse is skipped.
+# The scan only warns, so a folder it cannot list (access denied, a broken link) yields no names and never stops an apply.
 function Get-ScriptedDependencies {
+    param([string] $Folder)
+
+    try {
+        return (Read-ScriptedDependencies -Folder $Folder)
+    } catch {
+        return @()
+    }
+}
+
+function Read-ScriptedDependencies {
     param([string] $Folder)
 
     $modules = [IO.Path]::Combine($Folder, 'node_modules')

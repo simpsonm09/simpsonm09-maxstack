@@ -162,7 +162,7 @@ function writeFakePi(base) {
 // folder into its prefix, and nothing else here. FAKE_NPM_EXTRA names one more file it writes, and FAKE_NPM_REWRITE
 // makes it write a different lock, as npm does to a lock the layer ships. A node script runs it, behind a .cmd on
 // Windows and a shell file elsewhere.
-const FAKE_NPM_SCRIPT = `import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+const FAKE_NPM_SCRIPT = `import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
@@ -178,6 +178,11 @@ if (process.env.FAKE_NPM_EXTRA) {
   const extra = join(prefix, process.env.FAKE_NPM_EXTRA);
   mkdirSync(dirname(extra), { recursive: true });
   writeFileSync(extra, 'written by npm\\n');
+}
+// FAKE_NPM_BROKEN_SCOPE leaves a scope folder that is a junction to a folder that is gone, which listing it cannot read.
+if (process.env.FAKE_NPM_BROKEN_SCOPE) {
+  mkdirSync(join(prefix, 'node_modules'), { recursive: true });
+  symlinkSync(join(prefix, 'gone-target'), join(prefix, 'node_modules', '@broken'), 'junction');
 }
 // FAKE_NPM_SCRIPTED lists installed packages that declare a postinstall script, so the ignore-scripts scan has them.
 if (process.env.FAKE_NPM_SCRIPTED) {
@@ -4386,3 +4391,12 @@ withWorkspace('an audit runs no global filter that only the tree attributes name
   assertOk(audit);
   assert.equal(existsSync(marker), false, 'the audit ran a global clean command that only the in-tree attributes name');
 }, {});
+
+// Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
+// plugin folder is replaced and before the lock is written.
+withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: ORG_FILES });
+  const run = mustApply(ctx, [], { env: { ...ctx.env, FAKE_NPM_BROKEN_SCOPE: '1' } });
+  assert.doesNotMatch(plainOutput(run), /ignore-scripts/, plainOutput(run));
+  assert.ok(existsSync(lockPath(ctx)), 'the apply stopped before the lock was written');
+}, NPM);
