@@ -236,6 +236,7 @@ function New-LayerModel {
         dirty         = $null
         override      = $false
         localPath     = $null
+        folderMissing = $false
         repoRoot      = $null
         root          = $null
     }
@@ -314,6 +315,13 @@ function Get-ClaudeRecord {
         return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'git'; url = $Layer.url; path = $Layer.sourcePath; commit = $Layer.commit }
     }
 
+    # A local folder that is missing has no manifest or items to read. A junction needs neither, and a copy is unknown.
+    if ($null -eq $Layer.root) {
+        if ($Layer.runtimes.ContainsKey('opencode')) {
+            return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'junction'; target = ".opencode/plugins/$($Layer.name)" }
+        }
+        return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'copy'; items = $null }
+    }
     $manifestPath = Join-Path $Layer.root '.claude-plugin\plugin.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         throw "Layer '$($Layer.name)' has a claude runtime but no .claude-plugin\plugin.json at $($Layer.root). Add the manifest to that repository or remove its claude runtime."
@@ -1018,7 +1026,10 @@ function Get-PiLayerRecord {
         pi      = $piKey
         package = $(if ($null -ne $piKey) { if ($pinned) { ".claude/cache/$($Layer.name)" } else { $installed } } else { $null })
         skills  = $(if (Test-Path -LiteralPath (Join-Path $pluginSource 'skills') -PathType Container) { "$installed/skills" } else { $null })
-        pending = [bool]($pinned -and -not (Test-CacheAtPin $Layer))
+        # The package and skills are unknown while the layer has no root: a git cache not at its pin, or a missing folder.
+        pending = ($null -eq $Layer.root)
+        unknownPackage = $(if ($pinned) { ".claude/cache/$($Layer.name)" } else { $installed })
+        unknownSkills  = "$installed/skills"
     }
 }
 
@@ -2855,16 +2866,16 @@ foreach ($layer in $allLayers) {
     $layer.runtimes = $active
 }
 # Every layer's source is chosen before the active set is cut, so an unselected layer's lock record is right too.
-Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $updating
+Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $updating -SelectedLayers $selectedLayers
 $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
 $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notcontains $_ })
 
+# A local folder that is gone stops an apply, which would write what the folder holds, and a removal too, which rewrites the
+# config from every selected layer's fragment. Every other run reports the folder and goes on.
 foreach ($layer in $layers) {
-    if ($layer.sourceKind -ne 'local') { continue }
-    if (-not (Test-Path -LiteralPath $layer.root -PathType Container)) {
-        throw "Layer '$($layer.name)' is not checked out at $($layer.root)."
-    }
+    if ($layer.sourceKind -ne 'local' -or -not $layer.folderMissing) { continue }
+    if ($Apply) { throw "Layer '$($layer.name)' is not checked out at $($layer.localPath). Restore the folder, or drop the override with -Source $($layer.name)=default, then rerun." }
 }
 
 # Before any write, an apply records what already exists: the directories an install may create, the
@@ -3006,8 +3017,8 @@ if ($openCodeSelected -and -not $configUnknown) {
 $piUnknown = @{ packages = @(); skills = @() }
 foreach ($record in $piRecords) {
     if (-not $record.pending) { continue }
-    $piUnknown.packages += "../../.claude/cache/$($record.layer)"
-    $piUnknown.skills += "../../.claude/plugins/$($record.layer)/skills"
+    $piUnknown.packages += "../../$($record.unknownPackage)"
+    $piUnknown.skills += "../../$($record.unknownSkills)"
 }
 
 # The backup each replaced file gets, and the text it had when the install read it. Decided before any write, so the
@@ -3098,7 +3109,7 @@ if (-not $Apply) {
     Write-Host (Format-Selection -Runtimes $selectedRuntimes -Layers $selectedLayers)
     Write-SourcePinBlock -Entries (Get-ResolvedSourceEntries -Layers $allLayers)
     foreach ($layer in $layers) {
-        $where = if ($layer.root) { $layer.root } else { "pinned $($layer.url) at $($layer.commit)" }
+        $where = if ($layer.root) { $layer.root } elseif ($layer.sourceKind -eq 'local') { "$($layer.localPath): folder missing" } else { "pinned $($layer.url) at $($layer.commit)" }
         Write-Host ("Layer:          {0} ({1}) at {2}" -f $layer.name, $layer.kind, $where)
     }
     if ($openCodeSelected) {

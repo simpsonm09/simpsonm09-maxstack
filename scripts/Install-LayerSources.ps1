@@ -246,6 +246,7 @@ function Set-LayerChoice {
         $Layer.commit = $Choice.commit
         $Layer.dirty = $null
         $Layer.localPath = $null
+        $Layer.folderMissing = $false
         $Layer.repoRoot = $null
         $Layer.root = $null
         return
@@ -258,16 +259,20 @@ function Set-LayerChoice {
     $Layer.dirty = $state.dirty
     $Layer.localPath = $Choice.path
     $Layer.repoRoot = $Choice.checkout
-    $Layer.root = Join-SourceSub $Choice.checkout $Layer.sourcePath
+    # A folder that is gone has no root. Only an apply refuses it; every other run reports it.
+    $Layer.folderMissing = -not (Test-Path -LiteralPath $Choice.checkout -PathType Container)
+    $Layer.root = if ($Layer.folderMissing) { $null } else { Join-SourceSub $Choice.checkout $Layer.sourcePath }
 }
 
 # Resolves every layer's source for this run. Explicit maps names to parsed -Source specs, and Recorded maps names
-# to the override the lock recorded.
+# to the override the lock recorded. -Update moves only the selected layers: an unselected layer keeps its recorded
+# commit, so a remote that only it uses is never read.
 function Set-LayerSources {
-    param([object[]] $Layers, [hashtable] $Explicit, [hashtable] $Recorded, [bool] $Updating)
+    param([object[]] $Layers, [hashtable] $Explicit, [hashtable] $Recorded, [bool] $Updating, [string[]] $SelectedLayers)
 
     foreach ($layer in $Layers) {
-        $choice = Resolve-LayerChoice -Layer $layer -Explicit $Explicit[$layer.name] -Recorded $Recorded[$layer.name] -Updating $Updating
+        $moves = $Updating -and ($SelectedLayers -ccontains $layer.name)
+        $choice = Resolve-LayerChoice -Layer $layer -Explicit $Explicit[$layer.name] -Recorded $Recorded[$layer.name] -Updating $moves
         Set-LayerChoice -Layer $layer -Choice $choice
     }
 }
@@ -335,8 +340,12 @@ function Get-SourcePinLines {
             if ($source.override) { $lines.Add("  $($entry.name): override, git $($source.url) ref $($source.ref) at $($source.commit)") }
             continue
         }
-        $where = if ($null -eq $source.commit) { 'not a git checkout' } else { "HEAD $($source.commit), $(Format-DirtyLabel $source.dirty)" }
         $kind = if ($source.override) { 'override, local' } else { 'local, default' }
+        if ($source.path -and -not (Test-Path -LiteralPath $source.path -PathType Container)) {
+            $lines.Add("  $($entry.name): $kind $($source.path): folder missing")
+            continue
+        }
+        $where = if ($null -eq $source.commit) { 'not a git checkout' } else { "HEAD $($source.commit), $(Format-DirtyLabel $source.dirty)" }
         $lines.Add("  $($entry.name): $kind $($source.path) ($where)")
     }
     return $lines.ToArray()
@@ -415,6 +424,7 @@ function Get-SourceUpdate {
 
     $oldCommit = Get-Field $PriorSource 'commit'
     if ($Layer.sourceKind -eq 'local') {
+        if ($Layer.folderMissing) { return [pscustomobject]@{ line = "  $($Layer.name): local $($Layer.localPath): folder missing"; changed = $true } }
         $was = Format-DirtyState (Get-Field $PriorSource 'dirty')
         $now = Format-DirtyState $Layer.dirty
         $head = "HEAD $(Format-Commit $oldCommit) -> $(Format-Commit $Layer.commit)"

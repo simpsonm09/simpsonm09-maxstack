@@ -3667,3 +3667,45 @@ withWorkspace('an audit of a -Source local tree runs no program that its .git/co
   assertOk(audit);
   assert.equal(existsSync(marker), false, 'the audit ran the command that core.fsmonitor names');
 }, {});
+
+// Finding 3: a recorded local override whose folder is gone is reported, and only an apply stops on it.
+withWorkspace('a recorded local override whose folder is gone is reported by -Status, -Update -Check, and -Remove, and only -Apply stops', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  rmSync(checkout, { recursive: true, force: true });
+  const missing = `local ${checkout}: folder missing`;
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.ok(status.stdout.includes(missing), status.stdout);
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false });
+  assert.equal(check.status, 1, `a missing folder is not counted as a change:\n${check.stdout}`);
+  assert.ok(check.stdout.includes(missing), check.stdout);
+
+  assertOk(runInstaller(shell, ctx, ['-Uninstall'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], { apply: false }));
+  const refused = removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']);
+  assert.notEqual(refused.status, 0, 'a removal rewrote the config without the missing fragment');
+  assert.match(plainOutput(refused), /is not checked out at .* drop the override with -Source simpsonm09-org-ai-plugin=default/, refused.stdout);
+  assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-personal-ai-plugin')), 'a refused removal removed the layer');
+
+  mustApply(ctx, ['-Source', 'simpsonm09-org-ai-plugin=default']);
+  assertOk(removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']));
+  assert.equal(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-personal-ai-plugin')), false, 'the other layer was not removed');
+}, {});
+
+// Finding 3: -Update resolves only the layers it selects, so a remote the selection leaves out cannot abort it.
+withWorkspace('-Update resolves only the selected layers, so an unreachable remote of an unselected layer does not abort', (ctx) => {
+  const { bare } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lock = readJson(lockPath(ctx));
+  lock.selection.layers = lock.selection.layers.filter((name) => name !== 'pstack');
+  setLock(ctx, lock);
+  rmSync(bare, { recursive: true, force: true });
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.doesNotMatch(plainOutput(check), /could not read the refs/, check.stdout);
+}, {});
