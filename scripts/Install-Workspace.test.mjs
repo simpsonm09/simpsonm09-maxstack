@@ -3606,3 +3606,12 @@ withWorkspace('a lock from before the source block lists its local layers as def
   assert.match(text, new RegExp(`simpsonm09-org-ai-plugin: local, default \\S+ \\(HEAD ${LEGACY_COMMIT}, dirty state not recorded\\)`), text);
   assert.doesNotMatch(text, /pstack/, 'the pinned pstack layer is listed');
 }, {});
+
+withWorkspace('-Source owner/repo@tag resolves an annotated tag to the commit it points at', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  gitRun(bare, ['tag', '-a', 'v1', '-m', 'release', featCommit]);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@v1'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'the annotated tag resolved to its tag object, not its commit');
+  assert.deepEqual(sourceOf(ctx, 'pstack').source, { kind: 'git', url: remoteUrl(ctx, 'simpsonm09', 'pstack-claude'), ref: 'v1', commit: featCommit, override: true });
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/, 'the tagged content was not installed');
+}, {});
