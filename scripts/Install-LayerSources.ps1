@@ -470,7 +470,10 @@ function Read-LocalCheckoutState {
     # A diff between two commits reads no worktree content, so no filter runs there.
     $status = Invoke-GitGuarded -Dir $Root -EmptyAttributes -Arguments @('-C', $Root, 'status', '--porcelain', '--', '.')
     if ($null -ne $status.unreadable) { return (New-UnreadableState $status.unreadable) }
-    return [pscustomobject]@{ commit = (Get-GitLine $head); dirty = (@($status.stdout).Count -gt 0); unreadable = $null }
+    # A status that fails says nothing about the worktree, so its dirty state is unknown rather than clean. The empty-tree
+    # attribute source is a SHA-1 object, so a SHA-256 repository fails here.
+    $dirty = if ($status.code -eq 0) { (@($status.stdout).Count -gt 0) } else { $null }
+    return [pscustomobject]@{ commit = (Get-GitLine $head); dirty = $dirty; unreadable = $null }
 }
 
 # The state of a local checkout the guard cannot read. Its commit and dirty flag are unknown, and the reason is reported.

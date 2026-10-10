@@ -4407,3 +4407,16 @@ withWorkspace('a long-path UNC share is refused as a share root, not read as a f
   assert.notEqual(run.status, 0, 'a long-path UNC share was accepted as a layer source');
   assert.match(plainOutput(run), /is a drive or share root, which cannot be a layer source/, run.stdout);
 }, {});
+
+// Finding 4 follow-up: the empty-tree attribute source is a SHA-1 object, so in a SHA-256 repository the status it guards fails.
+// A failed status says nothing about the worktree, so its dirty state is unknown, not clean.
+withWorkspace('a SHA-256 checkout reads its dirty state as unknown, since the status it reads cannot run', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q', '--object-format=sha256']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{64}, dirty state not recorded\)/, plainOutput(audit));
+}, {});
