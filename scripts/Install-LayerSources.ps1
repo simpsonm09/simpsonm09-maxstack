@@ -89,13 +89,22 @@ function Get-GitFilterOverrides {
     param([string] $Dir)
 
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return @() }
-    $lines = @(& git @(Get-GitGuardArgs) -C $Dir config --get-regexp '^filter\.' 2>$null)
-    $names = @($lines | ForEach-Object { if ($_ -match '^filter\.(.+)\.[^.\s]+(\s|$)') { $Matches[1] } } | Sort-Object -Unique)
+    $keys = @(& git @(Get-GitGuardArgs) -C $Dir config --name-only --get-regexp '^filter\.' 2>$null)
+    $names = @($keys | ForEach-Object { Get-FilterDriverName $_ } | Where-Object { $null -ne $_ } | Sort-Object -Unique)
     $overrides = @()
     foreach ($name in $names) {
         $overrides += @('-c', "filter.$name.clean=", '-c', "filter.$name.smudge=", '-c', "filter.$name.process=", '-c', "filter.$name.required=false")
     }
     return $overrides
+}
+
+# The driver name of one config key, which is everything between the first "filter." and the last dot, so a subsection
+# may hold dots. Only the key is passed here: a value is never parsed, since it can hold any text, dots included.
+function Get-FilterDriverName {
+    param([string] $Key)
+
+    if ($Key -cmatch '^filter\.(.+)\.[^.]+\z') { return $Matches[1] }
+    return $null
 }
 
 # The reason a git -Source spec is refused, or $null when its characters and parts are acceptable.

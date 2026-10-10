@@ -4147,3 +4147,28 @@ test('a git output read that never completes returns within its bound, with no o
   assert.ok(Date.now() - started < 40000, 'the read was not bounded');
   assert.ok(run.stdout.includes('READ=[]'), run.stdout);
 }, {});
+
+// ---- Round 3: the filter guard. A clean command that the tree's config defines writes a marker file when it runs.
+// The fixture runs the command unguarded first, so a marker that is missing after an audit is a result, not a fixture gap.
+const touchAndCat = (marker) => `sh -c "touch '${marker.replace(/\\/g, '/')}'; cat"`;
+
+// Finding 1: the name comes from the config key. A clean command whose path has a dot ended the line the old parser read.
+withWorkspace('an audit of a -Source local tree runs no clean filter whose command has a dot in it', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'dotted-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  gitRun(checkout, ['config', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command that .git/config names');
+}, {});
