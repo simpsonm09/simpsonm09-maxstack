@@ -3690,7 +3690,7 @@ withWorkspace('a recorded local override whose folder is gone is reported by -St
   assert.ok(status.stdout.includes(missing), status.stdout);
 
   const check = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false });
-  assert.equal(check.status, 1, `a missing folder is not counted as a change:\n${check.stdout}`);
+  assert.equal(check.status, 1, `a missing folder is counted as a change, so -Strict exits 1:\n${check.stdout}`);
   assert.ok(check.stdout.includes(missing), check.stdout);
 
   assertOk(runInstaller(shell, ctx, ['-Uninstall'], { apply: false }));
