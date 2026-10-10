@@ -42,7 +42,7 @@ Audit mode computes each of these and reports `missing`, `differs`, `matches`, o
 
 ## The recorded lock
 
-`stack.lock.json` is the install-provenance record. `Install-Workspace.ps1` writes it at the workspace root, not in this repository. It records `generatedAt`, the SHA-256 of the written workspace config, the Copilot wrapper record, and one entry per layer with its `name`, `kind`, `path` (null for a git layer), `source`, and installed `commit`. Each layer has three runtime records, and a runtime the layer does not name has `enabled: false`.
+`stack.lock.json` is the install-provenance record. `Install-Workspace.ps1` writes it at the workspace root, not in this repository. It records `generatedAt`, the SHA-256 of the written workspace config, the Copilot wrapper record, and one entry per layer with its `name`, `kind`, `path` (null for a git layer), `source` (the source block that [install.md](install.md#layer-sources) describes), and installed `commit`. Each layer has three runtime records, and a runtime the layer does not name has `enabled: false`.
 
 - `claude`: a local layer has `enabled`, `plugin`, `kind: "junction"`, `child` (`.claude/plugins/<name>`), `target` (`.opencode/plugins/<name>`), and `treeSha256`. A git layer has `enabled`, `plugin`, `kind: "git"`, `child`, `repository`, `path`, `commit`, and `treeSha256`.
 - `opencode`: `enabled`, `folder` (`.opencode/plugins/<name>`), `entry`, `loader` (`discovery` for a root `index.ts`, `config` for a nested entry), `plugin` (the path named in `opencode.jsonc`, or null), and `agents` (the profile names installed).

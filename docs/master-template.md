@@ -50,7 +50,7 @@ Three behaviors constrain the design:
 
 ## Installer lifecycle
 
-The installer selects runtimes and layers, records what it wrote, and removes it with `-Remove` and `-Uninstall`. Both are dry runs until `-Apply`, and [install.md](install.md#removing-and-uninstalling) states their rules. It still declares itself Windows-only, and `update` is not built. The target is one entry point with these commands, the same on Windows and macOS:
+The installer selects runtimes and layers, records what it wrote, and removes it with `-Remove` and `-Uninstall`. Both are dry runs until `-Apply`, and [install.md](install.md#removing-and-uninstalling) states their rules. It still declares itself Windows-only. On Windows, `update` is built as `-Update` and `-Update -Check`, with the rules in [install.md](install.md#updating-the-sources). The target is one entry point with these commands, the same on Windows and macOS:
 
 | Command | Effect |
 | --- | --- |
@@ -78,9 +78,11 @@ The proof is a round trip. A test snapshots a workspace, runs `install` then `un
 
 macOS needs the installer to stop assuming Windows. PowerShell 7 runs on macOS, but the installer uses junctions. On POSIX it uses symbolic links and sets the executable bit on the shell wrappers. CI runs the lifecycle tests on Windows and macOS.
 
-## Layer sources
+## Layer sources (implemented)
 
-Every layer, including PStack, names where it installs from. Today PStack is a pinned git source, the org and personal layers are local checkouts, and `-LayerSource name=path` can override only a local layer. It refuses PStack, so a change on a fork branch cannot be tried without editing `layers.json`.
+Implemented on Windows. The commands and the lock record are in [install.md](install.md#layer-sources). Before this was built, `-LayerSource name=path` could override only a local layer and refused PStack, so a change on a fork branch could not be tried without editing `layers.json`.
+
+Every layer, including PStack, names where it installs from.
 
 A layer source is one of:
 

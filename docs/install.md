@@ -111,6 +111,80 @@ pwsh -File scripts/Install-Workspace.ps1
 
 A layer that stops naming a runtime leaves its folder behind. `-Apply` removes an OpenCode folder that no layer names only when the previous `stack.lock.json` recorded it, so the installer made it. It also removes the folder of the retired `pstack-opencode` port on every apply. Any other unnamed folder is reported as stale and kept. The same cleanup applies to `.claude\plugins`: `-Apply` removes a child that no layer declares, and audit reports it as stale.
 
+## Layer sources
+
+A layer installs from one source. `layers.json` gives each layer its default source: `pstack` is a git pin with a commit, and the org and personal layers are local checkouts. `-Source` changes one layer's source for a run, and the lock records the change. Each `-Source` entry is `name=spec`, and the entries may be repeated or comma-separated:
+
+```powershell
+pwsh -File scripts/Install-Workspace.ps1 -Source pstack=simpsonm09/pstack-claude@feat/opencode-runtime -Apply
+pwsh -File scripts/Install-Workspace.ps1 -Source simpsonm09-personal-ai-plugin=local:<absolute path> -Apply
+pwsh -File scripts/Install-Workspace.ps1 -Source pstack=default -Apply
+```
+
+The spec forms:
+
+| Form | Example | Meaning |
+| --- | --- | --- |
+| `owner/repo@ref` | `simpsonm09/pstack-claude@feat/opencode-runtime` | GitHub, at `https://github.com/<owner>/<repo>.git`. |
+| `https://host/path.git@ref` | `https://example.com/team/layer.git@v2` | Any host, over HTTPS only. |
+| `local:<absolute path>` | `local:<absolute path>` | A working tree. It is never fetched, and uncommitted changes install as they are. The layer's own folder inside the repository still applies, so `pstack` reads `plugins/pstack` in its checkout. |
+| `name=default`, or `name=` | `pstack=default` | Drops the override, and the layer returns to its `layers.json` source. |
+
+The ref in a git spec is a branch, a tag, or a full commit. It is checked as a git ref name. A spec is refused before anything is written when it has a space or a control character, starts with a dash, holds `..`, uses a scheme other than `https`, or carries a user name in its URL. A `local:` path must be absolute, must exist, and cannot be the workspace or a folder the installer writes (`.claude`, `.opencode`, `.pi`, or `.maxstack`).
+
+`-LayerSource name=path` is the alias of `-Source name=local:path`, and it works for every layer, pinned ones included.
+
+The rules:
+
+- Sources resolve before anything is written. A source that cannot be read exits non-zero with the reason, and the install stays as it was.
+- A plain apply reuses a recorded override, so an override holds until `-Source name=default` drops it.
+- Git writes happen only in the layer's own cache folder, and reading a remote's refs writes nothing. The cache's origin is reset to the resolved URL on each sync. No layer's install scripts run: npm runs with `--ignore-scripts`.
+- `-Source` applies to an apply or an audit. `-Status`, `-Remove`, and `-Uninstall` read the recorded sources and take no `-Source`.
+
+The lock records each layer's source as an object. A git source records its URL, its ref, the full commit it resolved to, and `override`:
+
+```json
+"source": { "kind": "git", "url": "https://github.com/simpsonm09/pstack-claude.git", "ref": "feat/opencode-runtime", "commit": "<40 hex characters>", "override": true }
+```
+
+A local source records HEAD and the dirty flag of its checkout. It never records a commit it cannot read, so a folder that is not a git checkout has `commit` and `dirty` set to `null`:
+
+```json
+"source": { "kind": "local", "url": null, "ref": null, "commit": "<40 hex characters>", "dirty": true, "override": true, "path": "<absolute path>" }
+```
+
+`override` is `true` for anything that differs from the `layers.json` default. A local override records its absolute path, since `-Update` reads the checkout again. That is the one lock value with an absolute path, and it appears only in an override record. A lock from before this record holds the source as a string, and it still verifies.
+
+`-Status` and an audit print the layer sources that are not at their committed pin, above the state rows:
+
+```text
+Layer sources not at their committed pin:
+  pstack: override, git <url> ref feat/opencode-runtime at <commit>
+  simpsonm09-org-ai-plugin: local, default projects/repos/simpsonm09-org-ai-plugin (not a git checkout)
+```
+
+Every override, every local source, and every branch or tag override is listed. A git layer pinned by commit in `layers.json` is not.
+
+### Updating the sources
+
+`-Update` re-resolves each selected layer's recorded source. A branch or tag override moves to its current commit, and the layer records that commit. A commit pin stays as it is, and so does a `layers.json` pin. A local source is read again. The recorded selection applies, so `-Update` takes no `-Runtimes`, `-Layers`, or `-Source`, and it cannot be combined with `-Remove`, `-Uninstall`, or `-Status`.
+
+```powershell
+pwsh -File scripts/Install-Workspace.ps1 -Update -Check
+pwsh -File scripts/Install-Workspace.ps1 -Update -Check -Strict
+pwsh -File scripts/Install-Workspace.ps1 -Update -Apply
+```
+
+Without `-Apply`, `-Update` prints the report and writes nothing. For each selected layer it prints the old and new commit, the number of files that would change under the layer's folder, and each owned path an apply would rewrite. A commit the cache does not hold is reported as `needs fetch`, and its changed files are known after an apply fetches it. The check reads the cache with `--no-lazy-fetch`, so it never fetches an object into the cache.
+
+- `-Update -Check` writes nothing: not the tree, the lock, or the cache. It exits 0.
+- `-Update -Check -Strict` exits 1 when anything would change.
+- `-Update -Apply` applies the change like an apply, and `-Strict` is refused with it.
+- `-Update` never changes `layers.json`. When a `layers.json` branch has moved past its pin, the report prints a one-line hint of the change to make by hand.
+- `-Update` needs a lock that names a selection. A workspace without one is refused, and the message says to run an apply first.
+
+`MAXSTACK_TEST_GITHUB_ROOT` is a test-only seam. The test suite sets it so that the `owner/repo` shorthand reads a local bare repository instead of GitHub. A real run never sets it.
+
 ## Ownership and status
 
 `-Apply` writes an ownership record into `stack.lock.json`: the `owned` list, with `ownedSchema: 2`. It names each path the apply wrote, sorted by path, kind, and key. Each record also names the `runtime` it belongs to, or `null` for the claude cache, and the `layers` it was installed for, sorted, so `-Remove` can pick the records of what it removes:
