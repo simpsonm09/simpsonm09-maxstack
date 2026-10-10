@@ -4445,6 +4445,26 @@ test('a non-ASCII setting reaches git intact, and a filter name git prints comes
   }
 }, {});
 
+// Finding 2: an empty filter name is a name. git accepts filter..clean (a subsection that is empty), so the guard turns it off.
+withWorkspace('an audit runs no clean filter whose name is empty, which .git/config names as [filter ""]', (ctx) => {
+  const marker = join(ctx.base, 'empty-name-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=\n', filters: [['', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the empty-named clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of the empty-named filter');
+}, {});
+
+test('the driver name of filter..clean is the empty name, and the guard passes it to git', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $name = Get-FilterDriverName 'filter..clean'; "NAME=[$name] IS_NULL=$($null -eq $name)"; $settings = @(Get-GitGuardSettings -FilterNames @($name)) | ForEach-Object { $_.key }; "HAS=$($settings -contains 'filter..clean')"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /NAME=\[\] IS_NULL=False/, run.stdout);
+  assert.match(run.stdout, /HAS=True/, run.stdout);
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {

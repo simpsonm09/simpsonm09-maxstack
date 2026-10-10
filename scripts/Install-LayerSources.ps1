@@ -190,11 +190,11 @@ function Test-GitEnvConfigSupport {
 }
 
 # The driver name of one config key: everything between the first "filter." and the last dot, so a subsection may hold
-# dots. Only the key is read. A value is never parsed, since it can hold any text.
+# dots, and may be empty (filter..clean, from [filter ""]). Only the key is read. A value is never parsed, since it can hold any text.
 function Get-FilterDriverName {
     param([string] $Key)
 
-    if ($Key -cmatch '^filter\.([\s\S]+)\.[^.]+\z') { return $Matches[1] }
+    if ($Key -cmatch '^filter\.([\s\S]*)\.[^.]+\z') { return $Matches[1] }
     return $null
 }
 
