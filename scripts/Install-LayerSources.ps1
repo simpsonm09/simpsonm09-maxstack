@@ -20,12 +20,13 @@ function Get-GitHubRemoteUrl {
     return "https://github.com/$Owner/$Repo.git"
 }
 
-# Whether a path is inside the temp folder. Both sides are full paths, compared without case.
+# Whether a path is inside the temp folder. Both sides are resolved, so a junction or symbolic link on either one counts as
+# the folder it names: a link under the temp folder that leads elsewhere is not inside it. Case is ignored.
 function Test-UnderTempFolder {
     param([string] $Path)
 
-    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\').ToLowerInvariant()
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    $temp = Get-NormalPath (Get-FullFolderPath ([IO.Path]::GetTempPath()))
+    $full = Get-NormalPath $Path
     return $full.StartsWith("$temp\", [StringComparison]::Ordinal)
 }
 

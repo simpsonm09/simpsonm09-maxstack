@@ -4077,3 +4077,16 @@ test('the installer under Windows PowerShell 5.1 stops with the PowerShell 7 req
     rmSync(base, { recursive: true, force: true });
   }
 }, {});
+
+// Round 2, G: a junction under the temp folder that leads outside it does not turn on the test root.
+test('a junction under the temp folder that leads outside it does not turn on the test root', { skip }, () => {
+  const junction = join(tmpdir(), `maxstack-jct-${process.pid}`);
+  symlinkSync(repoRoot, junction, 'junction');
+  try {
+    const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: junction });
+    assertOk(run);
+    assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+  } finally {
+    rmdirSync(junction);
+  }
+}, {});
