@@ -3715,7 +3715,7 @@ withWorkspace('-Update resolves only the selected layers, so an unreachable remo
 // The feat branch moves the skill to a new name and edits it, which is an inexact rename that reads both blobs.
 const SKILL_MOVED = 'plugins/pstack/skills/poteto-renamed/SKILL.md';
 
-function renameSkillOnFeat(ctx, bare) {
+function renameSkillOnFeat(ctx) {
   const work = join(ctx.base, 'work');
   gitRun(work, ['fetch', '--quiet', 'origin']);
   gitRun(work, ['checkout', '-q', '-B', 'feat', 'origin/feat']);
@@ -3729,9 +3729,9 @@ function renameSkillOnFeat(ctx, bare) {
 }
 
 withWorkspace('-Update -Check counts the changed files of a rename that the partial cache must read, and does not report zero', (ctx) => {
-  const { bare, featCommit } = servedFeature(ctx);
+  const { featCommit } = servedFeature(ctx);
   mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
-  const renamed = renameSkillOnFeat(ctx, bare);
+  const renamed = renameSkillOnFeat(ctx);
   const cache = join(ctx.workspace, '.claude', 'cache', 'pstack');
   gitRun(cache, ['fetch', '--quiet', '--filter=blob:none', 'origin', renamed]);
 
