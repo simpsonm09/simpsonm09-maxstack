@@ -175,7 +175,7 @@ pwsh -File scripts/Install-Workspace.ps1 -Update -Check -Strict
 pwsh -File scripts/Install-Workspace.ps1 -Update -Apply
 ```
 
-Without `-Apply`, `-Update` prints the report and writes nothing. For each selected layer it prints the old and new commit, the number of files that would change under the layer's folder, and each owned path an apply would rewrite. A commit the cache does not hold is reported as `needs fetch`, and its changed files are known after an apply fetches it. The check reads the cache with `--no-lazy-fetch`, so it never fetches an object into the cache.
+Without `-Apply`, `-Update` prints the report and writes nothing. For each selected layer it prints the old and new commit, the number of files that would change under the layer's folder, and each owned path an apply would rewrite. A commit the cache does not hold is reported as `needs fetch`, and its changed files are known after an apply fetches it. The check reads the cache with `--no-lazy-fetch`, so it never fetches an object into the cache. That flag needs git 2.44 or later. On an older git the report says `changed files unknown` rather than fetch. The count runs with rename detection off, so a partial clone that lacks a blob still gives a count, and a count git cannot read is reported as `changed files unknown`.
 
 - `-Update -Check` writes nothing: not the tree, the lock, or the cache. It exits 0.
 - `-Update -Check -Strict` exits 1 when anything would change.

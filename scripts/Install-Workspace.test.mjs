@@ -3709,3 +3709,33 @@ withWorkspace('-Update resolves only the selected layers, so an unreachable remo
   assertOk(check);
   assert.doesNotMatch(plainOutput(check), /could not read the refs/, check.stdout);
 }, {});
+
+// Finding 4: the changed-file count of an -Update -Check report. A rename makes git read blobs the partial cache lacks.
+// The feat branch moves the skill to a new name and edits it, which is an inexact rename that reads both blobs.
+const SKILL_MOVED = 'plugins/pstack/skills/poteto-renamed/SKILL.md';
+
+function renameSkillOnFeat(ctx, bare) {
+  const work = join(ctx.base, 'work');
+  gitRun(work, ['fetch', '--quiet', 'origin']);
+  gitRun(work, ['checkout', '-q', '-B', 'feat', 'origin/feat']);
+  mkdirSync(join(work, dirname(SKILL_MOVED)), { recursive: true });
+  gitRun(work, ['mv', SKILL_PATH, SKILL_MOVED]);
+  writeFile(work, SKILL_MOVED, SKILL_FEAT_TWO);
+  gitRun(work, ['add', '-A']);
+  gitRun(work, ['commit', '-q', '-m', 'rename the skill']);
+  gitRun(work, ['push', '-q', 'origin', 'feat']);
+  return gitRun(work, ['rev-parse', 'HEAD']);
+}
+
+withWorkspace('-Update -Check counts the changed files of a rename that the partial cache must read, and does not report zero', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const renamed = renameSkillOnFeat(ctx, bare);
+  const cache = join(ctx.workspace, '.claude', 'cache', 'pstack');
+  gitRun(cache, ['fetch', '--quiet', '--filter=blob:none', 'origin', renamed]);
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.match(check.stdout, new RegExp(`feat ${featCommit} -> ${renamed}; 2 files changed under plugins/pstack`), check.stdout);
+  assert.doesNotMatch(check.stdout, /0 files changed/, check.stdout);
+}, {});

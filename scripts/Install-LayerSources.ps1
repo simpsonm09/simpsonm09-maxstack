@@ -402,17 +402,32 @@ function Test-CachedCommit {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Whether this git accepts --no-lazy-fetch, which needs git 2.44. The probe runs once per run. Without the flag a check
+# could fetch from origin, so the changed files are reported unknown instead.
+$script:noLazyFetchSupported = $null
+function Test-NoLazyFetchSupport {
+    if ($null -eq $script:noLazyFetchSupported) {
+        & git @(Get-GitGuardArgs) --no-lazy-fetch version 2>$null | Out-Null
+        $script:noLazyFetchSupported = ($LASTEXITCODE -eq 0)
+    }
+    return $script:noLazyFetchSupported
+}
+
 # What a git source's move changes under the layer's folder, read from the cache. A commit the cache does not hold
-# is named as needing a fetch, since a check writes nothing and cannot read it.
+# is named as needing a fetch, since a check writes nothing and cannot read it. Renames are off: rename detection reads
+# blobs, and a partial clone may not hold them, so git would fail rather than count.
 function Get-MoveFilesNote {
     param($Layer, [string] $OldCommit)
 
     $cache = Join-Path $claudeCacheTarget $Layer.name
+    if (-not (Test-NoLazyFetchSupport)) { return 'changed files unknown: git 2.44 or later is needed to read the cache without fetching' }
     if (-not (Test-CachedCommit $cache $Layer.commit)) {
         return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
     }
     if (-not (Test-CachedCommit $cache $OldCommit)) { return 'changed files unknown: the old commit is not in the cache' }
-    $changed = @(& git @(Get-GitGuardArgs) --no-lazy-fetch -C $cache diff --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null | Where-Object { $_ })
+    $output = @(& git @(Get-GitGuardArgs) --no-lazy-fetch -C $cache diff --no-renames --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null)
+    if ($LASTEXITCODE -ne 0) { return 'changed files unknown: git could not list the changed files from the cache' }
+    $changed = @($output | Where-Object { $_ })
     return "$($changed.Count) files changed under $($Layer.sourcePath)"
 }
 
