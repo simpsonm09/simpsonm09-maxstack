@@ -153,7 +153,7 @@ A local source records HEAD and the dirty flag of its checkout. It never records
 "source": { "kind": "local", "url": null, "ref": null, "commit": "<40 hex characters>", "dirty": true, "override": true, "path": "<absolute path>" }
 ```
 
-`override` is `true` for anything that differs from the `layers.json` default. A local override records its absolute path, since `-Update` reads the checkout again. That is the one lock value with an absolute path, and it appears only in an override record. A lock from before this record holds the source as a string, and it still verifies.
+`override` is `true` for anything that differs from the `layers.json` default. A recorded override is checked each time the lock is read, with the same rules as a `-Source` spec: an https url, a safe ref, a full commit, and an absolute local path. A value that fails stops the run before git or the install runs, and the message names the layer and the field. A local override records its absolute path, since `-Update` reads the checkout again. That is the one lock value with an absolute path, and it appears only in an override record. A lock from before this record holds the source as a string, and it still verifies.
 
 `-Status` and an audit print the layer sources that are not at their committed pin, above the state rows:
 

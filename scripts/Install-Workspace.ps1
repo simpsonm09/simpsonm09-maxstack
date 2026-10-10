@@ -782,7 +782,7 @@ function Sync-GitPlugin {
     if (-not (Test-Path -LiteralPath (Join-Path $cache '.git'))) {
         New-Item -ItemType Directory -Path $claudeCacheTarget -Force | Out-Null
         Write-Host "Cloning $($Layer.url) (partial, sparse) into $cache"
-        & git @(Get-GitGuardArgs) clone --quiet --filter=blob:none --no-checkout --sparse $Layer.url $cache
+        & git @(Get-GitGuardArgs) clone --quiet --filter=blob:none --no-checkout --sparse -- $Layer.url $cache
         if ($LASTEXITCODE -ne 0) { throw "git clone of $($Layer.url) failed for '$($Layer.name)'." }
         & git @(Get-GitGuardArgs) -C $cache config core.autocrlf false
         & git @(Get-GitGuardArgs) -C $cache config core.eol lf
@@ -797,14 +797,15 @@ function Sync-GitPlugin {
 
     & git @(Get-GitGuardArgs) -C $cache cat-file -e "$($Layer.commit)^{commit}" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        & git @(Get-GitGuardArgs) -C $cache fetch --quiet --filter=blob:none origin $Layer.commit
+        & git @(Get-GitGuardArgs) -C $cache fetch --quiet --filter=blob:none origin -- $Layer.commit
         if ($LASTEXITCODE -ne 0) {
             $what = if ($Layer.override) { 'commit' } else { 'pinned commit' }
             $hint = if ($Layer.override) { 'Check the -Source spec.' } else { 'Check source.commit in layers.json.' }
             throw "Could not fetch the $what $($Layer.commit) from $($Layer.url) for '$($Layer.name)'. $hint"
         }
     }
-    & git @(Get-GitGuardArgs) -C $cache -c advice.detachedHead=false checkout --quiet --detach $Layer.commit
+    # --end-of-options, not --: a -- before the commit would make it a pathspec.
+    & git @(Get-GitGuardArgs) -C $cache -c advice.detachedHead=false checkout --quiet --detach --end-of-options $Layer.commit
     if ($LASTEXITCODE -ne 0) { throw "git checkout of $($Layer.commit) failed in $cache." }
     $head = (& git @(Get-GitGuardArgs) -C $cache rev-parse HEAD).Trim()
     if ($head -ne $Layer.commit) { throw "The cache is at $head, not the pinned $($Layer.commit) for '$($Layer.name)'." }

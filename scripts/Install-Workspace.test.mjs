@@ -3782,3 +3782,50 @@ withWorkspace('without the test-mode flag, a -Source owner/repo at a commit is a
   assert.ok(run.stdout.includes(`override, git ${SHORTHAND_URL} ref ${sha} at ${sha}`), run.stdout);
   assert.ok(!run.stdout.includes(join(ctx.base, 'github')), 'the test root was used');
 }, {});
+
+// Finding 6: a recorded override is checked as a -Source spec is, and a bad value is refused by layer and field.
+const BAD_RECORDS = [
+  ['commit', (block) => { block.commit = 'zz'; }],
+  ['ref', (block) => { block.ref = '--upload-pack=touch x'; }],
+  ['ref', (block) => { block.ref = 'feat..x'; }],
+  ['url', (block) => { block.url = 'ext::sh -c touch x'; }],
+  ['url', (block) => { block.url = 'https://user@github.com/simpsonm09/pstack-claude.git'; }],
+];
+
+function sourceBlockIn(lock, name) {
+  return lock.layers.find((layer) => layer.name === name).source;
+}
+
+withWorkspace('a git override the lock holds with a bad url, ref, or commit is refused by layer and field, before git runs', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const good = readJson(lockPath(ctx));
+  for (const [field, mutate] of BAD_RECORDS) {
+    const lock = structuredClone(good);
+    mutate(sourceBlockIn(lock, 'pstack'));
+    setLock(ctx, lock);
+    const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+    assert.notEqual(status.status, 0, `-Status read a lock whose ${field} is invalid`);
+    assert.match(plainOutput(status), new RegExp(`layer 'pstack'.*${field}`), plainOutput(status));
+  }
+  const lock = structuredClone(good);
+  sourceBlockIn(lock, 'pstack').url = 'ext::sh -c touch x';
+  setLock(ctx, lock);
+  const before = snapshotTree(ctx.workspace);
+  const apply = runInstaller(shell, ctx, [], { env: githubEnv(ctx) });
+  assert.notEqual(apply.status, 0, 'an apply read a lock whose url is invalid');
+  assert.match(plainOutput(apply), /layer 'pstack'.*url/, plainOutput(apply));
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a refused lock changed the install');
+}, {});
+
+withWorkspace('a local override the lock holds with a relative path is refused by layer and field', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = 'relative/checkout';
+  setLock(ctx, lock);
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assert.notEqual(status.status, 0, '-Status read a relative local path');
+  assert.match(plainOutput(status), /layer 'simpsonm09-org-ai-plugin'.*path/, plainOutput(status));
+}, {});

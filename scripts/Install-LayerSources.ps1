@@ -73,23 +73,31 @@ function Test-SafeRefName {
     return ($LASTEXITCODE -eq 0)
 }
 
-# A local source is a working tree that is never fetched. It must be an absolute folder that is not the workspace
-# and not one of the folders the installer writes into.
-function Read-LocalSpec {
-    param([string] $Name, [string] $Path)
+# The reason a path cannot be a local layer source, or $null. It must be an absolute path that is not the workspace and
+# is not one of the folders the installer writes into. It need not exist: a recorded folder that is gone is reported.
+function Get-LocalPathFault {
+    param($Path)
 
-    if ($Path -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}|/)') { throw "-Source $Name=local:$Path needs an absolute path." }
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "-Source $Name=local:${Path}: that folder does not exist." }
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $normal = Get-NormalPath $full
-    if ($normal -eq (Get-NormalPath $Workspace)) { throw "-Source $Name=local:$Path is the workspace itself, which cannot be a layer source." }
+    if (-not (Test-NonEmptyString $Path) -or $Path -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}|/)') { return 'needs an absolute path.' }
+    $normal = Get-NormalPath ([IO.Path]::GetFullPath($Path).TrimEnd('\'))
+    if ($normal -eq (Get-NormalPath $Workspace)) { return 'is the workspace itself, which cannot be a layer source.' }
     foreach ($output in @('.claude', '.opencode', '.pi', '.maxstack')) {
         $folder = Get-NormalPath (Join-Path $Workspace $output)
         if ($normal -eq $folder -or $normal.StartsWith("$folder\", [StringComparison]::Ordinal)) {
-            throw "-Source $Name=local:$Path is inside $output, which the installer writes, so it cannot be a layer source."
+            return "is inside $output, which the installer writes, so it cannot be a layer source."
         }
     }
-    return [pscustomobject]@{ kind = 'local'; path = $full }
+    return $null
+}
+
+# A local source is a working tree that is never fetched. It must be a folder that exists and passes Get-LocalPathFault.
+function Read-LocalSpec {
+    param([string] $Name, [string] $Path)
+
+    $fault = Get-LocalPathFault $Path
+    if ($fault) { throw "-Source $Name=local:$Path $fault" }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "-Source $Name=local:${Path}: that folder does not exist." }
+    return [pscustomobject]@{ kind = 'local'; path = ([IO.Path]::GetFullPath($Path).TrimEnd('\')) }
 }
 
 # A git spec is owner/repo@ref, or https://host/path@ref. The ref is the part after the last @.
@@ -300,16 +308,47 @@ function New-SourceRecord {
     return [pscustomobject]@{ kind = 'local'; url = $Layer.recordUrl; ref = $null; commit = $Layer.commit; dirty = $Layer.dirty; override = $Layer.override; path = $Layer.localPath }
 }
 
-# The source block of each layer the lock records as an override. A plain apply reuses these.
+# The source block of each layer the lock records as an override. A plain apply reuses these, after each is checked.
 function Get-RecordedOverrides {
     param($Stack)
 
     $overrides = @{}
     foreach ($layer in @($Stack.layers)) {
         $block = Get-Field $layer 'source'
-        if (($block -is [pscustomobject]) -and ((Get-Field $block 'override') -eq $true)) { $overrides[$layer.name] = $block }
+        if (($block -is [pscustomobject]) -and ((Get-Field $block 'override') -eq $true)) {
+            Assert-RecordedSource -Name $layer.name -Block $block
+            $overrides[$layer.name] = $block
+        }
     }
     return $overrides
+}
+
+# Stops on a field of a recorded override that the -Source rules refuse. The lock is a file a user can edit, so its
+# url, ref, commit, and path are checked before any git command or path use takes them.
+function Assert-RecordField {
+    param([string] $Name, [string] $Field, [string] $Reason)
+
+    if ($Reason) { throw "stack.lock.json: layer '$Name' has an invalid ${Field}: $Reason Fix the lock, or drop the override with -Source $Name=default." }
+}
+
+# Checks a recorded override. A git record holds an https url (or a local path under the test seam), a safe ref, and a
+# full commit. A local record holds a path that passes Get-LocalPathFault.
+function Assert-RecordedSource {
+    param([string] $Name, $Block)
+
+    $kind = Get-Field $Block 'kind'
+    if ($kind -eq 'local') {
+        Assert-RecordField -Name $Name -Field 'path' -Reason (Get-LocalPathFault (Get-Field $Block 'path'))
+        return
+    }
+    if ($kind -ne 'git') { Assert-RecordField -Name $Name -Field 'kind' -Reason 'it is neither git nor local.' }
+    $url = Get-Field $Block 'url'
+    $httpsUrl = (Test-NonEmptyString $url) -and ($url -cmatch '^https://[^/\\?#@]+/[^\\?#@]+$')
+    $seamUrl = (Test-TestSeam) -and (Test-NonEmptyString $url) -and ($url -cmatch '^([A-Za-z]:/|/)[^\x00-\x1f\x7f@]+$')
+    if (-not ($httpsUrl -or $seamUrl)) { Assert-RecordField -Name $Name -Field 'url' -Reason 'it is not an https address with a host and a path.' }
+    $ref = Get-Field $Block 'ref'
+    if (-not ((Test-NonEmptyString $ref) -and (Test-SafeRefName $ref))) { Assert-RecordField -Name $Name -Field 'ref' -Reason 'it is not a safe git ref name.' }
+    if (-not (Test-CommitRef (Get-Field $Block 'commit'))) { Assert-RecordField -Name $Name -Field 'commit' -Reason 'it is not a full 40-character lowercase commit SHA.' }
 }
 
 # The source a lock records for a layer, or the one its layers.json entry implies when the lock predates the source
@@ -353,9 +392,13 @@ function Get-SourcePinLines {
             continue
         }
         $kind = if ($source.override) { 'override, local' } else { 'local, default' }
-        if ($source.path -and -not (Test-Path -LiteralPath $source.path -PathType Container)) {
-            $lines.Add("  $($entry.name): $kind $($source.path): folder missing")
-            continue
+        # A default local path is relative to the workspace, so it is joined to it before the folder is tested.
+        if (Test-NonEmptyString $source.path) {
+            $folder = if ([IO.Path]::IsPathRooted($source.path)) { $source.path } else { Join-Path $Workspace ($source.path -replace '/', '\') }
+            if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+                $lines.Add("  $($entry.name): $kind $($source.path): folder missing")
+                continue
+            }
         }
         $where = if ($null -eq $source.commit) { 'not a git checkout' } else { "HEAD $($source.commit), $(Format-DirtyLabel $source.dirty)" }
         $lines.Add("  $($entry.name): $kind $($source.path) ($where)")
@@ -433,6 +476,7 @@ function Get-MoveFilesNote {
 
     $cache = Join-Path $claudeCacheTarget $Layer.name
     if (-not (Test-NoLazyFetchSupport)) { return 'changed files unknown: git 2.44 or later is needed to read the cache without fetching' }
+    if (-not (Test-CommitRef $OldCommit)) { return 'changed files unknown: the recorded commit is not a full SHA' }
     if (-not (Test-CachedCommit $cache $Layer.commit)) {
         return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
     }
