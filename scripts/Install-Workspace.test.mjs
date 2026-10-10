@@ -4279,3 +4279,110 @@ test('a checkout probe that throws is reported as unreadable, and Set-LayerChoic
   assert.match(run.stdout, /STATE=\[the checkout could not be read: simulated git failure\]/, run.stdout);
   assert.match(run.stdout, /LAYER=\[the checkout could not be read: simulated git failure\]/, run.stdout);
 }, {});
+
+// Finding 4: the guard turns off only the filters the tree itself defines: its own config, what its includes add, its per-worktree
+// config, and the names its attributes files use. The user's global and system filters run, as they do in any checkout.
+function runGit(dir, args, env = process.env) {
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8', env });
+  assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
+  return run.stdout.trim();
+}
+
+// The environment with a global config file that holds one setting. The file is outside the checkout and the test system config is off.
+function globalGitEnv(ctx, key, value) {
+  const file = join(ctx.base, 'global-gitconfig');
+  runGit(ctx.base, ['config', '-f', file, key, value]);
+  return { ...process.env, GIT_CONFIG_GLOBAL: file, GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+// A local checkout with one committed file, and a .gitattributes that names the mark filter on text files.
+function markedCheckoutWithCommit(ctx) {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  return checkout;
+}
+
+withWorkspace('a checkout runs the smudge filter that the user global config defines, since the guard turns off only the tree filters', (ctx) => {
+  const source = join(ctx.base, 'source');
+  writeFile(source, '.gitattributes', '*.txt filter=up\n');
+  writeFile(source, 'a.txt', 'hello\n');
+  runGit(source, ['init', '-q']);
+  runGit(source, ['add', '-A']);
+  runGit(source, ['commit', '-q', '-m', 'source']);
+  const env = globalGitEnv(ctx, 'filter.up.smudge', 'tr a-z A-Z');
+  const target = join(ctx.base, 'target');
+  runGit(ctx.base, ['clone', '-q', '--no-checkout', source, target], env);
+
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $target = '${target.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $target -Arguments @('-C', $target, 'checkout', '--quiet', '-f', 'HEAD'); "CODE=$($run.code)"`;
+  const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment(env) });
+  assertOk(guarded);
+  assert.match(guarded.stdout, /CODE=0/, guarded.stdout);
+  assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'HELLO\n', 'the guarded checkout did not run the global smudge filter');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree reaches through an include in its own config', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'include-marker.txt');
+  const included = join(ctx.base, 'included.cfg');
+  runGit(ctx.base, ['config', '-f', included, 'filter.mark.clean', touchAndCat(marker)]);
+  runGit(checkout, ['config', 'include.path', included.replace(/\\/g, '/')]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the included clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that an include in the tree config defines');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree defines in its per-worktree config', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'worktree-marker.txt');
+  runGit(checkout, ['config', 'extensions.worktreeConfig', 'true']);
+  runGit(checkout, ['config', '--worktree', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the per-worktree clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command from the per-worktree config');
+}, {});
+
+withWorkspace('an audit turns off the filter that .git/info/attributes names when the tree config defines it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-marker.txt');
+  runGit(checkout, ['config', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command named by .git/info/attributes');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit runs no global filter that only the tree attributes name, since the tree defines none', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'global-marker.txt');
+  const env = globalGitEnv(ctx, 'filter.mark.clean', touchAndCat(marker));
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt'], env);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the global clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command that only the in-tree attributes name');
+}, {});

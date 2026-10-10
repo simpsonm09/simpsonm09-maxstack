@@ -200,12 +200,23 @@ function Get-FilterDriverName {
 function Read-TreeFilterNames {
     param([string] $Dir)
 
-    $run = Invoke-GitProcess -Arguments @('-C', $Dir, 'config', '--name-only', '-z', '--get-regexp', '^filter\.') -Settings (Get-GitGuardSettings)
-    if ($null -ne $run.unreadable) { return [pscustomobject]@{ names = @(); fault = $run.unreadable } }
-    if ($run.code -eq 1) { return [pscustomobject]@{ names = @(); fault = $null } }
-    if ($run.code -ne 0) { return [pscustomobject]@{ names = @(); fault = 'git could not read the config of this folder' } }
+    $settings = Get-GitGuardSettings
+    $repo = Invoke-GitProcess -Arguments @('-C', $Dir, 'rev-parse', '--git-dir') -Settings $settings
+    if ($null -ne $repo.unreadable) { return [pscustomobject]@{ names = @(); fault = $repo.unreadable } }
+    # A folder that is not a repository has no config of its own, so it names no filter.
+    if ($repo.code -ne 0) { return [pscustomobject]@{ names = @(); fault = $null } }
+    # Only the tree's own scopes are read: its repository config and its per-worktree config. --includes follows an include.path
+    # in them, so a filter that an include adds is seen. The user's global and system config is not the tree's, and is not read.
+    $keys = [System.Collections.Generic.List[string]]::new()
+    foreach ($scope in @('--local', '--worktree')) {
+        $run = Invoke-GitProcess -Arguments @('-C', $Dir, 'config', $scope, '--includes', '--name-only', '-z', '--get-regexp', '^filter\.') -Settings $settings
+        if ($null -ne $run.unreadable) { return [pscustomobject]@{ names = @(); fault = $run.unreadable } }
+        if ($run.code -eq 1) { continue }
+        if ($run.code -ne 0) { return [pscustomobject]@{ names = @(); fault = 'git could not read the config of this folder' } }
+        $keys.AddRange([string[]] @($run.text -split "`0" | Where-Object { $_ }))
+    }
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($key in @($run.text -split "`0" | Where-Object { $_ })) {
+    foreach ($key in $keys) {
         $name = Get-FilterDriverName $key
         if ($null -eq $name) { continue }
         if ($name -cmatch '[\x00-\x1f\x7f]') {
@@ -221,11 +232,25 @@ function Read-TreeFilterNames {
     return [pscustomobject]@{ names = @($seen); fault = $null }
 }
 
+# The empty tree. Passed as --attr-source, git reads no attributes from the worktree, so a .gitattributes in the tree names no filter.
+$script:EmptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
+# Whether this git has --attr-source, which git 2.40 added. The probe runs once per run. Without it the empty tree cannot be
+# named, and a status reads the tree's attributes as usual. The name-based guard still applies.
+$script:attrSourceSupported = $null
+function Test-AttrSourceSupport {
+    if ($null -eq $script:attrSourceSupported) {
+        $script:attrSourceSupported = ((Invoke-GitProcess -Arguments @("--attr-source=$($script:EmptyTree)", 'version') -Settings @()).code -eq 0)
+    }
+    return $script:attrSourceSupported
+}
+
 # Runs one git command under the guard. With Dir, the filter drivers that the tree names are turned off first, and a tree that
 # cannot be passed is refused before git runs: the result then has unreadable set and no exit code, so a caller never reads a
-# tree whose filters it could not turn off. Every guarded command is run here.
+# tree whose filters it could not turn off. With EmptyAttributes, the command reads no attributes from the tree (where git supports it).
+# Every guarded command is run here.
 function Invoke-GitGuarded {
-    param([string[]] $Arguments, [string] $Dir = '', [int] $TimeoutSeconds = 0)
+    param([string[]] $Arguments, [string] $Dir = '', [int] $TimeoutSeconds = 0, [switch] $EmptyAttributes)
 
     if (-not (Test-GitEnvConfigSupport)) { return (New-GitFault 'git 2.31 or later is needed, so the filter guard cannot be passed') }
     $names = @()
@@ -234,7 +259,9 @@ function Invoke-GitGuarded {
         if ($null -ne $tree.fault) { return (New-GitFault $tree.fault) }
         $names = $tree.names
     }
-    return (Invoke-GitProcess -Arguments (@('--no-optional-locks') + $Arguments) -Settings (Get-GitGuardSettings -FilterNames $names) -TimeoutSeconds $TimeoutSeconds)
+    $options = @('--no-optional-locks')
+    if ($EmptyAttributes -and (Test-AttrSourceSupport)) { $options += "--attr-source=$($script:EmptyTree)" }
+    return (Invoke-GitProcess -Arguments ($options + $Arguments) -Settings (Get-GitGuardSettings -FilterNames $names) -TimeoutSeconds $TimeoutSeconds)
 }
 
 # The first line that a git command printed, trimmed, or an empty string when it printed none.
@@ -429,7 +456,9 @@ function Read-LocalCheckoutState {
     # A folder inside another repository reads that repository's HEAD. It is a checkout only when it is the top level.
     $top = Invoke-GitGuarded -Dir $Root -Arguments @('-C', $Root, 'rev-parse', '--show-toplevel')
     if ($top.code -ne 0 -or -not (Get-GitLine $top) -or (Get-NormalPath (Get-GitLine $top)) -ne (Get-NormalPath $Root)) { return $none }
-    $status = Invoke-GitGuarded -Dir $Root -Arguments @('-C', $Root, 'status', '--porcelain', '--', '.')
+    # A status of a local tree reads its content through the clean filters, so the tree's attributes are not read at all.
+    # A diff between two commits reads no worktree content, so no filter runs there.
+    $status = Invoke-GitGuarded -Dir $Root -EmptyAttributes -Arguments @('-C', $Root, 'status', '--porcelain', '--', '.')
     if ($null -ne $status.unreadable) { return (New-UnreadableState $status.unreadable) }
     return [pscustomobject]@{ commit = (Get-GitLine $head); dirty = (@($status.stdout).Count -gt 0); unreadable = $null }
 }
