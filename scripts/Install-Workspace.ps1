@@ -837,7 +837,8 @@ function Sync-GitPlugin {
     if (-not (Test-Path -LiteralPath (Join-Path $cache '.git'))) {
         New-Item -ItemType Directory -Path $claudeCacheTarget -Force | Out-Null
         Write-Host "Cloning $($Layer.url) (partial, sparse) into $cache"
-        $clone = Invoke-GitGuarded -Arguments @('clone', '--quiet', '--filter=blob:none', '--no-checkout', '--sparse', '--', $Layer.url, $cache)
+        # A clone names no tree, so it runs from an empty folder. Its target is an absolute path, since a relative one would resolve there.
+        $clone = Invoke-GitGuarded -Arguments @('clone', '--quiet', '--filter=blob:none', '--no-checkout', '--sparse', '--', $Layer.url, [IO.Path]::GetFullPath($cache))
         if ($clone.code -ne 0) { Write-GitStderr $clone; throw "git clone of $($Layer.url) failed for '$($Layer.name)'." }
         $null = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'config', 'core.autocrlf', 'false')
         $null = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'config', 'core.eol', 'lf')

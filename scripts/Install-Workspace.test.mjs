@@ -4567,6 +4567,52 @@ withWorkspace('an eol=crlf file that is unchanged reads as clean, since the stat
   assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
 }, {});
 
+// Finding 5: a git command that names no tree runs in a fresh empty folder, so the config of the folder the installer runs in
+// does not reach it. That config below rewrites the url of the remote, so a ref lookup must not read the other remote.
+function bareRepoWithCommit(base, name, text) {
+  const work = join(base, `${name}-work`);
+  writeFile(work, 'a.txt', text);
+  runGit(work, ['init', '-q', '-b', 'main']);
+  runGit(work, ['add', '-A']);
+  runGit(work, ['commit', '-q', '-m', text]);
+  const bare = join(base, `${name}.git`);
+  runGit(base, ['clone', '-q', '--bare', work, bare]);
+  return bare;
+}
+
+withWorkspace('a ref lookup reads the remote it names, not the one a config in the folder it runs from rewrites it to', (ctx) => {
+  const remote = bareRepoWithCommit(ctx.base, 'remote', 'the remote');
+  const other = bareRepoWithCommit(ctx.base, 'other', 'the other remote');
+  const remoteSha = runGit(remote, ['rev-parse', 'main']);
+  const otherSha = runGit(other, ['rev-parse', 'main']);
+  const evil = join(ctx.base, 'evil');
+  mkdirSync(evil);
+  runGit(evil, ['init', '-q']);
+  runGit(evil, ['config', `url.${other.replace(/\\/g, '/')}.insteadOf`, remote.replace(/\\/g, '/')]);
+
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, new RegExp(`REF=${remoteSha}`), run.stdout);
+  assert.notEqual(otherSha, remoteSha);
+  assert.doesNotMatch(run.stdout, new RegExp(otherSha), 'the ref lookup read the remote that the folder config rewrote it to');
+}, {});
+
+test('a git command that names no tree runs outside every repository, so the folder it runs from is not read', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-neutral-'));
+  try {
+    const evil = join(base, 'evil');
+    mkdirSync(evil);
+    runGit(evil, ['init', '-q']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('rev-parse', '--is-inside-work-tree'); "CODE=$($run.code)"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+    assertOk(run);
+    assert.doesNotMatch(run.stdout, /CODE=0/, 'a command that names no tree ran inside the repository of the folder it started from');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {

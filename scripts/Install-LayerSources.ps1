@@ -128,8 +128,9 @@ function New-GitFault {
 # Runs git with the settings in the child's environment, and a time limit when one is given (zero waits without one). A run past
 # the limit is stopped with its process tree, so a silent remote cannot hold the installer. Returns the exit code and each stream.
 # The process and its pipes are disposed on every path. Callers go through Invoke-GitGuarded, which applies the guard.
+# WorkingDirectory is the folder the child starts in, and CeilingDirectory is one git does not search above for a repository.
 function Invoke-GitProcess {
-    param([string[]] $Arguments, $Settings, [int] $TimeoutSeconds = 0)
+    param([string[]] $Arguments, $Settings, [int] $TimeoutSeconds = 0, [string] $WorkingDirectory = '', [string] $CeilingDirectory = '')
 
     $info = [Diagnostics.ProcessStartInfo]::new('git')
     foreach ($argument in $Arguments) { $info.ArgumentList.Add([string] $argument) }
@@ -139,7 +140,9 @@ function Invoke-GitProcess {
     $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $info.UseShellExecute = $false
+    if ($WorkingDirectory) { $info.WorkingDirectory = $WorkingDirectory }
     Set-GitChildEnvironment -Environment $info.Environment -Settings $Settings
+    if ($CeilingDirectory) { $info.Environment['GIT_CEILING_DIRECTORIES'] = $CeilingDirectory }
     try {
         $process = [Diagnostics.Process]::Start($info)
     } catch {
@@ -183,7 +186,7 @@ $script:gitEnvConfigSupported = $null
 function Test-GitEnvConfigSupport {
     if ($null -eq $script:gitEnvConfigSupported) {
         $probe = @([pscustomobject]@{ key = 'maxstack.guardprobe'; value = 'on' })
-        $run = Invoke-GitProcess -Arguments @('config', '--get', 'maxstack.guardprobe') -Settings $probe
+        $run = Invoke-GitNeutral -Arguments @('config', '--get', 'maxstack.guardprobe') -Settings $probe
         $script:gitEnvConfigSupported = ($run.code -eq 0 -and (@($run.stdout) -contains 'on'))
     }
     return $script:gitEnvConfigSupported
@@ -240,21 +243,35 @@ function Read-TreeFilterNames {
     return [pscustomobject]@{ names = @($seen); fault = $null }
 }
 
+# Runs a git command that names no tree (a ref lookup, a clone, a version probe) in a fresh empty folder, outside any repository.
+# git reads the config of the folder it starts in, so the installer's folder, which may be a repository, is never read. The
+# folder's parent is a ceiling, so git does not search above it. The folder is removed when the command ends.
+function Invoke-GitNeutral {
+    param([string[]] $Arguments, $Settings, [int] $TimeoutSeconds = 0)
+
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ('maxstack-git-' + [guid]::NewGuid().ToString('N'))
+    [void] [IO.Directory]::CreateDirectory($folder)
+    try {
+        $ceiling = ([IO.Path]::GetDirectoryName($folder)) -replace '\\', '/'
+        return (Invoke-GitProcess -Arguments $Arguments -Settings $Settings -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $folder -CeilingDirectory $ceiling)
+    } finally {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Runs one git command under the guard. With Dir, the filter drivers that the tree names are turned off first, and a tree that
 # cannot be passed is refused before git runs: the result then has unreadable set and no exit code, so a caller never reads a
 # tree whose filters it could not turn off. With AllFilterScopes, the names come from every config scope (see Read-TreeFilterNames).
-# Every guarded command is run here.
+# Without Dir the command names no tree, and it runs through Invoke-GitNeutral. Every guarded command is run here.
 function Invoke-GitGuarded {
     param([string[]] $Arguments, [string] $Dir = '', [int] $TimeoutSeconds = 0, [switch] $AllFilterScopes)
 
     if (-not (Test-GitEnvConfigSupport)) { return (New-GitFault 'git 2.31 or later is needed, so the filter guard cannot be passed') }
-    $names = @()
-    if ($Dir) {
-        $tree = Read-TreeFilterNames -Dir $Dir -AllScopes:$AllFilterScopes
-        if ($null -ne $tree.fault) { return (New-GitFault $tree.fault) }
-        $names = $tree.names
-    }
-    return (Invoke-GitProcess -Arguments (@('--no-optional-locks') + $Arguments) -Settings (Get-GitGuardSettings -FilterNames $names) -TimeoutSeconds $TimeoutSeconds)
+    $arguments = @('--no-optional-locks') + $Arguments
+    if (-not $Dir) { return (Invoke-GitNeutral -Arguments $arguments -Settings (Get-GitGuardSettings) -TimeoutSeconds $TimeoutSeconds) }
+    $tree = Read-TreeFilterNames -Dir $Dir -AllScopes:$AllFilterScopes
+    if ($null -ne $tree.fault) { return (New-GitFault $tree.fault) }
+    return (Invoke-GitProcess -Arguments $arguments -Settings (Get-GitGuardSettings -FilterNames $tree.names) -TimeoutSeconds $TimeoutSeconds)
 }
 
 # The first line that a git command printed, trimmed, or an empty string when it printed none.
