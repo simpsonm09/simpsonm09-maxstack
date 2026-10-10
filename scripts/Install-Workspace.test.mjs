@@ -4227,3 +4227,55 @@ withWorkspace('the guard passes its filter settings to git in the child process,
   assert.match(run.stdout, /CODE=0/, run.stdout);
   assert.match(run.stdout, /LEFT=\[\]/, 'the guard left its settings in the installer environment');
 }, {});
+
+// Finding 3: a tree that names more than 100 filter drivers is unreadable, and every run reports it. Nothing throws.
+function manyFilters(count) {
+  return Array.from({ length: count }, (_, index) => `[filter "f${index}"]\n\tclean = false\n`).join('');
+}
+
+withWorkspace('a tree that names more than 100 filter drivers is reported as unreadable by -Status, -Update, and an audit', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  appendFileSync(join(checkout, '.git', 'config'), manyFilters(400));
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /simpsonm09-org-ai-plugin: override, local .*unreadable: too many filter drivers/, plainOutput(status));
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false }));
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /unreadable: too many filter drivers/, plainOutput(audit));
+}, {});
+
+withWorkspace('a tree that names exactly 100 filter drivers is still read', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  appendFileSync(join(checkout, '.git', 'config'), manyFilters(100));
+  // The user's global config may name filters of its own, such as git-lfs, so the count is taken with an empty global file.
+  const emptyGlobal = join(ctx.base, 'empty-gitconfig');
+  writeFileSync(emptyGlobal, '');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env: { ...process.env, GIT_CONFIG_GLOBAL: emptyGlobal, GIT_CONFIG_NOSYSTEM: '1' } });
+  assertOk(audit);
+  assert.doesNotMatch(plainOutput(audit), /unreadable/, plainOutput(audit));
+  assert.match(plainOutput(audit), /simpsonm09-org-ai-plugin: override, local .*HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
+// Finding 3: a git failure inside the checkout probe is reported as an unreadable layer. Set-LayerChoice must not throw,
+// since a throw there would stop -Status, -Update, and -Remove.
+test('a checkout probe that throws is reported as unreadable, and Set-LayerChoice does not throw', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { throw 'simulated git failure' }; $state = Get-LocalCheckoutState -Root $env:TEMP; "STATE=[$($state.unreadable)]"; $layer = @{ name = 'x'; sourcePath = '.'; root = $null; override = $false }; $choice = [pscustomobject]@{ kind = 'local'; url = $null; ref = $null; commit = $null; path = $env:TEMP; checkout = $env:TEMP; override = $true }; Set-LayerChoice -Layer $layer -Choice $choice; "LAYER=[$($layer.unreadable)]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /STATE=\[the checkout could not be read: simulated git failure\]/, run.stdout);
+  assert.match(run.stdout, /LAYER=\[the checkout could not be read: simulated git failure\]/, run.stdout);
+}, {});

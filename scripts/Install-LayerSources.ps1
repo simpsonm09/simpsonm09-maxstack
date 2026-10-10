@@ -213,6 +213,11 @@ function Read-TreeFilterNames {
         }
         [void] $seen.Add($name)
     }
+    # Each name takes four settings, so the count is capped. A tree past the cap is refused, not read partly.
+    $maxFilterDrivers = 100
+    if ($seen.Count -gt $maxFilterDrivers) {
+        return [pscustomobject]@{ names = @(); fault = "too many filter drivers: $($seen.Count) are named, and the guard passes at most $maxFilterDrivers" }
+    }
     return [pscustomobject]@{ names = @($seen); fault = $null }
 }
 
@@ -401,7 +406,19 @@ function Join-SourceSub {
 
 # The state of a local checkout, read without writing: its HEAD commit and whether it holds uncommitted changes.
 # A folder that is not a git checkout has neither, so nothing is invented for it.
+# The state of a local checkout. A failure inside the probe is an unreadable checkout with its reason, never a throw, since a throw
+# would stop -Status, -Update, and -Remove, which all resolve every layer.
 function Get-LocalCheckoutState {
+    param([string] $Root)
+
+    try {
+        return (Read-LocalCheckoutState -Root $Root)
+    } catch {
+        return (New-UnreadableState "the checkout could not be read: $($_.Exception.Message)")
+    }
+}
+
+function Read-LocalCheckoutState {
     param([string] $Root)
 
     $none = [pscustomobject]@{ commit = $null; dirty = $null; unreadable = $null }
@@ -705,9 +722,13 @@ function Get-RecordedUnreadable {
     param($Source)
 
     if ($Source.kind -ne 'local' -or -not (Test-NonEmptyString $Source.path)) { return $null }
-    $folder = Get-LocalSourceFolder $Source.path
-    if (-not (Test-Path -LiteralPath $folder -PathType Container)) { return $null }
-    return (Read-TreeFilterNames -Dir $folder).fault
+    try {
+        $folder = Get-LocalSourceFolder $Source.path
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { return $null }
+        return (Read-TreeFilterNames -Dir $folder).fault
+    } catch {
+        return "the folder could not be read: $($_.Exception.Message)"
+    }
 }
 
 # The entries -Status reads from the lock, and the entries an audit reads from the layers it resolved. Each entry names
