@@ -3615,3 +3615,34 @@ withWorkspace('-Source owner/repo@tag resolves an annotated tag to the commit it
   assert.deepEqual(sourceOf(ctx, 'pstack').source, { kind: 'git', url: remoteUrl(ctx, 'simpsonm09', 'pstack-claude'), ref: 'v1', commit: featCommit, override: true });
   assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/, 'the tagged content was not installed');
 }, {});
+
+// ---- Hardening of the layer sources: each test names one review finding, and each fails before its fix. ----
+
+// A config layer served from a local bare repository, pinned to its commit, for a git override of that layer.
+function servedConfigLayer(ctx) {
+  const source = join(ctx.base, 'cfg-src');
+  writeLayerStub(source, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(source, ['init', '-q']);
+  gitRun(source, ['add', '-A']);
+  gitRun(source, ['commit', '-q', '-m', 'config layer']);
+  const commit = gitRun(source, ['rev-parse', 'HEAD']);
+  serveRepo(ctx, 'simpsonm09', 'org-ai-plugin', source);
+  return commit;
+}
+
+// Finding 1: a config layer under a git override is read from its cache, and an audit with no cache says so.
+withWorkspace('a config layer under a git override runs -Status and -Update -Check without throwing', (ctx) => {
+  const commit = servedConfigLayer(ctx);
+  const override = ['-Source', `simpsonm09-org-ai-plugin=simpsonm09/org-ai-plugin@${commit}`];
+  mustApply(ctx, override, { env: githubEnv(ctx) });
+  assertOk(runInstaller(shell, ctx, ['-Status'], { apply: false, env: githubEnv(ctx) }));
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) }));
+}, {});
+
+withWorkspace('a config layer pinned by -Source and audited without -Apply names its config as unknown, and does not throw', (ctx) => {
+  const commit = servedConfigLayer(ctx);
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=simpsonm09/org-ai-plugin@${commit}`], { apply: false, env: githubEnv(ctx) });
+  assertOk(audit);
+  assert.match(audit.stdout, /Drift: .*opencode\.jsonc: unknown until -Apply syncs the layer cache/, audit.stdout);
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'cache')), false, 'an audit fetched the cache');
+}, {});

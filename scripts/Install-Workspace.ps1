@@ -2896,6 +2896,9 @@ if ($Apply) {
         }
     }
 }
+# A git layer's root is its cache folder once the cache is at the pin. Without an apply, a cache that is not at the pin
+# leaves the root null, and what needs the root is then unknown until an apply syncs the cache.
+foreach ($layer in @($layers | Where-Object { $null -ne $_.url })) { $layer.root = Get-LayerRoot $layer }
 
 $claudeRecords = @($layers | ForEach-Object { Get-ClaudeRecord $_ } | Where-Object { $null -ne $_ })
 
@@ -2943,9 +2946,11 @@ if ($piSelected -and ($piLayers.Count -gt 0 -or (Test-Path -LiteralPath $piSetti
         -OwnedSkills (Get-OwnedPiEntries -Owned $priorOwned -LegacyPi $priorPi -Key 'skills')
 }
 
-# The config is OpenCode's. Without the opencode runtime it is neither built nor written.
+# The config is OpenCode's. Without the opencode runtime it is neither built nor written. A config layer whose root is
+# unknown (a git cache not yet at its pin) makes the whole document unknown, since its fragment is merged into it.
+$configUnknown = @($layers | Where-Object { $_.kind -eq 'config' -and $null -eq $_.root }).Count -gt 0
 $document = $null
-if ($openCodeSelected) {
+if ($openCodeSelected -and -not $configUnknown) {
     $base = Get-Content -LiteralPath $baseConfigFile -Raw | ConvertFrom-Json
     $serverMaps = @()
     $extraPermissions = @()
@@ -3098,7 +3103,8 @@ if (-not $Apply) {
     }
     if ($openCodeSelected) {
         Write-Host "Config target:  $configTarget"
-        Write-Host ("Drift:          {0}: {1}" -f $configTarget, (Get-DriftState -Path $configTarget -Text $document))
+        $configState = if ($configUnknown) { 'unknown until -Apply syncs the layer cache' } else { Get-DriftState -Path $configTarget -Text $document }
+        Write-Host ("Drift:          {0}: {1}" -f $configTarget, $configState)
     }
     if ($claudeSelected) {
         $wantedClaude = @($claudeRecords | ForEach-Object { $_.plugin })
