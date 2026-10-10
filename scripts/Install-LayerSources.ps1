@@ -111,7 +111,7 @@ function Get-SpecFault {
 function Test-CommitRef {
     param([string] $Ref)
 
-    return ($Ref -cmatch '^[0-9a-f]{40}$')
+    return ($Ref -cmatch '^[0-9a-f]{40}\z')
 }
 
 # Whether a ref is a safe git ref name. git check-ref-format is the authority. A leading dash is refused here too,
@@ -450,11 +450,12 @@ function Get-RecordedSourceFault {
     }
     if ($kind -ne 'git') { return [pscustomobject]@{ field = 'kind'; reason = 'it is neither git nor local.' } }
     $url = Get-Field $Block 'url'
-    $httpsUrl = (Test-NonEmptyString $url) -and (Test-HttpsGitUrl $url)
+    # The same two rules a -Source spec passes: its characters and parts (Get-SpecFault), and its url or ref form.
+    $httpsUrl = (Test-NonEmptyString $url) -and (Test-HttpsGitUrl $url) -and -not (Get-SpecFault $url)
     $seamUrl = (Test-TestSeam) -and (Test-NonEmptyString $url) -and ($url -cmatch '^([A-Za-z]:/|/)[^\x00-\x1f\x7f@]+\z')
     if (-not ($httpsUrl -or $seamUrl)) { return [pscustomobject]@{ field = 'url'; reason = 'it is not an https address with a host and a path.' } }
     $ref = Get-Field $Block 'ref'
-    if (-not ((Test-NonEmptyString $ref) -and (Test-SafeRefName $ref))) { return [pscustomobject]@{ field = 'ref'; reason = 'it is not a safe git ref name.' } }
+    if (-not ((Test-NonEmptyString $ref) -and -not (Get-SpecFault $ref) -and (Test-SafeRefName $ref))) { return [pscustomobject]@{ field = 'ref'; reason = 'it is not a safe git ref name.' } }
     if (-not (Test-CommitRef (Get-Field $Block 'commit'))) { return [pscustomobject]@{ field = 'commit'; reason = 'it is not a full 40-character lowercase commit SHA.' } }
     return $null
 }

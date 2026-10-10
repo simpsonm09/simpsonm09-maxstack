@@ -196,7 +196,7 @@ function New-LayerModel {
         $defaultRef = Get-Field $source 'ref'
         if (-not (Test-NonEmptyString $defaultUrl)) { throw "Layer '$name' source needs a url." }
         if (-not (Test-RelativePath $sourcePath)) { throw "Layer '$name' source.path must be a relative path inside the repository." }
-        if (-not (Test-NonEmptyString $commit) -or $commit -cnotmatch '^[0-9a-f]{40}$') {
+        if (-not (Test-NonEmptyString $commit) -or $commit -cnotmatch '^[0-9a-f]{40}\z') {
             throw "Layer '$name' source.commit must be a 40-character lowercase commit SHA."
         }
     } else {

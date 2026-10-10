@@ -3791,6 +3791,10 @@ const BAD_RECORDS = [
   ['ref', (block) => { block.ref = 'feat..x'; }],
   ['url', (block) => { block.url = 'ext::sh -c touch x'; }],
   ['url', (block) => { block.url = 'https://user@github.com/simpsonm09/pstack-claude.git'; }],
+  ['url', (block) => { block.url = 'https://github.com/simpsonm09/pstack claude.git'; }],
+  ['url', (block) => { block.url = 'https://github.com/../x'; }],
+  ['url', (block) => { block.url = 'https://github.com/simpsonm09/pstack-claude.git\n'; }],
+  ['commit', (block) => { block.commit = `${block.commit}\n`; }],
 ];
 
 function sourceBlockIn(lock, name) {
