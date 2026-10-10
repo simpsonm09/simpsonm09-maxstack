@@ -122,7 +122,7 @@ function Set-GitChildEnvironment {
 function New-GitFault {
     param([string] $Reason)
 
-    return [pscustomobject]@{ unreadable = $Reason; timedOut = $false; code = $null; text = ''; stdout = @(); stderr = @($Reason) }
+    return [pscustomobject]@{ unreadable = $Reason; timedOut = $false; code = $null; text = ''; stdout = @(); stderr = @($Reason); incomplete = $false }
 }
 
 # Runs git with the settings in the child's environment, and a time limit when one is given (zero waits without one). A run past
@@ -161,9 +161,10 @@ function Invoke-GitProcess {
             unreadable = $null
             timedOut   = $timedOut
             code       = $(if ($timedOut) { $null } else { $process.ExitCode })
-            text       = $out
-            stdout     = @(($out -split "`r?`n") | Where-Object { $_ })
-            stderr     = @(($err -split "`r?`n") | Where-Object { $_ })
+            text       = $out.text
+            stdout     = @(($out.text -split "`r?`n") | Where-Object { $_ })
+            stderr     = @(($err.text -split "`r?`n") | Where-Object { $_ })
+            incomplete = -not ($out.complete -and $err.complete)
         }
     } finally {
         foreach ($task in @($stdout, $stderr)) {
@@ -484,12 +485,13 @@ function New-UnreadableState {
 }
 
 # The text a git output pipe yields, waiting at most the given time. A pipe that a stopped git's child still holds open
-# gives no end, so the wait is bounded and the read gives up with no output rather than holding the installer.
+# gives no end, so the wait is bounded and the read gives up rather than holding the installer. The result says whether
+# the read completed: a read that gave up has no text and is incomplete, which is not the same as empty output.
 function Read-GitPipeBounded {
     param($Task, [int] $Milliseconds = 5000)
 
-    if ($Task.Wait($Milliseconds)) { return [string] $Task.Result }
-    return ''
+    if ($Task.Wait($Milliseconds)) { return [pscustomobject]@{ text = [string] $Task.Result; complete = $true } }
+    return [pscustomobject]@{ text = ''; complete = $false }
 }
 
 # The commit a branch, tag, or full commit names on a remote, read with git ls-remote. Nothing is written. A
@@ -502,6 +504,8 @@ function Find-GitRefCommit {
     if ($run.timedOut) {
         throw "could not read the refs of ${Url}: git ls-remote took longer than $TimeoutSeconds seconds, so it was stopped. Check the network and the url."
     }
+    # A read that gave up is not an empty listing: git may have printed the refs, and the output was cut off before they arrived.
+    if ($run.incomplete) { throw "could not read the refs of ${Url}: git output was cut off, so the refs are unknown. A process may still hold the output open." }
     if ($run.code -ne 0) { throw "could not read the refs of ${Url}: $((@($run.stdout) + @($run.stderr)) -join ' ')" }
     $output = $run.stdout
     $refs = [hashtable]::new([StringComparer]::Ordinal)

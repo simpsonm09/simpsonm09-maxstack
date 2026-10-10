@@ -4144,12 +4144,12 @@ withWorkspace('an apply that runs npm counts the installed packages that declare
 
 // Round 2, J: a pipe that a stopped git's child still holds open is not waited on past the bound.
 test('a git output read that never completes returns within its bound, with no output', { skip, timeout: 60000 }, () => {
-  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $text = Read-GitPipeBounded -Task $task -Milliseconds 1000; "READ=[$text]"`;
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $read = Read-GitPipeBounded -Task $task -Milliseconds 1000; "READ=[$($read.text)] COMPLETE=$($read.complete)"`;
   const started = Date.now();
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 50000 });
   assertOk(run);
   assert.ok(Date.now() - started < 40000, 'the read was not bounded');
-  assert.ok(run.stdout.includes('READ=[]'), run.stdout);
+  assert.ok(run.stdout.includes('READ=[] COMPLETE=False'), run.stdout);
 }, {});
 
 // ---- Round 3: the filter guard. A clean command that the tree's config defines writes a marker file when it runs.
@@ -4438,4 +4438,14 @@ withWorkspace('a recorded override with a relative path is warned and refused wi
   assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded path is relative');
   assert.match(plainOutput(apply), /has an invalid path: needs an absolute path\. Repair it with/, plainOutput(apply));
   assert.doesNotMatch(plainOutput(apply), /absolute path\.\./, plainOutput(apply));
+}, {});
+
+// Finding 10: git that exits 0 while a grandchild holds its output open gives an incomplete read. That is a cut-off output,
+// not a result, so the ref lookup says so instead of "no branch or tag named".
+test('a ref lookup whose git output was cut off says so, and does not report a missing ref', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = $true } }; try { Find-GitRefCommit -Url 'https://example.com/team/layer.git' -Ref 'main' } catch { "ERR=$($_.Exception.Message)" }`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /ERR=.*git output was cut off/, run.stdout);
+  assert.doesNotMatch(run.stdout, /no branch or tag named/, run.stdout);
 }, {});
