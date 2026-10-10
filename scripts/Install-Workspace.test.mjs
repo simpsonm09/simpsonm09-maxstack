@@ -3900,7 +3900,7 @@ test('the git guard sets the prompt variables, and turns on file transport only 
   assertOk(run);
   assert.match(run.stdout, /PROMPT=0/, run.stdout);
   assert.match(run.stdout, /GCM=never/, run.stdout);
-  assert.match(run.stdout, /core\.fsmonitor=false/, run.stdout);
+  assert.match(run.stdout, /core\.fsmonitor= /, run.stdout);
   assert.match(run.stdout, /protocol\.allow=never/, run.stdout);
   assert.doesNotMatch(run.stdout, /protocol\.file\.allow/, 'a real run allows file transport');
 
@@ -4821,6 +4821,15 @@ test('a cut-off read of the tree config is unreadable, not a list with no filter
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /FAULT=\[.*cut off/, run.stdout);
+}, {});
+
+// Finding 10: core.fsmonitor is off with the empty string, which git reads as no monitor on every version. On git 2.31 to 2.35
+// "false" is read as a path, so the value that means off is the empty string.
+test('the guard turns core.fsmonitor off with the empty string, which no git version reads as a path', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $setting = Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }; "FSM=[$($setting.value)] COUNT=$(@(Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }).Count)"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /FSM=\[\] COUNT=1/, run.stdout);
 }, {});
 
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the

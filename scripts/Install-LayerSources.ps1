@@ -75,7 +75,7 @@ function Get-GitGuardSettings {
     param([string[]] $FilterNames = @())
 
     $settings = @(
-        [pscustomobject]@{ key = 'core.fsmonitor'; value = 'false' }
+        [pscustomobject]@{ key = 'core.fsmonitor'; value = '' }
         [pscustomobject]@{ key = 'core.hooksPath'; value = 'NUL' }
         [pscustomobject]@{ key = 'protocol.allow'; value = 'never' }
         [pscustomobject]@{ key = 'protocol.https.allow'; value = 'always' }
