@@ -3676,6 +3676,9 @@ withWorkspace('an audit of a -Source local tree runs no program that its .git/co
   gitRun(checkout, ['commit', '-q', '-m', 'layer']);
   const marker = join(ctx.base, 'fsmonitor-marker');
   gitRun(checkout, ['config', 'core.fsmonitor', `touch '${marker.split('\\').join('/')}'`]);
+  gitRun(checkout, ['status', '--porcelain']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the command that core.fsmonitor names when git was not guarded');
+  rmSync(marker);
 
   const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
   assertOk(audit);
@@ -4689,6 +4692,88 @@ test('the child environment loses each inherited git variable that names a repos
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_NOSYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+// Finding 7: the older filter fixtures again, with the attribute line in .git/info/attributes, so the name rule is what runs.
+withWorkspace('an audit runs no clean filter whose command has a dot in it, when .git/info/attributes names it', (ctx) => {
+  const marker = join(ctx.base, 'info-dotted-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=mark\n', filters: [['mark', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command with a dot in it, named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit runs no clean filter whose name holds an equals sign, when .git/info/attributes names it', (ctx) => {
+  const marker = join(ctx.base, 'info-equals-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=a=b\n', filters: [['a=b', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command whose name holds an equals sign, named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree reaches through an include, when .git/info/attributes names it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-include-marker.txt');
+  const included = join(ctx.base, 'info-included.cfg');
+  runGit(ctx.base, ['config', '-f', included, 'filter.mark.clean', touchAndCat(marker)]);
+  runGit(checkout, ['config', 'include.path', included.replace(/\\/g, '/')]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the included clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that an include in the tree config defines');
+}, {});
+
+withWorkspace('an audit turns off a filter in the per-worktree config, when .git/info/attributes names it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-worktree-marker.txt');
+  runGit(checkout, ['config', 'extensions.worktreeConfig', 'true']);
+  runGit(checkout, ['config', '--worktree', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the per-worktree clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command from the per-worktree config, named by .git/info/attributes');
+}, {});
+
+// Finding 7: the guard turns off core.hooksPath too. A commit the guard runs must not run the hook the tree names.
+test('a commit the guard runs runs no hook that the tree names in core.hooksPath', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-hooks-'));
+  try {
+    const tree = join(base, 'tree');
+    mkdirSync(tree);
+    runGit(tree, ['init', '-q']);
+    const marker = join(base, 'hook-marker.txt');
+    const hooks = join(base, 'hooks');
+    writeFile(base, 'hooks/pre-commit', `#!/bin/sh\ntouch '${marker.replace(/\\/g, '/')}'\n`);
+    runGit(tree, ['config', 'core.hooksPath', hooks.replace(/\\/g, '/')]);
+    runGit(tree, ['commit', '-q', '--allow-empty', '-m', 'fixture']);
+    assert.equal(existsSync(marker), true, 'the fixture did not run the hook when git was not guarded');
+    rmSync(marker);
+
+    const env = { ...testEnvironment(), GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'commit', '-q', '--allow-empty', '-m', 'guarded'); "CODE=$($run.code)"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, /CODE=0/, run.stdout);
+    assert.equal(existsSync(marker), false, 'the guarded commit ran the hook that core.hooksPath names');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }, {});
 
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
