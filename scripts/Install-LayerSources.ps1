@@ -80,7 +80,11 @@ function Get-LocalPathFault {
 
     if (-not (Test-NonEmptyString $Path) -or $Path -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}|/)') { return 'needs an absolute path.' }
     $normal = Get-NormalPath ([IO.Path]::GetFullPath($Path).TrimEnd('\'))
-    if ($normal -eq (Get-NormalPath $Workspace)) { return 'is the workspace itself, which cannot be a layer source.' }
+    $workspaceNormal = Get-NormalPath $Workspace
+    if ($normal -eq $workspaceNormal) { return 'is the workspace itself, which cannot be a layer source.' }
+    if ($workspaceNormal.StartsWith("$normal\", [StringComparison]::Ordinal)) {
+        return 'is an ancestor of the workspace, and a layer cannot contain the installer that reads it.'
+    }
     foreach ($output in @('.claude', '.opencode', '.pi', '.maxstack')) {
         $folder = Get-NormalPath (Join-Path $Workspace $output)
         if ($normal -eq $folder -or $normal.StartsWith("$folder\", [StringComparison]::Ordinal)) {
@@ -109,6 +113,7 @@ function Read-GitSpec {
     $location = $Spec.Substring(0, $at)
     $ref = $Spec.Substring($at + 1)
     if (-not (Test-SafeRefName $ref)) { throw "-Source $Name=${Spec}: '$ref' is not a safe git ref name." }
+    if ($location -match '^([A-Za-z]:[\\/]|[\\/])') { throw "-Source $Name=${Spec} names a folder with an @ref, which is not a git source: did you mean local:${location}?" }
     if ($location -match '^[A-Za-z][A-Za-z0-9+.-]*:') {
         if ($location -cnotmatch '^https://[^/\\?#@]+/[^\\?#@]+$') {
             throw "-Source $Name=${Spec}: only https:// URLs with a host and a path are allowed."
@@ -142,7 +147,7 @@ function Read-SourceSpecs {
     $table = @{}
     foreach ($entry in @($Specs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
         $name, $spec = $entry -split '=', 2
-        if ($null -eq $spec) { throw "-Source expects name=spec, got '$entry'." }
+        if ($null -eq $spec) { throw "-Source expects name=spec, got '$entry'. A comma separates -Source entries, so a path cannot hold one." }
         Add-ExplicitSource -Table $table -Name $name -Spec (Read-SourceSpec -Name $name -Spec $spec) -LayerNames $LayerNames
     }
     foreach ($entry in @($LayerSpecs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
@@ -179,6 +184,9 @@ function Get-LocalCheckoutState {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $none }
     $head = (& git @(Get-GitGuardArgs) -C $Root rev-parse HEAD 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $head) { return $none }
+    # A folder inside another repository reads that repository's HEAD. It is a checkout only when it is the top level.
+    $top = (& git @(Get-GitGuardArgs) -C $Root rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $top -or (Get-NormalPath ([string] $top).Trim()) -ne (Get-NormalPath $Root)) { return $none }
     $changes = @(& git @(Get-GitGuardArgs) -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
     return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
 }

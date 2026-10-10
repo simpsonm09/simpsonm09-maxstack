@@ -3916,3 +3916,55 @@ withWorkspace('an apply that runs npm on a layer with no install script or bindi
   const run = mustApply(ctx);
   assert.doesNotMatch(plainOutput(run), /npm ran with --ignore-scripts/, plainOutput(run));
 }, NPM);
+
+// Finding 9: a local source is a checkout of its own only when git's top level is the folder; an ancestor of the workspace
+// would contain it; a long-path prefix and a junction are followed before a path is compared; a comma and a C:\x@ref
+// spec get a clear reason.
+withWorkspace('a plain folder inside another git repository is not a checkout, so no commit of that repository is recorded', (ctx) => {
+  const outer = join(ctx.base, 'outer');
+  writeFile(outer, 'README.md', 'outer\n');
+  gitRun(outer, ['init', '-q']);
+  gitRun(outer, ['add', '-A']);
+  gitRun(outer, ['commit', '-q', '-m', 'outer']);
+  const plain = join(outer, 'plain');
+  writeLayerStub(plain, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${plain}`], { apply: false });
+  assertOk(audit);
+  const text = sourceBlockOf(audit.stdout).lines.join('\n');
+  assert.match(text, /simpsonm09-org-ai-plugin: override, local .*plain \(not a git checkout\)/, text);
+  assert.doesNotMatch(text, /HEAD/, 'the enclosing repository was recorded');
+}, {});
+
+withWorkspace('a local source that contains the workspace is refused, since the layer would hold the installer that reads it', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${ctx.base}`], { apply: false });
+  assert.notEqual(run.status, 0, 'an ancestor of the workspace was accepted');
+  assert.match(plainOutput(run), /is an ancestor of the workspace/, run.stdout);
+}, {});
+
+withWorkspace('a local source reached through a junction, or named with a long-path prefix, is compared by the folder it names', (ctx) => {
+  const toClaude = join(ctx.base, 'to-claude');
+  mkdirSync(join(ctx.workspace, '.claude'), { recursive: true });
+  symlinkSync(join(ctx.workspace, '.claude'), toClaude, 'junction');
+  const viaJunction = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${toClaude}`], { apply: false });
+  assert.notEqual(viaJunction.status, 0, 'a junction into .claude was accepted');
+  assert.match(plainOutput(viaJunction), /is inside \.claude/, viaJunction.stdout);
+
+  const prefixed = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:\\\\?\\${ctx.workspace}`], { apply: false });
+  assert.notEqual(prefixed.status, 0, 'a long-path prefix hid the workspace');
+  assert.match(plainOutput(prefixed), /is the workspace itself/, prefixed.stdout);
+}, {});
+
+withWorkspace('a comma inside a -Source path is refused with the reason, since a comma separates entries', (ctx) => {
+  const folder = join(ctx.base, 'a');
+  mkdirSync(folder);
+  const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${folder},b`], { apply: false });
+  assert.notEqual(run.status, 0, 'a path with a comma was accepted');
+  assert.match(plainOutput(run), /comma separates -Source entries, so a path cannot hold one/i, run.stdout);
+}, {});
+
+withWorkspace('a -Source spec that is a folder with an @ref says to use local:', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', 'pstack=C:\\x@main'], { apply: false });
+  assert.notEqual(run.status, 0, 'a folder with an @ref was accepted as a git source');
+  assert.ok(plainOutput(run).includes('did you mean local:C:\\x?'), run.stdout);
+}, {});

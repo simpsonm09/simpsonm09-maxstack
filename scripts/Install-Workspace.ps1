@@ -345,10 +345,31 @@ function Get-ClaudeRecord {
     return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'junction'; target = ".opencode/plugins/$($Layer.name)" }
 }
 
+# The form of a path that comparisons use: a \\?\ long-path prefix is dropped, and each junction or symbolic link on the
+# way is followed, so a path through a link compares equal to the folder it names. Case is ignored.
 function Get-NormalPath {
     param([string] $Path)
 
-    return [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    $text = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
+    $root = [IO.Path]::GetPathRoot($text)
+    $current = $root
+    foreach ($segment in @($text.Substring($root.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))) {
+        $current = Resolve-PathLink (Join-Path $current $segment)
+    }
+    return $current.TrimEnd('\').ToLowerInvariant()
+}
+
+# The folder a junction or symbolic link names, or the path itself when it is not a link.
+function Resolve-PathLink {
+    param([string] $Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $Path }
+    $target = $item.ResolveLinkTarget($true)
+    if ($null -ne $target) { return $target.FullName }
+    $text = @($item.Target)[0]
+    if ($text) { return [IO.Path]::GetFullPath([string] $text) }
+    return $Path
 }
 
 # The folders directly under .opencode\plugins that no current layer names.
