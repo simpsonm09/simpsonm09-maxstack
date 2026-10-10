@@ -4137,3 +4137,13 @@ withWorkspace('an apply that runs npm counts the installed packages that declare
   const run = mustApply(ctx, [], { env: { ...ctx.env, FAKE_NPM_SCRIPTED: JSON.stringify(names) } });
   assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'pstack': 13 installed packages declare install scripts or a native build, which did not run: @acme\/native, dep-00.*and 3 more/, plainOutput(run));
 }, NPM);
+
+// Round 2, J: a pipe that a stopped git's child still holds open is not waited on past the bound.
+test('a git output read that never completes returns within its bound, with no output', { skip, timeout: 60000 }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $text = Read-GitPipeBounded -Task $task -Milliseconds 1000; "READ=[$text]"`;
+  const started = Date.now();
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 50000 });
+  assertOk(run);
+  assert.ok(Date.now() - started < 40000, 'the read was not bounded');
+  assert.ok(run.stdout.includes('READ=[]'), run.stdout);
+}, {});

@@ -266,8 +266,18 @@ function Get-LocalCheckoutState {
     return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
 }
 
-# Runs git with the guard options and a time limit. A run past the limit is stopped with its child processes, so a silent
-# remote cannot hold the installer. Returns whether it timed out, its exit code, and each stream's lines.
+# The text a git output pipe yields, waiting at most the given time. A pipe that a stopped git's child still holds open
+# gives no end, so the wait is bounded and the read gives up with no output rather than holding the installer.
+function Read-GitPipeBounded {
+    param($Task, [int] $Milliseconds = 5000)
+
+    if ($Task.Wait($Milliseconds)) { return [string] $Task.Result }
+    return ''
+}
+
+# Runs git with the guard options and a time limit. A run past the limit is stopped with its process tree, so a silent
+# remote cannot hold the installer. Returns whether it timed out, its exit code, and each stream's lines. The process and
+# its pipes are disposed on every path.
 function Invoke-GitTimed {
     param([string[]] $Arguments, [int] $TimeoutSeconds)
 
@@ -279,14 +289,25 @@ function Invoke-GitTimed {
     $process = [Diagnostics.Process]::Start($info)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
-    if ($timedOut) { $process.Kill($true) }
-    $process.WaitForExit()
-    return [pscustomobject]@{
-        timedOut = $timedOut
-        code     = $(if ($timedOut) { $null } else { $process.ExitCode })
-        stdout   = @(($stdout.Result -split "`r?`n") | Where-Object { $_ })
-        stderr   = @(($stderr.Result -split "`r?`n") | Where-Object { $_ })
+    try {
+        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+        if ($timedOut) {
+            try { $process.Kill($true) } catch { }
+            [void] $process.WaitForExit(5000)
+        }
+        $out = Read-GitPipeBounded -Task $stdout
+        $err = Read-GitPipeBounded -Task $stderr
+        return [pscustomobject]@{
+            timedOut = $timedOut
+            code     = $(if ($timedOut) { $null } else { $process.ExitCode })
+            stdout   = @(($out -split "`r?`n") | Where-Object { $_ })
+            stderr   = @(($err -split "`r?`n") | Where-Object { $_ })
+        }
+    } finally {
+        foreach ($task in @($stdout, $stderr)) {
+            if ($task.IsCompleted) { $task.Dispose() }
+        }
+        $process.Dispose()
     }
 }
 
