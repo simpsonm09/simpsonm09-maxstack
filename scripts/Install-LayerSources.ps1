@@ -70,11 +70,31 @@ function Resolve-PathLink {
 # names (core.fsmonitor and hooks), refuse every transport but https, and skip optional index locks. The test seam also
 # allows file, since its remotes are local bare repositories. Two variables stop git from waiting on a credential prompt.
 function Get-GitGuardArgs {
+    param([string] $Dir = '')
+
     $env:GIT_TERMINAL_PROMPT = '0'
     $env:GCM_INTERACTIVE = 'never'
     $guard = @('-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always')
     if (Test-TestSeam) { $guard += @('-c', 'protocol.file.allow=always') }
-    return ($guard + '--no-optional-locks')
+    $guard += '--no-optional-locks'
+    if ($Dir) { $guard += Get-GitFilterOverrides -Dir $Dir }
+    return $guard
+}
+
+# Turns off each filter driver that the tree's git config names. A clean, smudge, or process command is a program, and
+# git runs it while it reads a file, so a command on a tree the installer reads must not run any of them. Only config is
+# read here. A filter is also marked not required, so a driver that is missing cannot fail the command.
+function Get-GitFilterOverrides {
+    param([string] $Dir)
+
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return @() }
+    $lines = @(& git @(Get-GitGuardArgs) -C $Dir config --get-regexp '^filter\.' 2>$null)
+    $names = @($lines | ForEach-Object { if ($_ -match '^filter\.(.+)\.[^.\s]+(\s|$)') { $Matches[1] } } | Sort-Object -Unique)
+    $overrides = @()
+    foreach ($name in $names) {
+        $overrides += @('-c', "filter.$name.clean=", '-c', "filter.$name.smudge=", '-c', "filter.$name.process=", '-c', "filter.$name.required=false")
+    }
+    return $overrides
 }
 
 # The reason a git -Source spec is refused, or $null when its characters and parts are acceptable.
@@ -236,12 +256,12 @@ function Get-LocalCheckoutState {
 
     $none = [pscustomobject]@{ commit = $null; dirty = $null }
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $none }
-    $head = (& git @(Get-GitGuardArgs) -C $Root rev-parse HEAD 2>$null)
+    $head = (& git @(Get-GitGuardArgs -Dir $Root) -C $Root rev-parse HEAD 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $head) { return $none }
     # A folder inside another repository reads that repository's HEAD. It is a checkout only when it is the top level.
-    $top = (& git @(Get-GitGuardArgs) -C $Root rev-parse --show-toplevel 2>$null)
+    $top = (& git @(Get-GitGuardArgs -Dir $Root) -C $Root rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $top -or (Get-NormalPath ([string] $top).Trim()) -ne (Get-NormalPath $Root)) { return $none }
-    $changes = @(& git @(Get-GitGuardArgs) -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
+    $changes = @(& git @(Get-GitGuardArgs -Dir $Root) -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
     return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
 }
 
@@ -560,7 +580,7 @@ function Test-CachedCommit {
     param([string] $Cache, [string] $Commit)
 
     if ([string]::IsNullOrEmpty($Commit) -or -not (Test-Path -LiteralPath (Join-Path $Cache '.git'))) { return $false }
-    & git @(Get-GitGuardArgs) --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
+    & git @(Get-GitGuardArgs -Dir $Cache) --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -588,7 +608,7 @@ function Get-MoveFilesNote {
         return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
     }
     if (-not (Test-CachedCommit $cache $OldCommit)) { return 'changed files unknown: the old commit is not in the cache' }
-    $output = @(& git @(Get-GitGuardArgs) --no-lazy-fetch -C $cache diff --no-renames --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null)
+    $output = @(& git @(Get-GitGuardArgs -Dir $cache) --no-lazy-fetch -C $cache diff --no-renames --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null)
     if ($LASTEXITCODE -ne 0) { return 'changed files unknown: git could not list the changed files from the cache' }
     $changed = @($output | Where-Object { $_ })
     return "$($changed.Count) files changed under $($Layer.sourcePath)"

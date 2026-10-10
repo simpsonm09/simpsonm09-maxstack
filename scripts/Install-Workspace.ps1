@@ -794,20 +794,20 @@ function Sync-GitPlugin {
         Write-Host "Cloning $($Layer.url) (partial, sparse) into $cache"
         & git @(Get-GitGuardArgs) clone --quiet --filter=blob:none --no-checkout --sparse -- $Layer.url $cache
         if ($LASTEXITCODE -ne 0) { throw "git clone of $($Layer.url) failed for '$($Layer.name)'." }
-        & git @(Get-GitGuardArgs) -C $cache config core.autocrlf false
-        & git @(Get-GitGuardArgs) -C $cache config core.eol lf
+        & git @(Get-GitGuardArgs -Dir $cache) -C $cache config core.autocrlf false
+        & git @(Get-GitGuardArgs -Dir $cache) -C $cache config core.eol lf
     }
-    & git @(Get-GitGuardArgs) -C $cache remote set-url origin $Layer.url
+    & git @(Get-GitGuardArgs -Dir $cache) -C $cache remote set-url origin $Layer.url
     if ($Layer.sourcePath -eq '.') {
-        & git @(Get-GitGuardArgs) -C $cache sparse-checkout disable
+        & git @(Get-GitGuardArgs -Dir $cache) -C $cache sparse-checkout disable
     } else {
-        & git @(Get-GitGuardArgs) -C $cache sparse-checkout set $Layer.sourcePath
+        & git @(Get-GitGuardArgs -Dir $cache) -C $cache sparse-checkout set $Layer.sourcePath
     }
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout of $($Layer.sourcePath) failed in $cache." }
 
-    & git @(Get-GitGuardArgs) -C $cache cat-file -e "$($Layer.commit)^{commit}" 2>$null
+    & git @(Get-GitGuardArgs -Dir $cache) -C $cache cat-file -e "$($Layer.commit)^{commit}" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        & git @(Get-GitGuardArgs) -C $cache fetch --quiet --filter=blob:none origin -- $Layer.commit
+        & git @(Get-GitGuardArgs -Dir $cache) -C $cache fetch --quiet --filter=blob:none origin -- $Layer.commit
         if ($LASTEXITCODE -ne 0) {
             $what = if ($Layer.override) { 'commit' } else { 'pinned commit' }
             $hint = if ($Layer.override) { 'Check the -Source spec.' } else { 'Check source.commit in layers.json.' }
@@ -815,12 +815,12 @@ function Sync-GitPlugin {
         }
     }
     # --end-of-options, not --: a -- before the commit would make it a pathspec.
-    & git @(Get-GitGuardArgs) -C $cache -c advice.detachedHead=false checkout --quiet --detach --end-of-options $Layer.commit
+    & git @(Get-GitGuardArgs -Dir $cache) -C $cache -c advice.detachedHead=false checkout --quiet --detach --end-of-options $Layer.commit
     if ($LASTEXITCODE -ne 0) { throw "git checkout of $($Layer.commit) failed in $cache." }
-    $head = (& git @(Get-GitGuardArgs) -C $cache rev-parse HEAD).Trim()
+    $head = (& git @(Get-GitGuardArgs -Dir $cache) -C $cache rev-parse HEAD).Trim()
     if ($head -ne $Layer.commit) { throw "The cache is at $head, not the pinned $($Layer.commit) for '$($Layer.name)'." }
     # The cache holds exactly the pinned commit: a file the checkout does not track is removed, and printed.
-    foreach ($line in @(& git @(Get-GitGuardArgs) -C $cache clean -ffdx)) { Write-Host "Cache $($Layer.name): $line" }
+    foreach ($line in @(& git @(Get-GitGuardArgs -Dir $cache) -C $cache clean -ffdx)) { Write-Host "Cache $($Layer.name): $line" }
     return $cache
 }
 
@@ -831,7 +831,7 @@ function Test-CacheAtPin {
 
     $cache = Join-Path $claudeCacheTarget $Layer.name
     if (-not (Test-Path -LiteralPath (Join-Path $cache '.git'))) { return $false }
-    $head = & git @(Get-GitGuardArgs) -C $cache rev-parse HEAD 2>$null
+    $head = & git @(Get-GitGuardArgs -Dir $cache) -C $cache rev-parse HEAD 2>$null
     return ($LASTEXITCODE -eq 0 -and ([string] $head).Trim() -eq $Layer.commit)
 }
 

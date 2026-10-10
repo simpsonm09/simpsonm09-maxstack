@@ -4040,3 +4040,21 @@ withWorkspace('a drive root or a share root is refused as a local source, with t
   assert.notEqual(share.status, 0, 'a share root was accepted as a layer source');
   assert.match(plainOutput(share), /is a drive or share root, which cannot be a layer source/, share.stdout);
 }, {});
+
+// Round 2, D: a clean filter that .git/config names is a program too. An audit of a local tree must run none of it.
+withWorkspace('an audit of a -Source local tree runs no clean filter that its .git/config names', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'filter-marker');
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  gitRun(checkout, ['config', 'filter.mark.clean', `sh -c "touch '${marker.split('\\').join('/')}'; cat"`]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean filter that .git/config names');
+}, {});
