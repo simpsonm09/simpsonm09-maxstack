@@ -25,6 +25,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -4393,7 +4394,14 @@ withWorkspace('an audit runs no global filter that only the tree attributes name
 
 // Finding 1: the guard reads git's UTF-8 output as UTF-8. A filter name or a folder with non-ASCII text is read whole.
 // The name rule is tested through .git/info/attributes, which git reads whatever the tree holds.
-function infoAttributesCheckout(ctx, { dir = 'org-checkout', attributes, filters }) {
+// Moves a file's mtime a minute ahead, so git cannot take the index's stat as still matching and must read the content.
+// Without it a file committed in the same moment reads as unchanged, and whether a filter runs depends on the clock.
+function bumpMtime(path) {
+  const later = new Date(Date.now() + 60000);
+  utimesSync(path, later, later);
+}
+
+function infoAttributesCheckout(ctx, { dir = 'org-checkout', attributes, filters, edit = true, env = undefined }) {
   const checkout = join(ctx.base, ...dir.split('/'));
   writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
   writeFile(checkout, 'notes.txt', 'one\n');
@@ -4402,8 +4410,12 @@ function infoAttributesCheckout(ctx, { dir = 'org-checkout', attributes, filters
   runGit(checkout, ['commit', '-q', '-m', 'layer']);
   writeFile(checkout, '.git/info/attributes', attributes);
   for (const [name, command] of filters) runGit(checkout, ['config', `filter.${name}.clean`, command]);
-  writeFile(checkout, 'notes.txt', 'two\n');
-  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  if (edit) {
+    // A same-size edit, so git must run the clean filter to see it.
+    writeFile(checkout, 'notes.txt', 'two\n');
+    runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt'], env);
+  }
+  bumpMtime(join(checkout, 'notes.txt'));
   return checkout;
 }
 
@@ -4496,6 +4508,65 @@ withWorkspace('an audit runs no filter that a populated submodule names in its o
   assert.equal(existsSync(marker), false, 'the audit ran a clean command that a populated submodule names in its own config');
 }, {});
 
+// Finding 4: a status of a local tree turns off every filter name that any config scope defines, the user's global config
+// included, and it reads the tree's own attributes. So a global filter that the tree names runs in neither case, and writes
+// nothing into the tree. touchAndCatInTree records its run in the marker and writes a file inside the tree, as git-lfs does.
+const touchAndCatInTree = (marker, file) => `sh -c "touch '${marker.replace(/\\/g, '/')}' '${file.replace(/\\/g, '/')}'; cat"`;
+
+withWorkspace('a status runs no global filter that .git/info/attributes names, and writes nothing into the tree', (ctx) => {
+  const marker = join(ctx.base, 'global-marker.txt');
+  const written = join(ctx.base, 'org-checkout', '.git', 'lfs-written.txt');
+  const env = globalGitEnv(ctx, 'filter.lfs.clean', touchAndCatInTree(marker, written));
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=lfs\n', filters: [], env });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the global clean command when git was not guarded');
+  rmSync(marker);
+  rmSync(written);
+  const before = snapshotTree(checkout);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command that the tree attributes name');
+  assert.equal(existsSync(written), false, 'the audit wrote a file into the tree');
+  assert.deepEqual(snapshotTree(checkout), before, 'the audit changed the tree');
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('a clean tree whose .git/info/attributes names a global filter reports clean, and runs no filter', (ctx) => {
+  const marker = join(ctx.base, 'clean-global-marker.txt');
+  const env = globalGitEnv(ctx, 'filter.lfs.clean', touchAndCat(marker));
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=lfs\n', filters: [], edit: false, env });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command on a tree with no change');
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('a changed file makes a local tree read as uncommitted changes', (ctx) => {
+  const checkout = infoAttributesCheckout(ctx, { attributes: '', filters: [] });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('an eol=crlf file that is unchanged reads as clean, since the status reads the tree attributes', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, '.gitattributes', '*.ps1 text eol=crlf\n');
+  writeFile(checkout, 'tool.ps1', 'one\r\ntwo\r\n');
+  runGit(checkout, ['init', '-q']);
+  // The system config may set core.autocrlf, which would convert the CRLF file on its own. Off, only the attributes can match it.
+  runGit(checkout, ['config', 'core.autocrlf', 'false']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  bumpMtime(join(checkout, 'tool.ps1'));
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {
@@ -4512,9 +4583,8 @@ withWorkspace('a long-path UNC share is refused as a share root, not read as a f
   assert.match(plainOutput(run), /is a drive or share root, which cannot be a layer source/, run.stdout);
 }, {});
 
-// Finding 4 follow-up: the empty-tree attribute source is a SHA-1 object, so in a SHA-256 repository the status it guards fails.
-// A failed status says nothing about the worktree, so its dirty state is unknown, not clean.
-withWorkspace('a SHA-256 checkout reads its dirty state as unknown, since the status it reads cannot run', (ctx) => {
+// A SHA-256 repository reads its HEAD and its dirty state like a SHA-1 one: the status names no SHA-1 object.
+withWorkspace('a SHA-256 checkout reads its HEAD and dirty state', (ctx) => {
   const checkout = join(ctx.base, 'org-checkout');
   writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
   runGit(checkout, ['init', '-q', '--object-format=sha256']);
@@ -4522,7 +4592,7 @@ withWorkspace('a SHA-256 checkout reads its dirty state as unknown, since the st
   runGit(checkout, ['commit', '-q', '-m', 'layer']);
   const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
   assertOk(audit);
-  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{64}, dirty state not recorded\)/, plainOutput(audit));
+  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{64}, clean\)/, plainOutput(audit));
 }, {});
 
 // Finding 9: a recorded fault already ends in a period, so the warning and the refusal join it with a space, not a second period.
