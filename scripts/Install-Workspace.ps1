@@ -703,6 +703,22 @@ function Resolve-NpmLocks {
     }
 }
 
+# npm runs with --ignore-scripts, so a layer's own install scripts and a native build (a binding.gyp) do not run. Each
+# layer that declares one is named when npm runs, so the change in what gets installed shows in that run's output.
+function Write-IgnoredScriptWarning {
+    param([string] $Name, [string] $Folder)
+
+    $declared = @()
+    $package = Join-Path $Folder 'package.json'
+    if (Test-Path -LiteralPath $package -PathType Leaf) {
+        $scripts = Get-Field (Get-Content -LiteralPath $package -Raw | ConvertFrom-Json) 'scripts'
+        $declared = @(@('preinstall', 'install', 'postinstall') | Where-Object { $null -ne (Get-Field $scripts $_) } | ForEach-Object { "scripts.$_" })
+    }
+    if (Test-Path -LiteralPath (Join-Path $Folder 'binding.gyp') -PathType Leaf) { $declared += 'binding.gyp' }
+    if ($declared.Count -eq 0) { return }
+    Write-Warning "npm ran with --ignore-scripts for layer '$Name': its $($declared -join ', ') did not run, so what it would build or install is missing."
+}
+
 # Copies the named items of a layer root into a folder. A claude copy of a local layer holds the same
 # items as its OpenCode copy, and never the rest of the checkout.
 function Copy-LayerItems {
@@ -3232,6 +3248,7 @@ foreach ($layer in $openCodeLayers) {
         # --ignore-scripts: a layer's own install scripts, and its dependencies', never run from a checkout the installer reads.
         & npm install --prefix $installDir --omit=dev --no-audit --no-fund --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw "npm install failed in $installDir" }
+        Write-IgnoredScriptWarning -Name $layer.name -Folder $installDir
     }
     Resolve-NpmLocks -Folder $installDir -Shipped $shippedLocks
 

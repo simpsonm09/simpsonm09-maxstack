@@ -3885,3 +3885,34 @@ test('an ls-remote that passes its time limit is stopped, and the error says so'
     server.close();
   }
 });
+
+// Finding 8: npm runs with --ignore-scripts, and a layer that declares install scripts or a binding.gyp is named when it runs.
+// The stub org layer's node_modules is taken away, so npm runs for it, and its layer.json names the files the copy keeps.
+function orgNeedingNpm(ctx, { packageJson, files, extra = {} }) {
+  const org = join(ctx.workspace, ORG_SOURCE);
+  rmSync(join(org, 'node_modules'), { recursive: true, force: true });
+  writeFile(org, 'layer.json', JSON.stringify({ files }));
+  writeFile(org, 'package.json', JSON.stringify(packageJson));
+  for (const [rel, content] of Object.entries(extra)) writeFile(org, rel, content);
+}
+
+const ORG_FILES = ['index.ts', 'package.json', 'skills', '.claude-plugin'];
+
+withWorkspace('an apply that runs npm names a layer that declares an install script, since its scripts do not run', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0', scripts: { postinstall: 'node build.js' } }, files: ORG_FILES });
+  const run = mustApply(ctx);
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'simpsonm09-org-ai-plugin': its scripts\.postinstall did not run/, plainOutput(run));
+  assert.doesNotMatch(plainOutput(run), /ignore-scripts for layer 'pstack'/, 'a layer with no install script is named');
+}, NPM);
+
+withWorkspace('an apply that runs npm names a layer that ships a binding.gyp, since its native build does not run', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: [...ORG_FILES, 'binding.gyp'], extra: { 'binding.gyp': '{}\n' } });
+  const run = mustApply(ctx);
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'simpsonm09-org-ai-plugin': its binding\.gyp did not run/, plainOutput(run));
+}, NPM);
+
+withWorkspace('an apply that runs npm on a layer with no install script or binding.gyp prints no ignore-scripts warning', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: ORG_FILES });
+  const run = mustApply(ctx);
+  assert.doesNotMatch(plainOutput(run), /npm ran with --ignore-scripts/, plainOutput(run));
+}, NPM);
