@@ -4391,6 +4391,60 @@ withWorkspace('an audit runs no global filter that only the tree attributes name
   assert.equal(existsSync(marker), false, 'the audit ran a global clean command that only the in-tree attributes name');
 }, {});
 
+// Finding 1: the guard reads git's UTF-8 output as UTF-8. A filter name or a folder with non-ASCII text is read whole.
+// The name rule is tested through .git/info/attributes, which git reads whatever the tree holds.
+function infoAttributesCheckout(ctx, { dir = 'org-checkout', attributes, filters }) {
+  const checkout = join(ctx.base, ...dir.split('/'));
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, '.git/info/attributes', attributes);
+  for (const [name, command] of filters) runGit(checkout, ['config', `filter.${name}.clean`, command]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  return checkout;
+}
+
+for (const [label, name] of [['a non-ASCII name', 'é'], ['a CJK name', '日本']]) {
+  withWorkspace(`an audit runs no clean filter named by ${label} in .git/info/attributes`, (ctx) => {
+    const marker = join(ctx.base, 'utf8-marker.txt');
+    const checkout = infoAttributesCheckout(ctx, { attributes: `*.txt filter=${name}\n`, filters: [[name, touchAndCat(marker)]] });
+    assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+    rmSync(marker);
+
+    const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+    assertOk(audit);
+    assert.equal(existsSync(marker), false, `the audit ran the clean command of the filter named ${name}`);
+  }, {});
+}
+
+withWorkspace('a checkout under a non-ASCII folder is read as a checkout, with its HEAD and dirty state', (ctx) => {
+  const checkout = infoAttributesCheckout(ctx, { dir: '日本語/org-checkout', attributes: '', filters: [] });
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+test('a non-ASCII setting reaches git intact, and a filter name git prints comes back as the same text', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-utf8-'));
+  try {
+    const tree = join(base, 'tree');
+    mkdirSync(tree);
+    runGit(tree, ['init', '-q']);
+    runGit(tree, ['config', 'filter.é.clean', 'x']);
+    runGit(tree, ['config', 'filter.日本.clean', 'x']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $names = @((Read-TreeFilterNames -Dir $tree).names); $probe = @([pscustomobject]@{ key = 'maxstack.probe'; value = '日本é' }); $run = Invoke-GitProcess -Arguments @('config', '--get', 'maxstack.probe') -Settings $probe; "NAMES has_e=$($names -contains 'é') has_cjk=$($names -contains '日本') count=$($names.Count)"; "ENV code=$($run.code) same=$($run.stdout[0] -ceq '日本é')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /NAMES has_e=True has_cjk=True count=2/, run.stdout);
+    assert.match(run.stdout, /ENV code=0 same=True/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {

@@ -135,6 +135,9 @@ function Invoke-GitProcess {
     foreach ($argument in $Arguments) { $info.ArgumentList.Add([string] $argument) }
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    # git writes UTF-8 (config names, paths, refs). Without these, .NET decodes the streams with the console code page.
+    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $info.UseShellExecute = $false
     Set-GitChildEnvironment -Environment $info.Environment -Settings $Settings
     try {
