@@ -3885,7 +3885,7 @@ function runAsync(args, env) {
 }
 
 test('the git guard sets the prompt variables, and turns on file transport only in a test run', { skip }, () => {
-  const script = `. '${layerSourcesFile}'; $null = Get-GitGuardArgs; "PROMPT=$env:GIT_TERMINAL_PROMPT"; "GCM=$env:GCM_INTERACTIVE"; (Get-GitGuardArgs) -join ' '`;
+  const script = `. '${layerSourcesFile}'; $vars = Get-GitChildVariables -Settings (Get-GitGuardSettings); "PROMPT=$($vars.GIT_TERMINAL_PROMPT)"; "GCM=$($vars.GCM_INTERACTIVE)"; (Get-GitGuardSettings | ForEach-Object { "$($_.key)=$($_.value)" }) -join ' '`;
   const real = { ...process.env };
   delete real.MAXSTACK_TEST_MODE;
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: real });
@@ -4171,4 +4171,59 @@ withWorkspace('an audit of a -Source local tree runs no clean filter whose comma
   const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
   assertOk(audit);
   assert.equal(existsSync(marker), false, 'the audit ran the clean command that .git/config names');
+}, {});
+
+// Finding 2: the guard passes its settings in the child's environment, so a name is never split at "=", and a name the
+// guard cannot pass makes the tree unreadable, with no filter run. The checkout's clean command writes the marker.
+withWorkspace('an audit of a -Source local tree runs no clean filter whose name holds an equals sign', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'equals-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=a=b\n');
+  gitRun(checkout, ['config', 'filter.a=b.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command whose filter name holds an equals sign');
+}, {});
+
+withWorkspace('a filter name with a control character makes its tree unreadable, and no filter in it runs', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'control-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=a\x01b\n');
+  gitRun(checkout, ['config', 'filter.a\x01b.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const status = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /simpsonm09-org-ai-plugin: override, local .*unreadable: .*control character/, plainOutput(status));
+  assert.equal(existsSync(marker), false, 'a tree with an unpassable filter name was read');
+}, {});
+
+withWorkspace('the guard passes its filter settings to git in the child process, and leaves the installer environment as it was', (ctx) => {
+  const tree = join(ctx.base, 'tree');
+  mkdirSync(tree);
+  gitRun(tree, ['init', '-q']);
+  gitRun(tree, ['config', 'filter.a=b.clean', 'touch x']);
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'status', '--porcelain'); "CODE=$($run.code)"; "LEFT=[$env:GIT_CONFIG_COUNT]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /CODE=0/, run.stdout);
+  assert.match(run.stdout, /LEFT=\[\]/, 'the guard left its settings in the installer environment');
 }, {});

@@ -238,6 +238,7 @@ function New-LayerModel {
         override      = $false
         localPath     = $null
         folderMissing = $false
+        unreadable    = $null
         repoRoot      = $null
         root          = $null
     }
@@ -825,35 +826,37 @@ function Sync-GitPlugin {
     if (-not (Test-Path -LiteralPath (Join-Path $cache '.git'))) {
         New-Item -ItemType Directory -Path $claudeCacheTarget -Force | Out-Null
         Write-Host "Cloning $($Layer.url) (partial, sparse) into $cache"
-        & git @(Get-GitGuardArgs) clone --quiet --filter=blob:none --no-checkout --sparse -- $Layer.url $cache
-        if ($LASTEXITCODE -ne 0) { throw "git clone of $($Layer.url) failed for '$($Layer.name)'." }
-        & git @(Get-GitGuardArgs -Dir $cache) -C $cache config core.autocrlf false
-        & git @(Get-GitGuardArgs -Dir $cache) -C $cache config core.eol lf
+        $clone = Invoke-GitGuarded -Arguments @('clone', '--quiet', '--filter=blob:none', '--no-checkout', '--sparse', '--', $Layer.url, $cache)
+        if ($clone.code -ne 0) { Write-GitStderr $clone; throw "git clone of $($Layer.url) failed for '$($Layer.name)'." }
+        $null = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'config', 'core.autocrlf', 'false')
+        $null = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'config', 'core.eol', 'lf')
     }
-    & git @(Get-GitGuardArgs -Dir $cache) -C $cache remote set-url origin $Layer.url
+    $null = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'remote', 'set-url', 'origin', $Layer.url)
     if ($Layer.sourcePath -eq '.') {
-        & git @(Get-GitGuardArgs -Dir $cache) -C $cache sparse-checkout disable
+        $sparse = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'sparse-checkout', 'disable')
     } else {
-        & git @(Get-GitGuardArgs -Dir $cache) -C $cache sparse-checkout set $Layer.sourcePath
+        $sparse = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'sparse-checkout', 'set', $Layer.sourcePath)
     }
-    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout of $($Layer.sourcePath) failed in $cache." }
+    if ($sparse.code -ne 0) { Write-GitStderr $sparse; throw "git sparse-checkout of $($Layer.sourcePath) failed in $cache." }
 
-    & git @(Get-GitGuardArgs -Dir $cache) -C $cache cat-file -e "$($Layer.commit)^{commit}" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        & git @(Get-GitGuardArgs -Dir $cache) -C $cache fetch --quiet --filter=blob:none origin -- $Layer.commit
-        if ($LASTEXITCODE -ne 0) {
+    $present = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'cat-file', '-e', "$($Layer.commit)^{commit}")
+    if ($present.code -ne 0) {
+        $fetch = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'fetch', '--quiet', '--filter=blob:none', 'origin', '--', $Layer.commit)
+        if ($fetch.code -ne 0) {
+            Write-GitStderr $fetch
             $what = if ($Layer.override) { 'commit' } else { 'pinned commit' }
             $hint = if ($Layer.override) { 'Check the -Source spec.' } else { 'Check source.commit in layers.json.' }
             throw "Could not fetch the $what $($Layer.commit) from $($Layer.url) for '$($Layer.name)'. $hint"
         }
     }
     # --end-of-options, not --: a -- before the commit would make it a pathspec.
-    & git @(Get-GitGuardArgs -Dir $cache) -C $cache -c advice.detachedHead=false checkout --quiet --detach --end-of-options $Layer.commit
-    if ($LASTEXITCODE -ne 0) { throw "git checkout of $($Layer.commit) failed in $cache." }
-    $head = (& git @(Get-GitGuardArgs -Dir $cache) -C $cache rev-parse HEAD).Trim()
+    $checkout = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, '-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', '--end-of-options', $Layer.commit)
+    if ($checkout.code -ne 0) { Write-GitStderr $checkout; throw "git checkout of $($Layer.commit) failed in $cache." }
+    $head = Get-GitLine (Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'rev-parse', 'HEAD'))
     if ($head -ne $Layer.commit) { throw "The cache is at $head, not the pinned $($Layer.commit) for '$($Layer.name)'." }
     # The cache holds exactly the pinned commit: a file the checkout does not track is removed, and printed.
-    foreach ($line in @(& git @(Get-GitGuardArgs -Dir $cache) -C $cache clean -ffdx)) { Write-Host "Cache $($Layer.name): $line" }
+    $clean = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'clean', '-ffdx')
+    foreach ($line in @($clean.stdout)) { Write-Host "Cache $($Layer.name): $line" }
     return $cache
 }
 
@@ -864,8 +867,8 @@ function Test-CacheAtPin {
 
     $cache = Join-Path $claudeCacheTarget $Layer.name
     if (-not (Test-Path -LiteralPath (Join-Path $cache '.git'))) { return $false }
-    $head = & git @(Get-GitGuardArgs -Dir $cache) -C $cache rev-parse HEAD 2>$null
-    return ($LASTEXITCODE -eq 0 -and ([string] $head).Trim() -eq $Layer.commit)
+    $run = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'rev-parse', 'HEAD')
+    return ($run.code -eq 0 -and (Get-GitLine $run) -eq $Layer.commit)
 }
 
 # The folder a layer installs from: its checkout, or the pinned folder of its cache. $null when
@@ -2928,14 +2931,15 @@ $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
 $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notcontains $_ })
 
-# A local folder that is gone stops an apply, which would write what the folder holds, and a removal too, which rewrites the
-# config from every selected layer's fragment. Every other run reports the folder and goes on.
+# A local folder that is gone, or a tree whose git config the guard cannot pass, stops an apply, which would write what the
+# folder holds, and a removal too, which rewrites the config from every selected layer's fragment. Every other run reports it and goes on.
 foreach ($layer in $layers) {
-    if ($layer.sourceKind -ne 'local' -or -not $layer.folderMissing) { continue }
+    if ($layer.sourceKind -ne 'local' -or -not ($layer.folderMissing -or $layer.unreadable)) { continue }
     if (-not $Apply) { continue }
     # -Source is an apply or audit option, so only a plain apply names it, and only for an override that it would drop.
     $repair = if (-not $removing -and $layer.override) { " or drop the override with -Source $($layer.name)=default -Apply" } else { '' }
-    throw "Layer '$($layer.name)' has no folder at $($layer.repoRoot). Restore the folder$repair, then rerun."
+    if ($layer.folderMissing) { throw "Layer '$($layer.name)' has no folder at $($layer.repoRoot). Restore the folder$repair, then rerun." }
+    throw "Layer '$($layer.name)' cannot be read at $($layer.repoRoot): $($layer.unreadable). Fix the tree's git config$repair, then rerun."
 }
 
 # Before any write, an apply records what already exists: the directories an install may create, the

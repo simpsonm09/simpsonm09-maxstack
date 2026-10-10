@@ -67,44 +67,185 @@ function Resolve-PathLink {
     }
 }
 
-# The options every git command the installer runs starts with. They stop git from running a program that a checkout
-# names (core.fsmonitor and hooks), refuse every transport but https, and skip optional index locks. The test seam also
-# allows file, since its remotes are local bare repositories. Two variables stop git from waiting on a credential prompt.
-function Get-GitGuardArgs {
-    param([string] $Dir = '')
+# The settings every git command the installer runs under. They stop git from running a program that a checkout names
+# (core.fsmonitor and hooks), and refuse every transport but https. The test seam also allows file, since its remotes
+# are local bare repositories. Each filter driver that a tree names is turned off as well (-FilterNames): a clean,
+# smudge, or process command is a program that git runs while it reads a file, and a driver that is missing is not required.
+function Get-GitGuardSettings {
+    param([string[]] $FilterNames = @())
 
-    $env:GIT_TERMINAL_PROMPT = '0'
-    $env:GCM_INTERACTIVE = 'never'
-    $guard = @('-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always')
-    if (Test-TestSeam) { $guard += @('-c', 'protocol.file.allow=always') }
-    $guard += '--no-optional-locks'
-    if ($Dir) { $guard += Get-GitFilterOverrides -Dir $Dir }
-    return $guard
-}
-
-# Turns off each filter driver that the tree's git config names. A clean, smudge, or process command is a program, and
-# git runs it while it reads a file, so a command on a tree the installer reads must not run any of them. Only config is
-# read here. A filter is also marked not required, so a driver that is missing cannot fail the command.
-function Get-GitFilterOverrides {
-    param([string] $Dir)
-
-    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return @() }
-    $keys = @(& git @(Get-GitGuardArgs) -C $Dir config --name-only --get-regexp '^filter\.' 2>$null)
-    $names = @($keys | ForEach-Object { Get-FilterDriverName $_ } | Where-Object { $null -ne $_ } | Sort-Object -Unique)
-    $overrides = @()
-    foreach ($name in $names) {
-        $overrides += @('-c', "filter.$name.clean=", '-c', "filter.$name.smudge=", '-c', "filter.$name.process=", '-c', "filter.$name.required=false")
+    $settings = @(
+        [pscustomobject]@{ key = 'core.fsmonitor'; value = 'false' }
+        [pscustomobject]@{ key = 'core.hooksPath'; value = 'NUL' }
+        [pscustomobject]@{ key = 'protocol.allow'; value = 'never' }
+        [pscustomobject]@{ key = 'protocol.https.allow'; value = 'always' }
+    )
+    if (Test-TestSeam) { $settings += [pscustomobject]@{ key = 'protocol.file.allow'; value = 'always' } }
+    foreach ($name in $FilterNames) {
+        foreach ($part in @('clean', 'smudge', 'process')) {
+            $settings += [pscustomobject]@{ key = "filter.$name.$part"; value = '' }
+        }
+        $settings += [pscustomobject]@{ key = "filter.$name.required"; value = 'false' }
     }
-    return $overrides
+    return $settings
 }
 
-# The driver name of one config key, which is everything between the first "filter." and the last dot, so a subsection
-# may hold dots. Only the key is passed here: a value is never parsed, since it can hold any text, dots included.
+# The variables a git child runs with: the two that stop a credential prompt, and the settings as GIT_CONFIG_COUNT with
+# GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n>, which git 2.31 reads. A name is never split at "=", and the argument list has no
+# length limit.
+function Get-GitChildVariables {
+    param($Settings)
+
+    $list = @($Settings)
+    $variables = @{ GIT_TERMINAL_PROMPT = '0'; GCM_INTERACTIVE = 'never'; GIT_CONFIG_COUNT = [string] $list.Count }
+    for ($index = 0; $index -lt $list.Count; $index++) {
+        $variables["GIT_CONFIG_KEY_$index"] = [string] $list[$index].key
+        $variables["GIT_CONFIG_VALUE_$index"] = [string] $list[$index].value
+    }
+    return $variables
+}
+
+# Sets a git child's environment to those variables. The child inherits the installer's environment, so any GIT_CONFIG_* entry
+# it holds is removed from the child first. Only the child's environment is set, never the installer's.
+function Set-GitChildEnvironment {
+    param($Environment, $Settings)
+
+    foreach ($key in @($Environment.Keys)) {
+        if ($key -cmatch '^GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+)\z') { [void] $Environment.Remove($key) }
+    }
+    foreach ($entry in (Get-GitChildVariables -Settings $Settings).GetEnumerator()) {
+        $Environment[$entry.Key] = $entry.Value
+    }
+}
+
+# The result of a command the guard refused to run. Nothing ran, so there is no exit code, and the reason is the stderr.
+function New-GitFault {
+    param([string] $Reason)
+
+    return [pscustomobject]@{ unreadable = $Reason; timedOut = $false; code = $null; text = ''; stdout = @(); stderr = @($Reason) }
+}
+
+# Runs git with the settings in the child's environment, and a time limit when one is given (zero waits without one). A run past
+# the limit is stopped with its process tree, so a silent remote cannot hold the installer. Returns the exit code and each stream.
+# The process and its pipes are disposed on every path. Callers go through Invoke-GitGuarded, which applies the guard.
+function Invoke-GitProcess {
+    param([string[]] $Arguments, $Settings, [int] $TimeoutSeconds = 0)
+
+    $info = [Diagnostics.ProcessStartInfo]::new('git')
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add([string] $argument) }
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.UseShellExecute = $false
+    Set-GitChildEnvironment -Environment $info.Environment -Settings $Settings
+    try {
+        $process = [Diagnostics.Process]::Start($info)
+    } catch {
+        return (New-GitFault "git could not start: $($_.Exception.Message)")
+    }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    try {
+        $timedOut = $false
+        if ($TimeoutSeconds -gt 0) {
+            $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+        } else {
+            $process.WaitForExit()
+        }
+        if ($timedOut) {
+            try { $process.Kill($true) } catch { }
+            [void] $process.WaitForExit(5000)
+        }
+        $out = Read-GitPipeBounded -Task $stdout
+        $err = Read-GitPipeBounded -Task $stderr
+        return [pscustomobject]@{
+            unreadable = $null
+            timedOut   = $timedOut
+            code       = $(if ($timedOut) { $null } else { $process.ExitCode })
+            text       = $out
+            stdout     = @(($out -split "`r?`n") | Where-Object { $_ })
+            stderr     = @(($err -split "`r?`n") | Where-Object { $_ })
+        }
+    } finally {
+        foreach ($task in @($stdout, $stderr)) {
+            if ($task.IsCompleted) { $task.Dispose() }
+        }
+        $process.Dispose()
+    }
+}
+
+# Whether this git reads the GIT_CONFIG_* settings, which git 2.31 added. Without them the guard does not hold, so a git
+# that cannot read them runs no guarded command. The probe reads back a value that it sets, and runs once per run.
+$script:gitEnvConfigSupported = $null
+function Test-GitEnvConfigSupport {
+    if ($null -eq $script:gitEnvConfigSupported) {
+        $probe = @([pscustomobject]@{ key = 'maxstack.guardprobe'; value = 'on' })
+        $run = Invoke-GitProcess -Arguments @('config', '--get', 'maxstack.guardprobe') -Settings $probe
+        $script:gitEnvConfigSupported = ($run.code -eq 0 -and (@($run.stdout) -contains 'on'))
+    }
+    return $script:gitEnvConfigSupported
+}
+
+# The driver name of one config key: everything between the first "filter." and the last dot, so a subsection may hold
+# dots. Only the key is read. A value is never parsed, since it can hold any text.
 function Get-FilterDriverName {
     param([string] $Key)
 
-    if ($Key -cmatch '^filter\.(.+)\.[^.]+\z') { return $Matches[1] }
+    if ($Key -cmatch '^filter\.([\s\S]+)\.[^.]+\z') { return $Matches[1] }
     return $null
+}
+
+# The filter driver names a tree's git config names, read from the keys alone. -z keeps each name whole, so a name that
+# holds a newline is seen as one. Returns the names and a fault. A name with a control character cannot be passed to git,
+# so the tree is refused with that reason. A config that cannot be read is refused too, and a tree that names none has no names.
+function Read-TreeFilterNames {
+    param([string] $Dir)
+
+    $run = Invoke-GitProcess -Arguments @('-C', $Dir, 'config', '--name-only', '-z', '--get-regexp', '^filter\.') -Settings (Get-GitGuardSettings)
+    if ($null -ne $run.unreadable) { return [pscustomobject]@{ names = @(); fault = $run.unreadable } }
+    if ($run.code -eq 1) { return [pscustomobject]@{ names = @(); fault = $null } }
+    if ($run.code -ne 0) { return [pscustomobject]@{ names = @(); fault = 'git could not read the config of this folder' } }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($key in @($run.text -split "`0" | Where-Object { $_ })) {
+        $name = Get-FilterDriverName $key
+        if ($null -eq $name) { continue }
+        if ($name -cmatch '[\x00-\x1f\x7f]') {
+            return [pscustomobject]@{ names = @(); fault = 'a filter driver name holds a control character, which the guard cannot pass to git' }
+        }
+        [void] $seen.Add($name)
+    }
+    return [pscustomobject]@{ names = @($seen); fault = $null }
+}
+
+# Runs one git command under the guard. With Dir, the filter drivers that the tree names are turned off first, and a tree that
+# cannot be passed is refused before git runs: the result then has unreadable set and no exit code, so a caller never reads a
+# tree whose filters it could not turn off. Every guarded command is run here.
+function Invoke-GitGuarded {
+    param([string[]] $Arguments, [string] $Dir = '', [int] $TimeoutSeconds = 0)
+
+    if (-not (Test-GitEnvConfigSupport)) { return (New-GitFault 'git 2.31 or later is needed, so the filter guard cannot be passed') }
+    $names = @()
+    if ($Dir) {
+        $tree = Read-TreeFilterNames -Dir $Dir
+        if ($null -ne $tree.fault) { return (New-GitFault $tree.fault) }
+        $names = $tree.names
+    }
+    return (Invoke-GitProcess -Arguments (@('--no-optional-locks') + $Arguments) -Settings (Get-GitGuardSettings -FilterNames $names) -TimeoutSeconds $TimeoutSeconds)
+}
+
+# The first line that a git command printed, trimmed, or an empty string when it printed none.
+function Get-GitLine {
+    param($Run)
+
+    $line = @($Run.stdout | Where-Object { $_ }) | Select-Object -First 1
+    if ($null -eq $line) { return '' }
+    return ([string] $line).Trim()
+}
+
+# Shows the stderr of a git command that failed. The guard captures the streams, so this keeps the reason in front of the user.
+function Write-GitStderr {
+    param($Run)
+
+    foreach ($line in @($Run.stderr)) { Write-Host $line }
 }
 
 # The reason a git -Source spec is refused, or $null when its characters and parts are acceptable.
@@ -131,8 +272,7 @@ function Test-SafeRefName {
 
     if (Test-CommitRef $Ref) { return $true }
     if ($Ref.StartsWith('-') -or $Ref -match '\s' -or $Ref.Contains('..')) { return $false }
-    & git @(Get-GitGuardArgs) check-ref-format "refs/heads/$Ref" 2>$null
-    return ($LASTEXITCODE -eq 0)
+    return ((Invoke-GitGuarded -Arguments @('check-ref-format', "refs/heads/$Ref")).code -eq 0)
 }
 
 # The full path of a folder. A trailing separator is dropped, except on a root, which keeps its own: C:\ stays C:\ and
@@ -264,15 +404,24 @@ function Join-SourceSub {
 function Get-LocalCheckoutState {
     param([string] $Root)
 
-    $none = [pscustomobject]@{ commit = $null; dirty = $null }
+    $none = [pscustomobject]@{ commit = $null; dirty = $null; unreadable = $null }
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $none }
-    $head = (& git @(Get-GitGuardArgs -Dir $Root) -C $Root rev-parse HEAD 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $head) { return $none }
+    $head = Invoke-GitGuarded -Dir $Root -Arguments @('-C', $Root, 'rev-parse', 'HEAD')
+    if ($null -ne $head.unreadable) { return (New-UnreadableState $head.unreadable) }
+    if ($head.code -ne 0 -or -not (Get-GitLine $head)) { return $none }
     # A folder inside another repository reads that repository's HEAD. It is a checkout only when it is the top level.
-    $top = (& git @(Get-GitGuardArgs -Dir $Root) -C $Root rev-parse --show-toplevel 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $top -or (Get-NormalPath ([string] $top).Trim()) -ne (Get-NormalPath $Root)) { return $none }
-    $changes = @(& git @(Get-GitGuardArgs -Dir $Root) -C $Root status --porcelain -- . 2>$null | Where-Object { $_ })
-    return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
+    $top = Invoke-GitGuarded -Dir $Root -Arguments @('-C', $Root, 'rev-parse', '--show-toplevel')
+    if ($top.code -ne 0 -or -not (Get-GitLine $top) -or (Get-NormalPath (Get-GitLine $top)) -ne (Get-NormalPath $Root)) { return $none }
+    $status = Invoke-GitGuarded -Dir $Root -Arguments @('-C', $Root, 'status', '--porcelain', '--', '.')
+    if ($null -ne $status.unreadable) { return (New-UnreadableState $status.unreadable) }
+    return [pscustomobject]@{ commit = (Get-GitLine $head); dirty = (@($status.stdout).Count -gt 0); unreadable = $null }
+}
+
+# The state of a local checkout the guard cannot read. Its commit and dirty flag are unknown, and the reason is reported.
+function New-UnreadableState {
+    param([string] $Reason)
+
+    return [pscustomobject]@{ commit = $null; dirty = $null; unreadable = $Reason }
 }
 
 # The text a git output pipe yields, waiting at most the given time. A pipe that a stopped git's child still holds open
@@ -284,49 +433,13 @@ function Read-GitPipeBounded {
     return ''
 }
 
-# Runs git with the guard options and a time limit. A run past the limit is stopped with its process tree, so a silent
-# remote cannot hold the installer. Returns whether it timed out, its exit code, and each stream's lines. The process and
-# its pipes are disposed on every path.
-function Invoke-GitTimed {
-    param([string[]] $Arguments, [int] $TimeoutSeconds)
-
-    $info = [Diagnostics.ProcessStartInfo]::new('git')
-    foreach ($argument in @(@(Get-GitGuardArgs) + $Arguments)) { $info.ArgumentList.Add([string] $argument) }
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $info.UseShellExecute = $false
-    $process = [Diagnostics.Process]::Start($info)
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
-    try {
-        $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
-        if ($timedOut) {
-            try { $process.Kill($true) } catch { }
-            [void] $process.WaitForExit(5000)
-        }
-        $out = Read-GitPipeBounded -Task $stdout
-        $err = Read-GitPipeBounded -Task $stderr
-        return [pscustomobject]@{
-            timedOut = $timedOut
-            code     = $(if ($timedOut) { $null } else { $process.ExitCode })
-            stdout   = @(($out -split "`r?`n") | Where-Object { $_ })
-            stderr   = @(($err -split "`r?`n") | Where-Object { $_ })
-        }
-    } finally {
-        foreach ($task in @($stdout, $stderr)) {
-            if ($task.IsCompleted) { $task.Dispose() }
-        }
-        $process.Dispose()
-    }
-}
-
 # The commit a branch, tag, or full commit names on a remote, read with git ls-remote. Nothing is written. A
 # branch wins over a tag of the same name, and an annotated tag resolves to the commit it points at. A remote that
 # does not answer within the limit is stopped, and the error says so.
 function Find-GitRefCommit {
     param([string] $Url, [string] $Ref, [int] $TimeoutSeconds = 60)
 
-    $run = Invoke-GitTimed -Arguments @('ls-remote', '--', $Url) -TimeoutSeconds $TimeoutSeconds
+    $run = Invoke-GitGuarded -Arguments @('ls-remote', '--', $Url) -TimeoutSeconds $TimeoutSeconds
     if ($run.timedOut) {
         throw "could not read the refs of ${Url}: git ls-remote took longer than $TimeoutSeconds seconds, so it was stopped. Check the network and the url."
     }
@@ -407,6 +520,7 @@ function Set-LayerChoice {
         $Layer.ref = $Choice.ref
         $Layer.commit = $Choice.commit
         $Layer.dirty = $null
+        $Layer.unreadable = $null
         $Layer.localPath = $null
         $Layer.folderMissing = $false
         $Layer.repoRoot = $null
@@ -419,11 +533,12 @@ function Set-LayerChoice {
     $Layer.ref = $null
     $Layer.commit = $state.commit
     $Layer.dirty = $state.dirty
+    $Layer.unreadable = $state.unreadable
     $Layer.localPath = $Choice.path
     $Layer.repoRoot = $Choice.checkout
-    # A folder that is gone has no root. Only an apply refuses it; every other run reports it.
+    # A folder that is gone, or a tree the guard cannot read, has no root. Only an apply refuses either; every other run reports it.
     $Layer.folderMissing = -not (Test-Path -LiteralPath $Choice.checkout -PathType Container)
-    $Layer.root = if ($Layer.folderMissing) { $null } else { Join-SourceSub $Choice.checkout $Layer.sourcePath }
+    $Layer.root = if ($Layer.folderMissing -or $Layer.unreadable) { $null } else { Join-SourceSub $Choice.checkout $Layer.sourcePath }
 }
 
 # Resolves every layer's source for this run. Explicit maps names to parsed -Source specs, and Recorded maps names
@@ -551,13 +666,15 @@ function Get-SourcePinLines {
             continue
         }
         $kind = if ($source.override) { 'override, local' } else { 'local, default' }
-        # A default local path is relative to the workspace, so it is joined to it before the folder is tested.
         if (Test-NonEmptyString $source.path) {
-            $folder = if ([IO.Path]::IsPathRooted($source.path)) { $source.path } else { Join-Path $Workspace ($source.path -replace '/', '\') }
-            if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+            if (-not (Test-Path -LiteralPath (Get-LocalSourceFolder $source.path) -PathType Container)) {
                 $lines.Add("  $($entry.name): $kind $($source.path): folder missing")
                 continue
             }
+        }
+        if ($entry.unreadable) {
+            $lines.Add("  $($entry.name): $kind $($source.path): unreadable: $($entry.unreadable)")
+            continue
         }
         $where = if ($null -eq $source.commit) { 'not a git checkout' } else { "HEAD $($source.commit), $(Format-DirtyLabel $source.dirty)" }
         $lines.Add("  $($entry.name): $kind $($source.path) ($where)")
@@ -575,18 +692,40 @@ function Write-SourcePinBlock {
     foreach ($line in $lines) { Write-Host $line }
 }
 
-# The entries -Status reads from the lock, and the entries an audit reads from the layers it resolved.
+# The folder a local source's path names. A default path is relative to the workspace, so it is joined to it.
+function Get-LocalSourceFolder {
+    param([string] $Path)
+
+    if ([IO.Path]::IsPathRooted($Path)) { return $Path }
+    return (Join-Path $Workspace ($Path -replace '/', '\'))
+}
+
+# The reason the guard cannot read a recorded local folder now, or $null. A folder that is gone is reported as missing instead.
+function Get-RecordedUnreadable {
+    param($Source)
+
+    if ($Source.kind -ne 'local' -or -not (Test-NonEmptyString $Source.path)) { return $null }
+    $folder = Get-LocalSourceFolder $Source.path
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) { return $null }
+    return (Read-TreeFilterNames -Dir $folder).fault
+}
+
+# The entries -Status reads from the lock, and the entries an audit reads from the layers it resolved. Each entry names
+# the reason its local tree cannot be read, or null.
 function Get-RecordedSourceEntries {
     param($Stack)
 
     if ($null -eq $Stack) { return @() }
-    return @(@($Stack.layers) | ForEach-Object { [pscustomobject]@{ name = $_.name; source = Get-RecordedSourceOf $_ } })
+    return @(@($Stack.layers) | ForEach-Object {
+        $source = Get-RecordedSourceOf $_
+        [pscustomobject]@{ name = $_.name; source = $source; unreadable = (Get-RecordedUnreadable $source) }
+    })
 }
 
 function Get-ResolvedSourceEntries {
     param([object[]] $Layers)
 
-    return @($Layers | ForEach-Object { [pscustomobject]@{ name = $_.name; source = New-SourceRecord $_ } })
+    return @($Layers | ForEach-Object { [pscustomobject]@{ name = $_.name; source = New-SourceRecord $_; unreadable = $_.unreadable } })
 }
 
 # ---- -Update: move branch and tag overrides to their current commit, re-read local sources, and report the change ----
@@ -612,8 +751,8 @@ function Test-CachedCommit {
     param([string] $Cache, [string] $Commit)
 
     if ([string]::IsNullOrEmpty($Commit) -or -not (Test-Path -LiteralPath (Join-Path $Cache '.git'))) { return $false }
-    & git @(Get-GitGuardArgs -Dir $Cache) --no-lazy-fetch -C $Cache cat-file -e "$Commit^{commit}" 2>$null
-    return ($LASTEXITCODE -eq 0)
+    $present = Invoke-GitGuarded -Dir $Cache -Arguments @('--no-lazy-fetch', '-C', $Cache, 'cat-file', '-e', "$Commit^{commit}")
+    return ($present.code -eq 0)
 }
 
 # Whether this git accepts --no-lazy-fetch, which needs git 2.44. The probe runs once per run. Without the flag a check
@@ -621,8 +760,7 @@ function Test-CachedCommit {
 $script:noLazyFetchSupported = $null
 function Test-NoLazyFetchSupport {
     if ($null -eq $script:noLazyFetchSupported) {
-        & git @(Get-GitGuardArgs) --no-lazy-fetch version 2>$null | Out-Null
-        $script:noLazyFetchSupported = ($LASTEXITCODE -eq 0)
+        $script:noLazyFetchSupported = ((Invoke-GitGuarded -Arguments @('--no-lazy-fetch', 'version')).code -eq 0)
     }
     return $script:noLazyFetchSupported
 }
@@ -640,9 +778,9 @@ function Get-MoveFilesNote {
         return 'needs fetch: the new commit is not in the cache, so the changed files are known after an apply fetches it'
     }
     if (-not (Test-CachedCommit $cache $OldCommit)) { return 'changed files unknown: the old commit is not in the cache' }
-    $output = @(& git @(Get-GitGuardArgs -Dir $cache) --no-lazy-fetch -C $cache diff --no-renames --name-only $OldCommit $Layer.commit -- $Layer.sourcePath 2>$null)
-    if ($LASTEXITCODE -ne 0) { return 'changed files unknown: git could not list the changed files from the cache' }
-    $changed = @($output | Where-Object { $_ })
+    $diff = Invoke-GitGuarded -Dir $cache -Arguments @('--no-lazy-fetch', '-C', $cache, 'diff', '--no-renames', '--name-only', $OldCommit, $Layer.commit, '--', $Layer.sourcePath)
+    if ($diff.code -ne 0) { return 'changed files unknown: git could not list the changed files from the cache' }
+    $changed = @($diff.stdout | Where-Object { $_ })
     return "$($changed.Count) files changed under $($Layer.sourcePath)"
 }
 
@@ -655,6 +793,7 @@ function Get-SourceUpdate {
     $oldCommit = Get-Field $PriorSource 'commit'
     if ($Layer.sourceKind -eq 'local') {
         if ($Layer.folderMissing) { return [pscustomobject]@{ line = "  $($Layer.name): local $($Layer.localPath): folder missing"; changed = $true } }
+        if ($Layer.unreadable) { return [pscustomobject]@{ line = "  $($Layer.name): local $($Layer.localPath): unreadable: $($Layer.unreadable)"; changed = $true } }
         $was = Format-DirtyState (Get-Field $PriorSource 'dirty')
         $now = Format-DirtyState $Layer.dirty
         $head = "HEAD $(Format-Commit $oldCommit) -> $(Format-Commit $Layer.commit)"
