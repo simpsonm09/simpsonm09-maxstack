@@ -4776,6 +4776,22 @@ test('a commit the guard runs runs no hook that the tree names in core.hooksPath
   }
 }, {});
 
+// Finding 8: a tree whose config git cannot parse is not "not a repository". git stops with a parse error, so it is unreadable.
+withWorkspace('a tree whose config git cannot parse is reported unreadable, not as a folder that is not a checkout', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const broken = join(ctx.base, 'bad.cfg');
+  writeFileSync(broken, '[broken\n');
+  runGit(checkout, ['config', 'include.path', broken.replace(/\\/g, '/')]);
+  const fixture = spawnSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  assert.notEqual(fixture.status, 0, 'the fixture config parsed, so the tree is not broken');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: config cannot be read/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+  assert.notEqual(runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]).status, 0, 'an apply wrote a layer from a tree whose config it cannot read');
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {

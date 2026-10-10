@@ -221,8 +221,14 @@ function Read-TreeFilterNames {
     $settings = Get-GitGuardSettings
     $repo = Invoke-GitProcess -Arguments @('-C', $Dir, 'rev-parse', '--git-dir') -Settings $settings
     if ($null -ne $repo.unreadable) { return [pscustomobject]@{ names = @(); fault = $repo.unreadable } }
-    # A folder that is not a repository has no config of its own, so it names no filter.
-    if ($repo.code -ne 0) { return [pscustomobject]@{ names = @(); fault = $null } }
+    # A folder that is not a repository has no config of its own, so it names no filter. A folder with a .git entry that git
+    # stops on is different: git reads its config first, so a config it cannot parse fails here, and the tree is unreadable.
+    if ($repo.code -ne 0) {
+        $reason = [string] (@($repo.stderr) | Select-Object -First 1)
+        $hasGitEntry = Test-Path -LiteralPath (Join-Path $Dir '.git')
+        if (-not $hasGitEntry -or $reason -match 'not a git repository') { return [pscustomobject]@{ names = @(); fault = $null } }
+        return [pscustomobject]@{ names = @(); fault = "config cannot be read: $reason" }
+    }
     # The tree's own scopes are its repository config and its per-worktree config. --includes follows an include.path in them,
     # so a filter that an include adds is seen. With no scope flag, git reads every scope.
     $scopes = if ($AllScopes) { @('') } else { @('--local', '--worktree') }
