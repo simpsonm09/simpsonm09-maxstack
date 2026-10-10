@@ -105,13 +105,27 @@ function Test-SafeRefName {
     return ($LASTEXITCODE -eq 0)
 }
 
-# The reason a path cannot be a local layer source, or $null. It must be an absolute path that is not the workspace and
-# is not one of the folders the installer writes into. It need not exist: a recorded folder that is gone is reported.
+# The full path of a folder. A trailing separator is dropped, except on a root, which keeps its own: C:\ stays C:\ and
+# does not become the drive-relative C:.
+function Get-FullFolderPath {
+    param([string] $Path)
+
+    $full = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
+    $root = [IO.Path]::GetPathRoot($full)
+    if ($full.Length -gt $root.Length) { return $full.TrimEnd('\') }
+    return $full
+}
+
+# The reason a path cannot be a local layer source, or $null. It must be an absolute path that is not a drive or share
+# root, not the workspace, and not one of the folders the installer writes into. It need not exist: a recorded folder
+# that is gone is reported.
 function Get-LocalPathFault {
     param($Path)
 
     if (-not (Test-NonEmptyString $Path) -or $Path -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}|/)') { return 'needs an absolute path.' }
-    $normal = Get-NormalPath ([IO.Path]::GetFullPath($Path).TrimEnd('\'))
+    $full = Get-FullFolderPath $Path
+    if ($full.TrimEnd('\') -ieq ([IO.Path]::GetPathRoot($full)).TrimEnd('\')) { return 'is a drive or share root, which cannot be a layer source.' }
+    $normal = Get-NormalPath $full
     $workspaceNormal = Get-NormalPath $Workspace
     if ($normal -eq $workspaceNormal) { return 'is the workspace itself, which cannot be a layer source.' }
     if ($workspaceNormal.StartsWith("$normal\", [StringComparison]::Ordinal)) {
@@ -133,7 +147,7 @@ function Read-LocalSpec {
     $fault = Get-LocalPathFault $Path
     if ($fault) { throw "-Source $Name=local:$Path $fault" }
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "-Source $Name=local:${Path}: that folder does not exist." }
-    return [pscustomobject]@{ kind = 'local'; path = ([IO.Path]::GetFullPath($Path).TrimEnd('\')) }
+    return [pscustomobject]@{ kind = 'local'; path = (Get-FullFolderPath $Path) }
 }
 
 # Whether a url is an https address with a host and a path. A -Source spec and a recorded override both use this rule.
@@ -304,7 +318,7 @@ function New-GitChoice {
 function New-LocalChoice {
     param($Layer, [string] $Path)
 
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $full = Get-FullFolderPath $Path
     if (-not $Layer.defaultGit -and (Get-NormalPath $full) -eq (Get-NormalPath (Join-Path $Workspace ($Layer.path -replace '/', '\')))) {
         return (New-DefaultChoice $Layer)
     }

@@ -28,7 +28,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join, relative, resolve } from 'node:path';
+import { delimiter, dirname, join, parse as parsePath, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -4019,4 +4019,24 @@ withWorkspace('a recorded override on a drive that is gone is reported as a miss
   const explicit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${gone}:/nope`], { apply: false });
   assert.notEqual(explicit.status, 0, 'an explicit source on an absent drive was accepted');
   assert.match(plainOutput(explicit), /folder does not exist/, explicit.stdout);
+}, {});
+
+// Round 2, C: a drive root or a share root is refused as a local source, and its path is kept whole, never cut to "Y:".
+test('the folder helper keeps a drive root whole, with its backslash', { skip }, () => {
+  const driveRoot = parsePath(tmpdir()).root;
+  const script = `. '${layerSourcesFile}'; Get-FullFolderPath '${driveRoot.split('\\').join('/')}'`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+  assertOk(run);
+  assert.equal(run.stdout.trim(), driveRoot, run.stdout);
+}, {});
+
+withWorkspace('a drive root or a share root is refused as a local source, with the reason', (ctx) => {
+  const driveRoot = parsePath(tmpdir()).root;
+  const drive = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${driveRoot}`], { apply: false });
+  assert.notEqual(drive.status, 0, 'a drive root was accepted as a layer source');
+  assert.match(plainOutput(drive), /is a drive or share root, which cannot be a layer source/, drive.stdout);
+
+  const share = runInstaller(shell, ctx, ['-Source', 'simpsonm09-org-ai-plugin=local://server/share'], { apply: false });
+  assert.notEqual(share.status, 0, 'a share root was accepted as a layer source');
+  assert.match(plainOutput(share), /is a drive or share root, which cannot be a layer source/, share.stdout);
 }, {});
