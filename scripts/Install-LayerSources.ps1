@@ -472,7 +472,9 @@ function Read-LocalCheckoutState {
     if ($top.code -ne 0 -or -not (Get-GitLine $top) -or (Get-NormalPath (Get-GitLine $top)) -ne (Get-NormalPath $Root)) { return $none }
     # A status of a local tree reads its content through the clean filters, so the tree's attributes are not read at all.
     # A diff between two commits reads no worktree content, so no filter runs there.
-    $status = Invoke-GitGuarded -Dir $Root -EmptyAttributes -Arguments @('-C', $Root, 'status', '--porcelain', '--', '.')
+    # --ignore-submodules=all keeps the status out of each populated submodule: git runs a status inside it, which reads that
+    # submodule's own config, and the guard names only this tree's filters.
+    $status = Invoke-GitGuarded -Dir $Root -EmptyAttributes -Arguments @('-C', $Root, 'status', '--porcelain', '--ignore-submodules=all', '--', '.')
     if ($null -ne $status.unreadable) { return (New-UnreadableState $status.unreadable) }
     # A status that fails says nothing about the worktree, so its dirty state is unknown rather than clean. The empty-tree
     # attribute source is a SHA-1 object, so a SHA-256 repository fails here.

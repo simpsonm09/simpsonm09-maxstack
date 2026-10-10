@@ -4465,6 +4465,37 @@ test('the driver name of filter..clean is the empty name, and the guard passes i
   assert.match(run.stdout, /HAS=True/, run.stdout);
 }, {});
 
+// Finding 3: git status spawns a status inside each populated submodule, and that status reads the submodule's own config.
+// The superproject's guard names only the superproject's filters, so the local status must not look inside a submodule.
+withWorkspace('an audit runs no filter that a populated submodule names in its own config', (ctx) => {
+  const source = join(ctx.base, 'sub-source');
+  writeFile(source, 'a.txt', 'one\n');
+  runGit(source, ['init', '-q']);
+  runGit(source, ['add', '-A']);
+  runGit(source, ['commit', '-q', '-m', 'sub']);
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  runGit(checkout, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', source, 'sub']);
+  runGit(checkout, ['commit', '-q', '-m', 'add submodule']);
+  const sub = join(checkout, 'sub');
+  const marker = join(ctx.base, 'submodule-marker.txt');
+  runGit(sub, ['config', 'filter.subm.clean', touchAndCat(marker)]);
+  writeFile(checkout, '.git/modules/sub/info/attributes', '*.txt filter=subm\n');
+  // The checkout is CRLF under core.autocrlf, so the edit keeps the byte length: git must hash the file, not compare sizes.
+  const subFile = join(sub, 'a.txt');
+  writeFileSync(subFile, readFileSync(subFile, 'utf8').replace('one', 'two'));
+  runGit(checkout, ['-c', 'protocol.file.allow=always', 'status', '--porcelain']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the submodule clean command when the status was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that a populated submodule names in its own config');
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {
