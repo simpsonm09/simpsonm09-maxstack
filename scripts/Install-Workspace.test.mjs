@@ -179,6 +179,14 @@ if (process.env.FAKE_NPM_EXTRA) {
   mkdirSync(dirname(extra), { recursive: true });
   writeFileSync(extra, 'written by npm\\n');
 }
+// FAKE_NPM_SCRIPTED lists installed packages that declare a postinstall script, so the ignore-scripts scan has them.
+if (process.env.FAKE_NPM_SCRIPTED) {
+  for (const name of JSON.parse(process.env.FAKE_NPM_SCRIPTED)) {
+    const dir = join(prefix, 'node_modules', ...name.split('/'));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0', scripts: { postinstall: 'node build.js' } }));
+  }
+}
 `;
 
 function writeFakeNpm(base) {
@@ -4121,3 +4129,11 @@ withWorkspace('a removal refused for a missing layer folder gives no -Source adv
   assert.match(plainOutput(removed), /has no folder at .*Restore the folder, then rerun/, plainOutput(removed));
   assert.doesNotMatch(plainOutput(removed), /-Source/, plainOutput(removed));
 }, {});
+
+// Round 2, I: after npm runs, the installed dependencies that declare install scripts are counted and named, up to ten.
+withWorkspace('an apply that runs npm counts the installed packages that declare install scripts, and names up to ten', (ctx) => {
+  const names = Array.from({ length: 12 }, (_, index) => `dep-${String(index).padStart(2, '0')}`);
+  names.push('@acme/native');
+  const run = mustApply(ctx, [], { env: { ...ctx.env, FAKE_NPM_SCRIPTED: JSON.stringify(names) } });
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'pstack': 13 installed packages declare install scripts or a native build, which did not run: @acme\/native, dep-00.*and 3 more/, plainOutput(run));
+}, NPM);

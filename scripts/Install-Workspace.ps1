@@ -710,8 +710,40 @@ function Write-IgnoredScriptWarning {
         $declared = @(@('preinstall', 'install', 'postinstall') | Where-Object { $null -ne (Get-Field $scripts $_) } | ForEach-Object { "scripts.$_" })
     }
     if (Test-Path -LiteralPath (Join-Path $Folder 'binding.gyp') -PathType Leaf) { $declared += 'binding.gyp' }
-    if ($declared.Count -eq 0) { return }
-    Write-Warning "npm ran with --ignore-scripts for layer '$Name': its $($declared -join ', ') did not run, so what it would build or install is missing."
+    if ($declared.Count -gt 0) {
+        Write-Warning "npm ran with --ignore-scripts for layer '$Name': its $($declared -join ', ') did not run, so what it would build or install is missing."
+    }
+    # The packages npm installed under the layer are scanned the same way, since a dependency's script is skipped too.
+    $dependencies = @(Get-ScriptedDependencies -Folder $Folder)
+    if ($dependencies.Count -gt 0) {
+        $shown = @($dependencies | Select-Object -First 10)
+        $more = $dependencies.Count - $shown.Count
+        $tail = if ($more -gt 0) { " (and $more more)" } else { '' }
+        Write-Warning "npm ran with --ignore-scripts for layer '$Name': $($dependencies.Count) installed packages declare install scripts or a native build, which did not run: $($shown -join ', ')$tail."
+    }
+}
+
+# The installed packages under a folder's node_modules whose package.json declares a preinstall, install, or postinstall
+# script, or a gypfile. Scoped packages (@scope/name) are read one level down. A manifest that does not parse is skipped.
+function Get-ScriptedDependencies {
+    param([string] $Folder)
+
+    $modules = [IO.Path]::Combine($Folder, 'node_modules')
+    if (-not (Test-Path -LiteralPath $modules -PathType Container)) { return @() }
+    $packages = @(Get-ChildItem -LiteralPath $modules -Directory -Force | ForEach-Object {
+        if ($_.Name.StartsWith('@')) { Get-ChildItem -LiteralPath $_.FullName -Directory -Force } else { $_ }
+    })
+    $scripted = foreach ($package in $packages) {
+        $manifest = [IO.Path]::Combine($package.FullName, 'package.json')
+        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { continue }
+        try { $json = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json } catch { continue }
+        $scripts = Get-Field $json 'scripts'
+        $hasScript = @('preinstall', 'install', 'postinstall') | Where-Object { $null -ne (Get-Field $scripts $_) }
+        if ($hasScript -or ((Get-Field $json 'gypfile') -eq $true)) {
+            if ($package.Parent.Name.StartsWith('@')) { "$($package.Parent.Name)/$($package.Name)" } else { $package.Name }
+        }
+    }
+    return @($scripted | Sort-Object -Unique)
 }
 
 # Copies the named items of a layer root into a folder. A claude copy of a local layer holds the same
