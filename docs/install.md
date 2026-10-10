@@ -183,7 +183,7 @@ Without `-Apply`, `-Update` prints the report and writes nothing. For each selec
 - `-Update` never changes `layers.json`. When a `layers.json` branch has moved past its pin, the report prints a one-line hint of the change to make by hand.
 - `-Update` needs a lock that names a selection. A workspace without one is refused, and the message says to run an apply first.
 
-`MAXSTACK_TEST_GITHUB_ROOT` is a test-only seam. The test suite sets it so that the `owner/repo` shorthand reads a local bare repository instead of GitHub. A real run never sets it.
+`MAXSTACK_TEST_GITHUB_ROOT` is a test-only seam. The test suite sets it so that the `owner/repo` shorthand reads a local bare repository instead of GitHub. The installer honours it only when `MAXSTACK_TEST_MODE` is `1` and the folder is under the temp folder. Otherwise the shorthand names github.com. Each use prints a warning, and a real run never sets either variable.
 
 ## Ownership and status
 

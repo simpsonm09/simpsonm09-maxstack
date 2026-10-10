@@ -6,15 +6,27 @@
 #
 # Dot-sourced by Install-Workspace.ps1, so it shares that script's variables and functions.
 
-# A test seam, and nothing else. When MAXSTACK_TEST_GITHUB_ROOT is set, the owner/repo shorthand names a bare
-# repository under that folder instead of github.com, so the tests fetch from local repositories. Nothing else
-# reads the variable, and a real run never sets it.
+# A test seam, and nothing else. The owner/repo shorthand names a bare repository under MAXSTACK_TEST_GITHUB_ROOT instead
+# of github.com, so the tests fetch from local repositories. The root is honoured only in a test run (MAXSTACK_TEST_MODE is 1)
+# and only when it is under the temp folder. Each use is warned, so a stray variable in a real run shows.
 function Get-GitHubRemoteUrl {
     param([string] $Owner, [string] $Repo)
 
     $testRoot = $env:MAXSTACK_TEST_GITHUB_ROOT
-    if ($testRoot) { return ((Join-Path $testRoot "$Owner\$Repo.git") -replace '\\', '/') }
+    if ($testRoot -and (Test-TestSeam) -and (Test-UnderTempFolder $testRoot)) {
+        Write-Warning "MAXSTACK_TEST_GITHUB_ROOT is set, so $Owner/$Repo reads the local folder $testRoot, not GitHub. This is the test seam."
+        return ((Join-Path $testRoot "$Owner\$Repo.git") -replace '\\', '/')
+    }
     return "https://github.com/$Owner/$Repo.git"
+}
+
+# Whether a path is inside the temp folder. Both sides are full paths, compared without case.
+function Test-UnderTempFolder {
+    param([string] $Path)
+
+    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\').ToLowerInvariant()
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    return $full.StartsWith("$temp\", [StringComparison]::Ordinal)
 }
 
 # Whether the test seam is on. The tests set MAXSTACK_TEST_MODE, and a real run never does.

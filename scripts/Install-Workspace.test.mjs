@@ -3739,3 +3739,46 @@ withWorkspace('-Update -Check counts the changed files of a rename that the part
   assert.match(check.stdout, new RegExp(`feat ${featCommit} -> ${renamed}; 2 files changed under plugins/pstack`), check.stdout);
   assert.doesNotMatch(check.stdout, /0 files changed/, check.stdout);
 }, {});
+
+// Finding 5: the owner/repo shorthand reads a local folder only in a test run, and only for a folder under the temp folder.
+// These call the resolver in a child that dot-sources the module, so nothing here reaches the network.
+const layerSourcesFile = join(repoRoot, 'scripts', 'Install-LayerSources.ps1');
+const SHORTHAND_URL = 'https://github.com/simpsonm09/pstack-claude.git';
+
+function resolveShorthand(env) {
+  const script = `. '${layerSourcesFile}'; Get-GitHubRemoteUrl -Owner 'simpsonm09' -Repo 'pstack-claude'`;
+  return spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+}
+
+test('without the test-mode flag the owner/repo shorthand names github.com, even when the test root is set', { skip }, () => {
+  const env = { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(tmpdir(), 'maxstack-seam-probe') };
+  delete env.MAXSTACK_TEST_MODE;
+  const run = resolveShorthand(env);
+  assertOk(run);
+  assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+}, {});
+
+test('with the test-mode flag and a root under the temp folder, the shorthand names that folder and warns', { skip }, () => {
+  const root = join(tmpdir(), 'maxstack-seam-probe');
+  const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: root });
+  assertOk(run);
+  assert.ok(run.stdout.split(/\r?\n/).includes(`${root.split('\\').join('/')}/simpsonm09/pstack-claude.git`), run.stdout);
+  assert.match(plainOutput(run), /MAXSTACK_TEST_GITHUB_ROOT is set/, plainOutput(run));
+}, {});
+
+test('with the test-mode flag but a root outside the temp folder, the shorthand names github.com', { skip }, () => {
+  const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: repoRoot });
+  assertOk(run);
+  assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+}, {});
+
+withWorkspace('without the test-mode flag, a -Source owner/repo at a commit is audited against github.com', (ctx) => {
+  const sha = 'a'.repeat(40);
+  const env = { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(ctx.base, 'github') };
+  delete env.MAXSTACK_TEST_MODE;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', ctx.workspace, '-LayersFile', writeLayers(ctx),
+    '-CopilotCommand', ctx.fakeCopilot, '-PiCommand', ctx.fakePi, '-Source', `pstack=simpsonm09/pstack-claude@${sha}`], { encoding: 'utf8', env });
+  assertOk(run);
+  assert.ok(run.stdout.includes(`override, git ${SHORTHAND_URL} ref ${sha} at ${sha}`), run.stdout);
+  assert.ok(!run.stdout.includes(join(ctx.base, 'github')), 'the test root was used');
+}, {});
