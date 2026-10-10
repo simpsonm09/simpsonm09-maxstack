@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:net';
 import {
   appendFileSync,
   chmodSync,
@@ -3829,3 +3830,58 @@ withWorkspace('a local override the lock holds with a relative path is refused b
   assert.notEqual(status.status, 0, '-Status read a relative local path');
   assert.match(plainOutput(status), /layer 'simpsonm09-org-ai-plugin'.*path/, plainOutput(status));
 }, {});
+
+// Finding 7: git never waits on a credential prompt, and ls-remote gives up after its time limit with the reason.
+function runAsync(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(shell, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // A run that never ends is killed, so a failing test cannot leave the process behind.
+    const guard = setTimeout(() => child.kill(), 100000);
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (status) => {
+      clearTimeout(guard);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+test('the git guard sets the prompt variables, and turns on file transport only in a test run', { skip }, () => {
+  const script = `. '${layerSourcesFile}'; $null = Get-GitGuardArgs; "PROMPT=$env:GIT_TERMINAL_PROMPT"; "GCM=$env:GCM_INTERACTIVE"; (Get-GitGuardArgs) -join ' '`;
+  const real = { ...process.env };
+  delete real.MAXSTACK_TEST_MODE;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: real });
+  assertOk(run);
+  assert.match(run.stdout, /PROMPT=0/, run.stdout);
+  assert.match(run.stdout, /GCM=never/, run.stdout);
+  assert.match(run.stdout, /core\.fsmonitor=false/, run.stdout);
+  assert.match(run.stdout, /protocol\.allow=never/, run.stdout);
+  assert.doesNotMatch(run.stdout, /protocol\.file\.allow/, 'a real run allows file transport');
+
+  const seam = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...real, MAXSTACK_TEST_MODE: '1' } });
+  assert.match(seam.stdout, /protocol\.file\.allow=always/, seam.stdout);
+}, {});
+
+test('an ls-remote that passes its time limit is stopped, and the error says so', { skip, timeout: 120000 }, async () => {
+  // The silent server takes each connection and never answers. The reset a stopped git causes is expected here.
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    const script = `. '${layerSourcesFile}'; Find-GitRefCommit -Url 'https://127.0.0.1:${port}/simpsonm09/pstack-claude.git' -Ref 'main' -TimeoutSeconds 2`;
+    const run = await runAsync(['-NoProfile', '-NonInteractive', '-Command', script], { ...process.env, GIT_TERMINAL_PROMPT: '0' });
+    assert.notEqual(run.status, 0, 'a silent remote was waited for');
+    assert.match(plainOutput(run), /ls-remote took longer than 2 seconds/, plainOutput(run));
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+});

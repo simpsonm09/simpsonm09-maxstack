@@ -183,13 +183,42 @@ function Get-LocalCheckoutState {
     return [pscustomobject]@{ commit = ([string] $head).Trim(); dirty = ($changes.Count -gt 0) }
 }
 
-# The commit a branch, tag, or full commit names on a remote, read with git ls-remote. Nothing is written. A
-# branch wins over a tag of the same name, and an annotated tag resolves to the commit it points at.
-function Find-GitRefCommit {
-    param([string] $Url, [string] $Ref)
+# Runs git with the guard options and a time limit. A run past the limit is stopped with its child processes, so a silent
+# remote cannot hold the installer. Returns whether it timed out, its exit code, and each stream's lines.
+function Invoke-GitTimed {
+    param([string[]] $Arguments, [int] $TimeoutSeconds)
 
-    $output = @(& git @(Get-GitGuardArgs) ls-remote -- $Url 2>&1 | ForEach-Object { "$_" })
-    if ($LASTEXITCODE -ne 0) { throw "could not read the refs of ${Url}: $($output -join ' ')" }
+    $info = [Diagnostics.ProcessStartInfo]::new('git')
+    foreach ($argument in @(@(Get-GitGuardArgs) + $Arguments)) { $info.ArgumentList.Add([string] $argument) }
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.UseShellExecute = $false
+    $process = [Diagnostics.Process]::Start($info)
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+    if ($timedOut) { $process.Kill($true) }
+    $process.WaitForExit()
+    return [pscustomobject]@{
+        timedOut = $timedOut
+        code     = $(if ($timedOut) { $null } else { $process.ExitCode })
+        stdout   = @(($stdout.Result -split "`r?`n") | Where-Object { $_ })
+        stderr   = @(($stderr.Result -split "`r?`n") | Where-Object { $_ })
+    }
+}
+
+# The commit a branch, tag, or full commit names on a remote, read with git ls-remote. Nothing is written. A
+# branch wins over a tag of the same name, and an annotated tag resolves to the commit it points at. A remote that
+# does not answer within the limit is stopped, and the error says so.
+function Find-GitRefCommit {
+    param([string] $Url, [string] $Ref, [int] $TimeoutSeconds = 60)
+
+    $run = Invoke-GitTimed -Arguments @('ls-remote', '--', $Url) -TimeoutSeconds $TimeoutSeconds
+    if ($run.timedOut) {
+        throw "could not read the refs of ${Url}: git ls-remote took longer than $TimeoutSeconds seconds, so it was stopped. Check the network and the url."
+    }
+    if ($run.code -ne 0) { throw "could not read the refs of ${Url}: $((@($run.stdout) + @($run.stderr)) -join ' ')" }
+    $output = $run.stdout
     $refs = [hashtable]::new([StringComparer]::Ordinal)
     foreach ($line in $output) {
         $sha, $name = $line -split "`t", 2

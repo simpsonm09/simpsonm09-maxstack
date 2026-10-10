@@ -137,6 +137,7 @@ The ref in a git spec is a branch, a tag, or a full commit. It is checked as a g
 The rules:
 
 - Sources resolve before anything is written. A source that cannot be read exits non-zero with the reason, and the install stays as it was.
+- Git never waits for a credential. Every git command runs with `GIT_TERMINAL_PROMPT=0` and `GCM_INTERACTIVE=never`, so a remote that needs a login fails at once. A remote whose refs do not arrive within 60 seconds is stopped, and the error says so.
 - A plain apply reuses a recorded override, so an override holds until `-Source name=default` drops it.
 - Git writes happen only in the layer's own cache folder, and reading a remote's refs writes nothing. The cache's origin is reset to the resolved URL on each sync. No layer's install scripts run: npm runs with `--ignore-scripts`.
 - `-Source` applies to an apply or an audit. `-Status`, `-Remove`, and `-Uninstall` read the recorded sources and take no `-Source`.
