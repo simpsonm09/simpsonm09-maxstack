@@ -345,33 +345,6 @@ function Get-ClaudeRecord {
     return [pscustomobject]@{ layer = $Layer.name; plugin = $Layer.name; kind = 'junction'; target = ".opencode/plugins/$($Layer.name)" }
 }
 
-# The form of a path that comparisons use: a \\?\ long-path prefix is dropped, and each junction or symbolic link on the
-# way is followed, so a path through a link compares equal to the folder it names. Case is ignored.
-function Get-NormalPath {
-    param([string] $Path)
-
-    $text = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
-    $root = [IO.Path]::GetPathRoot($text)
-    $current = $root
-    foreach ($segment in @($text.Substring($root.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))) {
-        $current = Resolve-PathLink (Join-Path $current $segment)
-    }
-    return $current.TrimEnd('\').ToLowerInvariant()
-}
-
-# The folder a junction or symbolic link names, or the path itself when it is not a link.
-function Resolve-PathLink {
-    param([string] $Path)
-
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $item -or -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $Path }
-    $target = $item.ResolveLinkTarget($true)
-    if ($null -ne $target) { return $target.FullName }
-    $text = @($item.Target)[0]
-    if ($text) { return [IO.Path]::GetFullPath([string] $text) }
-    return $Path
-}
-
 # The folders directly under .opencode\plugins that no current layer names.
 function Get-StalePluginFolders {
     param([string[]] $Wanted)
@@ -1046,7 +1019,7 @@ function Get-PiLayerRecord {
     $pinned = $null -ne $Layer.url
     $repo = if ($pinned) { Join-Path $claudeCacheTarget $Layer.name } else { $Layer.repoRoot }
     $pluginSource = Join-SourceSub $repo $Layer.sourcePath
-    $manifest = Join-Path $repo 'package.json'
+    $manifest = [IO.Path]::Combine($repo, 'package.json')
     $piKey = $null
     if (Test-Path -LiteralPath $manifest -PathType Leaf) {
         $piKey = Get-Field (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json) 'pi'
@@ -1063,7 +1036,7 @@ function Get-PiLayerRecord {
         layer   = $Layer.name
         pi      = $piKey
         package = $(if ($null -ne $piKey) { if ($pinned) { ".claude/cache/$($Layer.name)" } else { $installed } } else { $null })
-        skills  = $(if (Test-Path -LiteralPath (Join-Path $pluginSource 'skills') -PathType Container) { "$installed/skills" } else { $null })
+        skills  = $(if (Test-Path -LiteralPath ([IO.Path]::Combine($pluginSource, 'skills')) -PathType Container) { "$installed/skills" } else { $null })
         # The package and skills are unknown while the layer has no root: a git cache not at its pin, or a missing folder.
         pending = ($null -eq $Layer.root)
         unknownPackage = $(if ($pinned) { ".claude/cache/$($Layer.name)" } else { $installed })

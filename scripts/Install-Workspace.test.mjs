@@ -3968,3 +3968,33 @@ withWorkspace('a -Source spec that is a folder with an @ref says to use local:',
   assert.notEqual(run.status, 0, 'a folder with an @ref was accepted as a git source');
   assert.ok(plainOutput(run).includes('did you mean local:C:\\x?'), run.stdout);
 }, {});
+
+// Round 2, A: a recorded local override on a drive that is gone is reported as a missing folder, not a raw drive error.
+function absentDriveLetter() {
+  for (const letter of 'QRSTUVWXYZ') {
+    if (!existsSync(`${letter}:/`)) return letter;
+  }
+  return null;
+}
+
+withWorkspace('a recorded override on a drive that is gone is reported as a missing folder, and -Status, -Update, -Remove, -Uninstall run', (ctx) => {
+  const gone = absentDriveLetter();
+  if (!gone) return;
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = `${gone}:/repo/org`;
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.ok(status.stdout.split('\\').join('/').includes(`${gone}:/repo/org: folder missing`), status.stdout);
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Uninstall'], { apply: false }));
+
+  const explicit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${gone}:/nope`], { apply: false });
+  assert.notEqual(explicit.status, 0, 'an explicit source on an absent drive was accepted');
+  assert.match(plainOutput(explicit), /folder does not exist/, explicit.stdout);
+}, {});

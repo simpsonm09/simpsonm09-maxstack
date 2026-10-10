@@ -34,6 +34,38 @@ function Test-TestSeam {
     return ($env:MAXSTACK_TEST_MODE -eq '1')
 }
 
+# The form of a path that comparisons use: a \\?\ long-path prefix is dropped, and each junction or symbolic link on the
+# way is followed, so a path through a link compares equal to the folder it names. Case is ignored. A drive that is not
+# present yields the path as written, so a folder on it compares as missing rather than failing the run.
+function Get-NormalPath {
+    param([string] $Path)
+
+    $text = [IO.Path]::GetFullPath(($Path -replace '^\\\\\?\\', ''))
+    $root = [IO.Path]::GetPathRoot($text)
+    $current = $root
+    foreach ($segment in @($text.Substring($root.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))) {
+        $current = Resolve-PathLink ([IO.Path]::Combine($current, $segment))
+    }
+    return $current.TrimEnd('\').ToLowerInvariant()
+}
+
+# The folder a junction or symbolic link names, or the path itself when it is not a link or cannot be read.
+function Resolve-PathLink {
+    param([string] $Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item -or -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $Path }
+        $target = $item.ResolveLinkTarget($true)
+        if ($null -ne $target) { return $target.FullName }
+        $text = @($item.Target)[0]
+        if ($text) { return [IO.Path]::GetFullPath([string] $text) }
+        return $Path
+    } catch {
+        return $Path
+    }
+}
+
 # The options every git command the installer runs starts with. They stop git from running a program that a checkout
 # names (core.fsmonitor and hooks), refuse every transport but https, and skip optional index locks. The test seam also
 # allows file, since its remotes are local bare repositories. Two variables stop git from waiting on a credential prompt.
@@ -172,7 +204,7 @@ function Join-SourceSub {
     param([string] $Root, [string] $Sub)
 
     if ([string]::IsNullOrEmpty($Sub) -or $Sub -eq '.') { return $Root }
-    return (Join-Path $Root ($Sub -replace '/', '\'))
+    return ([IO.Path]::Combine($Root, ($Sub -replace '/', '\')))
 }
 
 # The state of a local checkout, read without writing: its HEAD commit and whether it holds uncommitted changes.
