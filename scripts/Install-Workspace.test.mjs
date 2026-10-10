@@ -42,11 +42,10 @@ const MISSING_PI = 'maxstack-test-no-such-pi';
 
 let layersCounter = 0;
 
+// The installer needs PowerShell 7 (#requires -Version 7.0), so only pwsh is tried. Windows PowerShell 5.1 stops every installer
+// run with a version error, so it is never the shell. Without pwsh the tests skip with that reason.
 function findShell() {
-  for (const name of ['pwsh', 'powershell']) {
-    if (spawnSync(name, ['-NoProfile', '-Command', 'exit 0']).status === 0) return name;
-  }
-  return null;
+  return spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status === 0 ? 'pwsh' : null;
 }
 
 // On Windows a bash on PATH can be the WSL launcher, so use the one Git for Windows ships.
