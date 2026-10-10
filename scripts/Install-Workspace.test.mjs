@@ -4792,6 +4792,37 @@ withWorkspace('a tree whose config git cannot parse is reported unreadable, not 
   assert.notEqual(runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]).status, 0, 'an apply wrote a layer from a tree whose config it cannot read');
 }, {});
 
+// Finding 9: a filter name the guard cannot pass is refused as too long, with the reason, and never read as "not a checkout".
+withWorkspace('a filter name of 33000 characters makes its tree unreadable as too long, and the tree is not read as a non-checkout', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  appendFileSync(join(checkout, '.git', 'config'), `[filter "${'a'.repeat(33000)}"]\n\tclean = x\n`);
+  const fixture = spawnSync('git', ['-C', checkout, 'status', '--porcelain'], { encoding: 'utf8' });
+  assert.equal(fixture.status, 0, 'the fixture config does not parse for git, so the case is not the name length');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: filter name too long/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('filter names that together need more environment than git can take make the tree unreadable as too long', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const lines = Array.from({ length: 100 }, (_, index) => `[filter "n${index}-${'x'.repeat(1000)}"]\n\tclean = x\n`).join('');
+  appendFileSync(join(checkout, '.git', 'config'), lines);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: filter name too long/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+}, {});
+
+test('a cut-off read of the tree config is unreadable, not a list with no filter names', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitProcess { param($Arguments, $Settings, $TimeoutSeconds = 0, $WorkingDirectory = '', $CeilingDirectory = '') [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = (@($Arguments) -contains 'config') } }; $info = Read-TreeFilterNames -Dir 'C:/nowhere'; "FAULT=[$($info.fault)]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /FAULT=\[.*cut off/, run.stdout);
+}, {});
+
 // Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
 // plugin folder is replaced and before the lock is written.
 withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {

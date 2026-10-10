@@ -221,6 +221,7 @@ function Read-TreeFilterNames {
     $settings = Get-GitGuardSettings
     $repo = Invoke-GitProcess -Arguments @('-C', $Dir, 'rev-parse', '--git-dir') -Settings $settings
     if ($null -ne $repo.unreadable) { return [pscustomobject]@{ names = @(); fault = $repo.unreadable } }
+    if ($repo.incomplete) { return [pscustomobject]@{ names = @(); fault = 'git output was cut off, so the tree is unreadable' } }
     # A folder that is not a repository has no config of its own, so it names no filter. A folder with a .git entry that git
     # stops on is different: git reads its config first, so a config it cannot parse fails here, and the tree is unreadable.
     if ($repo.code -ne 0) {
@@ -238,6 +239,8 @@ function Read-TreeFilterNames {
         if ($scope) { $scopeArgs = @($scope) }
         $run = Invoke-GitProcess -Arguments (@('-C', $Dir, 'config') + $scopeArgs + @('--includes', '--name-only', '-z', '--get-regexp', '^filter\.')) -Settings $settings
         if ($null -ne $run.unreadable) { return [pscustomobject]@{ names = @(); fault = $run.unreadable } }
+        # A read that was cut off has no end, so its names are not known. It is unreadable, not a list with fewer names.
+        if ($run.incomplete) { return [pscustomobject]@{ names = @(); fault = 'git output was cut off, so the filter names are unknown' } }
         if ($run.code -eq 1) { continue }
         if ($run.code -ne 0) { return [pscustomobject]@{ names = @(); fault = 'git could not read the config of this folder' } }
         $keys.AddRange([string[]] @($run.text -split "`0" | Where-Object { $_ }))
@@ -249,6 +252,9 @@ function Read-TreeFilterNames {
         if ($name -cmatch '[\x00-\x1f\x7f]') {
             return [pscustomobject]@{ names = @(); fault = 'a filter driver name holds a control character, which the guard cannot pass to git' }
         }
+        if ($name.Length -gt $script:MaxFilterNameLength) {
+            return [pscustomobject]@{ names = @(); fault = "filter name too long: a name holds $($name.Length) characters, and the guard passes at most $($script:MaxFilterNameLength)" }
+        }
         [void] $seen.Add($name)
     }
     # Each name takes four settings, so the count is capped. A tree past the cap is refused, not read partly.
@@ -256,7 +262,34 @@ function Read-TreeFilterNames {
     if ($seen.Count -gt $maxFilterDrivers) {
         return [pscustomobject]@{ names = @(); fault = "too many filter drivers: $($seen.Count) are named, and the guard passes at most $maxFilterDrivers" }
     }
+    $environmentFault = Get-GitEnvironmentFault -Names @($seen)
+    if ($environmentFault) { return [pscustomobject]@{ names = @(); fault = $environmentFault } }
     return [pscustomobject]@{ names = @($seen); fault = $null }
+}
+
+# The longest filter name the guard passes. A longer one is refused, since its settings would not fit the child's environment.
+$script:MaxFilterNameLength = 4096
+
+# The environment a child takes its settings in. Windows caps an environment block at 32767 characters, and a child whose block
+# is too long does not start, so the names are checked against a budget below that cap. The count is the characters of the
+# guard's settings plus the installer's own variables, which a child inherits. No names need no budget.
+$script:GitEnvironmentBudget = 30000
+
+function Get-GitEnvironmentFault {
+    param([string[]] $Names)
+
+    if ($Names.Count -eq 0) { return $null }
+    $settingChars = 0
+    foreach ($entry in (Get-GitChildVariables -Settings (Get-GitGuardSettings -FilterNames $Names)).GetEnumerator()) {
+        $settingChars += ([string] $entry.Key).Length + ([string] $entry.Value).Length + 2
+    }
+    $ownChars = 0
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        $ownChars += ([string] $entry.Key).Length + ([string] $entry.Value).Length + 2
+    }
+    $total = $settingChars + $ownChars
+    if ($total -le $script:GitEnvironmentBudget) { return $null }
+    return "filter name too long: the names together need $total characters of environment, and the guard passes at most $($script:GitEnvironmentBudget)"
 }
 
 # Runs a git command that names no tree (a ref lookup, a clone, a version probe) in a fresh empty folder, outside any repository.
@@ -499,6 +532,8 @@ function Read-LocalCheckoutState {
     # status inside it, which reads that submodule's own config, and a submodule's changes are not part of the dirty flag.
     $status = Invoke-GitGuarded -Dir $Root -AllFilterScopes -Arguments @('-C', $Root, 'status', '--porcelain', '--ignore-submodules=all', '--', '.')
     if ($null -ne $status.unreadable) { return (New-UnreadableState $status.unreadable) }
+    # A status whose output was cut off lists fewer changes than it made, so its dirty state is unknown too.
+    if ($status.incomplete) { return (New-UnreadableState 'git output was cut off, so the worktree state is unknown') }
     # A status that fails says nothing about the worktree, so its dirty state is unknown rather than clean.
     $dirty = if ($status.code -eq 0) { (@($status.stdout).Count -gt 0) } else { $null }
     return [pscustomobject]@{ commit = (Get-GitLine $head); dirty = $dirty; unreadable = $null }
