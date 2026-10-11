@@ -1515,6 +1515,23 @@ function Get-RecordedWrapperText {
     return [IO.File]::ReadAllText($full)
 }
 
+# The text of a runtime's wrapper pair, kept when this run cannot find the CLI the pair runs. Both files must be the
+# lock's recorded copies, or nothing is kept. A file that is not its recorded copy stays on disk and is reported.
+function Get-KeptWrapperPair {
+    param([string] $CmdRelative, [string] $ShRelative)
+
+    $cmdText = Get-RecordedWrapperText $CmdRelative
+    $shText = Get-RecordedWrapperText $ShRelative
+    foreach ($entry in @(@($CmdRelative, $cmdText), @($ShRelative, $shText))) {
+        $full = Join-Path $Workspace ($entry[0] -replace '/', '\')
+        if ($null -eq $entry[1] -and (Test-Path -LiteralPath $full -PathType Leaf)) {
+            Write-Host "Kept ${full}: it is not the installer's recorded copy (changed by hand, or never recorded)"
+        }
+    }
+    if ($null -eq $cmdText -or $null -eq $shText) { return $null }
+    return [pscustomobject]@{ cmd = $cmdText; sh = $shText }
+}
+
 # What the installer would own after an apply, from the same layers and texts the apply writes.
 # -Apply writes its record from this plan once the disk matches it, and -Status compares the plan
 # with the disk and with the record. A null hash or entries means the value is not known yet.
@@ -2848,6 +2865,7 @@ $priorLayers = @{}
 $recordedOverrides = @{}
 $recordedInvalid = @{}
 $priorPi = $null
+$priorCopilot = $null
 # The ownership list the previous apply wrote. $null means the lock predates it, or there is no lock.
 $priorOwned = $null
 # The directories and files an earlier apply recorded as created by the installer.
@@ -2865,6 +2883,7 @@ if (Test-Path -LiteralPath $stackTarget -PathType Leaf) {
     $recordedOverrides = $recorded.overrides
     $recordedInvalid = $recorded.invalid
     $priorPi = Get-Field $priorStack 'pi'
+    $priorCopilot = Get-Field $priorStack 'copilot'
     if ($null -ne $priorStack.PSObject.Properties['owned']) { $priorOwned = @($priorStack.owned | Where-Object { $null -ne $_ }) }
     if ($null -ne $priorStack.PSObject.Properties['createdDirs']) { $priorCreatedDirs = @($priorStack.createdDirs) }
     if ($null -ne $priorStack.PSObject.Properties['createdFiles']) { $priorCreatedFiles = @($priorStack.createdFiles) }
@@ -3039,11 +3058,24 @@ $copilotDirs = @($copilotLayers | ForEach-Object { Join-Path $claudePluginsTarge
 $copilotExecutable = if ($copilotLayers.Count -gt 0) { Find-WrappedExecutable $CopilotCommand } else { $null }
 $copilotCmdText = $null
 $copilotShText = $null
+$copilotKept = $false
 if ($copilotExecutable) {
     $copilotCmdText = New-CopilotCmdText -Executable $copilotExecutable -PluginDirs $copilotDirs
     $copilotShText = New-CopilotShText -PluginDirs $copilotDirs
 } elseif ($copilotLayers.Count -gt 0) {
-    Write-Warning "Copilot CLI not found: no '$CopilotCommand' application outside .maxstack\bin. Skipping $copilotCmdTarget and $copilotShTarget. Install Copilot, then rerun with -Apply."
+    # Without a Copilot on this run, the wrappers the lock records stay as they are on disk, as the Pi wrappers do.
+    $copilotKeptPair = Get-KeptWrapperPair '.maxstack/bin/copilot.cmd' '.maxstack/bin/copilot.sh'
+    $copilotKept = $null -ne $copilotKeptPair
+    if ($copilotKept) {
+        $copilotCmdText = $copilotKeptPair.cmd
+        $copilotShText = $copilotKeptPair.sh
+    }
+    $copilotNotFound = "no '$CopilotCommand' application outside .maxstack\bin"
+    if ($copilotKept) {
+        Write-Warning "Copilot CLI not found: $copilotNotFound. Kept $copilotCmdTarget and $copilotShTarget because Copilot was not found on this run. The lock records them, so they stay as they are and still name the Copilot they were written for. Install Copilot, then rerun with -Apply."
+    } else {
+        Write-Warning "Copilot CLI not found: $copilotNotFound. Skipping $copilotCmdTarget and $copilotShTarget. Install Copilot, then rerun with -Apply."
+    }
 }
 
 # Pi lists each layer's package when its package.json has a pi key, and each layer's skills
@@ -3066,13 +3098,12 @@ if ($piExecutable) {
     $piShText = New-PiShText -AgentDir $piAgentDir -LocalExecutable $(if ($piLocal) { $piExecutable } else { '' })
 } elseif ($piLayers.Count -gt 0) {
     # Without a Pi on this run, the wrappers the lock records stay as they are on disk, so this run never rewrites or
-    # removes them and the lock keeps recording them. Any other wrapper is left alone too.
-    $piCmdText = Get-RecordedWrapperText '.maxstack/bin/pi.cmd'
-    $piShText = Get-RecordedWrapperText '.maxstack/bin/pi.sh'
-    $piKept = ($null -ne $piCmdText) -and ($null -ne $piShText)
-    if (-not $piKept) {
-        $piCmdText = $null
-        $piShText = $null
+    # removes them and the lock keeps recording them.
+    $piKeptPair = Get-KeptWrapperPair '.maxstack/bin/pi.cmd' '.maxstack/bin/pi.sh'
+    $piKept = $null -ne $piKeptPair
+    if ($piKept) {
+        $piCmdText = $piKeptPair.cmd
+        $piShText = $piKeptPair.sh
     }
     $notFound = "no '$PiCommand' application outside .maxstack\bin, and no pi under $piLocalBinTarget"
     if ($piKept) {
@@ -3444,14 +3475,17 @@ if ($claudeSelected) {
 }
 
 # The Copilot wrappers run the Claude folders above, so they are written last.
-if ($copilotCmdText) {
+if ($copilotKept) {
+    Write-Host "Kept $copilotCmdTarget and $copilotShTarget as they were, because Copilot was not found on this run"
+} elseif ($copilotCmdText) {
     New-Item -ItemType Directory -Path $copilotBinTarget -Force | Out-Null
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($copilotCmdTarget, $copilotCmdText, $utf8)
     [IO.File]::WriteAllText($copilotShTarget, $copilotShText, $utf8)
     Set-ShellExecutable $copilotShTarget
     Write-Host "Wrote $copilotCmdTarget and $copilotShTarget"
-} elseif ($copilotSelected) {
+} elseif ($copilotSelected -and $copilotLayers.Count -eq 0) {
+    # No layer declares copilot, so the wrappers are no longer wanted. A run that could not find Copilot never reaches this.
     foreach ($path in @($copilotCmdTarget, $copilotShTarget)) {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             Remove-WrapperIfRecorded -Path $path
@@ -3585,7 +3619,8 @@ $layerRecords = foreach ($layer in $allLayers) {
 $copilotLock = if ($copilotCmdText) {
     [pscustomobject]@{
         enabled    = $true
-        executable = [IO.Path]::GetFileName($copilotExecutable)
+        # A kept wrapper names the Copilot the lock already records, since no Copilot was found to name.
+        executable = if ($copilotExecutable) { [IO.Path]::GetFileName($copilotExecutable) } else { Get-Field $priorCopilot 'executable' }
         wrappers   = @('.maxstack/bin/copilot.cmd', '.maxstack/bin/copilot.sh')
         cmdSha256  = Get-TextSha256 $copilotCmdText
         shSha256   = Get-TextSha256 $copilotShText
