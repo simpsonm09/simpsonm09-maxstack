@@ -43,6 +43,12 @@ check: lint validate
 check-agent-tools:
     node scripts/check-agent-tools.mjs
 
+# Project layer sources into a dedicated runtime bundle. Arguments: runtime, output directory,
+# layer roots separated by ';' (name=path allowed), then optionally --check. Each value is quoted
+# for the shell the recipe runs in: PowerShell on Windows doubles an apostrophe, POSIX sh uses quote().
+generate-layers runtime out layers check="":
+    node scripts/generate-layers.mjs --runtime {{ if os_family() == "windows" { "'" + replace(runtime, "'", "''") + "'" } else { quote(runtime) } }} --out {{ if os_family() == "windows" { "'" + replace(out, "'", "''") + "'" } else { quote(out) } }} --layers {{ if os_family() == "windows" { "'" + replace(layers, "'", "''") + "'" } else { quote(layers) } }} {{ if check == "" { "" } else if os_family() == "windows" { "'" + replace(check, "'", "''") + "'" } else { quote(check) } }}
+
 # Run the Biome complexity gate over the repository.
 complexity:
     mise exec -- biome lint .

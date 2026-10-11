@@ -15,7 +15,7 @@ PStack comes from one source: the `plugins/pstack` folder of [`simpsonm09/pstack
 - GitHub Copilot CLI: `.maxstack\bin\copilot.cmd` and `copilot.sh`, which run Copilot with the Claude plugin folders.
 - Pi: `.maxstack\bin\pi.cmd` and `pi.sh`, which run Pi with the settings in `.pi\agent`, listing the same layers as packages and skills.
 
-The org and personal layers are local checkouts. They install for the same four runtimes, and their Claude folders are links to the OpenCode copies. Nothing is global. See [`docs/t3-setup.md`](docs/t3-setup.md). The plan to maintain one master source for seven runtimes is in [`docs/master-template.md`](docs/master-template.md).
+The org and personal layers are local checkouts. They install for the same four runtimes, and their Claude folders are links to the OpenCode copies. Nothing is global. See [`docs/t3-setup.md`](docs/t3-setup.md). The plan to maintain one master source for seven runtimes is in [`docs/master-template.md`](docs/master-template.md), and the standalone layer generator is described in [`docs/neutral-layer-generator.md`](docs/neutral-layer-generator.md).
 
 ## Guardrails
 
