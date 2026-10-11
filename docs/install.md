@@ -1,5 +1,7 @@
 # Install and reload
 
+> **Requires PowerShell 7 or later (`pwsh`).** `scripts/Install-Workspace.ps1` declares `#requires -Version 7.0`. Windows PowerShell 5.1 (`powershell.exe`) stops at once with that requirement and does not run the installer. Every installer command in this document is written as `pwsh -File`.
+
 ## Model
 
 maxstack sets no model. The workspace `opencode.jsonc` has no `model` or `small_model` key, and the installed agent profiles have no `model:` line, so each agent runs the model the session uses. You pick that model in the harness: the T3 Code model picker for a thread or project, or your own OpenCode, Claude Code, or Copilot settings. The PStack Claude plugin's per-role models are set with its own `/setup-pstack` command.
@@ -110,6 +112,91 @@ pwsh -File scripts/Install-Workspace.ps1
 `-Apply` makes the changes. Each runtime is written in this order: the config, the OpenCode folders and agent profiles, the Claude folders, then the Copilot wrappers. A git source is fetched before anything is written, so a commit the fork cannot supply stops the run with the workspace unchanged.
 
 A layer that stops naming a runtime leaves its folder behind. `-Apply` removes an OpenCode folder that no layer names only when the previous `stack.lock.json` recorded it, so the installer made it. It also removes the folder of the retired `pstack-opencode` port on every apply. Any other unnamed folder is reported as stale and kept. The same cleanup applies to `.claude\plugins`: `-Apply` removes a child that no layer declares, and audit reports it as stale.
+
+## Layer sources
+
+A layer installs from one source. `layers.json` gives each layer its default source: `pstack` is a git pin with a commit, and the org and personal layers are local checkouts. `-Source` changes one layer's source for a run, and the lock records the change. Each `-Source` entry is `name=spec`, and the entries may be repeated or comma-separated:
+
+```powershell
+pwsh -File scripts/Install-Workspace.ps1 -Source pstack=simpsonm09/pstack-claude@feat/opencode-runtime -Apply
+pwsh -File scripts/Install-Workspace.ps1 -Source simpsonm09-personal-ai-plugin=local:<absolute path> -Apply
+pwsh -File scripts/Install-Workspace.ps1 -Source pstack=default -Apply
+```
+
+The spec forms:
+
+| Form | Example | Meaning |
+| --- | --- | --- |
+| `owner/repo@ref` | `simpsonm09/pstack-claude@feat/opencode-runtime` | GitHub, at `https://github.com/<owner>/<repo>.git`. |
+| `https://host/path.git@ref` | `https://example.com/team/layer.git@v2` | Any host, over HTTPS only. |
+| `local:<absolute path>` | `local:<absolute path>` | A working tree. It is never fetched, and uncommitted changes install as they are. The layer's own folder inside the repository still applies, so `pstack` reads `plugins/pstack` in its checkout. |
+| `name=default`, or `name=` | `pstack=default` | Drops the override, and the layer returns to its `layers.json` source. |
+
+The ref in a git spec is a branch, a tag, or a full commit. It is checked as a git ref name. A spec is refused before anything is written when it has a space or a control character, starts with a dash, holds `..`, uses a scheme other than `https`, or carries a user name in its URL. A `local:` path must be absolute, must exist, and cannot be the workspace, a folder that contains the workspace, or a folder the installer writes (`.claude`, `.opencode`, `.pi`, or `.maxstack`). Each junction and symbolic link on the path is followed before that check, and a `\\?\` prefix is ignored. A `local:` folder is a git checkout only when it is the top level of its repository. A folder inside another repository records no commit. A `-Source` value cannot hold a comma, since a comma separates entries, and a folder with an `@ref`, such as `C:\x@main`, is refused with `did you mean local:C:\x?`.
+
+A `local:` path that is a drive root or a share root is refused, since a layer cannot be a whole drive or share. The refusal names the reason. A long-path prefix is dropped from a drive path only: `\\?\C:\x` reads as `C:\x`, and `\\?\UNC\server\share` stays the share `\\server\share`, so it is refused the same way.
+
+`-LayerSource name=path` is the alias of `-Source name=local:path`, and it works for every layer, pinned ones included.
+
+The rules:
+
+- Sources resolve before anything is written. A source that cannot be read exits non-zero with the reason, and the install stays as it was.
+- Git does not prompt for a credential, and runs no askpass program. Every git command runs with `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, and `core.askPass` set to the empty string, which overrides a global or system askpass. Its child also loses `GIT_ASKPASS`, `SSH_ASKPASS`, and `SSH_ASKPASS_REQUIRE`, so a remote that needs a login over https fails at once. An ssh remote is refused before ssh starts, since `protocol.allow=never` allows only https, so no ssh prompt runs. A credential helper that the user's own config names still runs, since the guard does not turn helpers off. A remote whose refs do not arrive within 60 seconds is stopped, and the error says so.
+- A plain apply reuses a recorded override, so an override holds until `-Source name=default` drops it.
+- Git writes happen only in the layer's own cache folder, and reading a remote's refs writes nothing. The cache's origin is reset to the resolved URL on each sync. No layer's install scripts run: npm runs with `--ignore-scripts`, with no opt-out. An apply that runs npm names each layer whose `preinstall`, `install`, or `postinstall` script, or whose `binding.gyp`, did not run. See [plugin-publishing.md](plugin-publishing.md#assembly).
+- A tree's own filter drivers are off for every git command the installer runs on it, and a local status turns off every filter that any scope defines (see the status rule below). A clean, smudge, or process command is a program that git runs while it reads a file, so the guard reads the filter drivers that the tree's repository config and its per-worktree config define, with the `include.path` entries that those files name. It turns each one off, and it marks each one not required. The settings reach git only through the environment of the git process (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, and `GIT_CONFIG_VALUE_<n>`), so no argument list grows with the tree, and the installer's own environment is never changed.
+- A git command that names no tree, such as a ref lookup or a clone, runs in a fresh empty folder outside any repository, with that folder's parent as the ceiling git does not search above. So the config of the folder the installer starts from is never read, and the folder is removed when the command ends.
+- Each git child loses the variables that git reads a repository, a worktree, a config, a program, or a transport policy from: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_PREFIX`, `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `GIT_ALLOW_PROTOCOL`, and `GIT_PROTOCOL_FROM_USER`, along with any `GIT_CONFIG_*` entry the installer holds. `GIT_ALLOW_PROTOCOL` would otherwise override the `protocol.allow=never` the guard sets. The names match without regard to case. Only the child's environment changes, so the installer's own environment is as the user set it, and `GIT_CONFIG_NOSYSTEM` is left as the user set it too. `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are left as the user set them, so a relocated config is read by the guard and by a status alike, and its credential helper still applies. The user's global config is read from `GIT_CONFIG_GLOBAL` when the user set it, and from `HOME` otherwise.
+- A layer's cache keeps the user's global and system filters, such as git-lfs, by design, so a cache holds their content, not pointer files. A cache sync turns off only the filters the tree's own config and includes define, so a filter that the user's config defines runs there.
+- A status of a local tree (an audit, `-Status`, or `-Update`) turns off every filter that any config scope defines, the user's global and system config included, so a filter that the tree's attributes name, such as a `.git/info/attributes` line for git-lfs, cannot run or write into the tree. The tree's attributes are still read, so an `eol` or `text` setting compares correctly: an unchanged CRLF file in an `eol=crlf` tree reads `clean`, and an edited one reads `uncommitted changes`. A tree whose attributes name a filter is compared as raw content, so an LFS tree whose committed files are pointers can read `uncommitted changes` while its working copy holds the content. A submodule is not read, since the status passes `--ignore-submodules=all`, so a change inside a submodule is not part of the dirty state.
+- A tree the guard cannot pass is `unreadable: <reason>` in the source block, as a missing folder is reported. Its layer runs no git command, and an apply refuses it. The reasons are a filter driver name with a control character, which git cannot take as a setting; a filter driver name that is not valid UTF-8, since git's output is read strictly and a replaced byte would name a different filter, reported as `a filter driver name is not valid UTF-8`; more than 100 filter drivers, since each takes four settings; a name longer than 4096 characters, or names that together need more than 30000 characters of child environment (the Windows block is capped at 32767), reported as `filter name too long`; and a read of the config or of the status that git cut off, which has no end and so cannot be counted. A tree whose config cannot be read is refused in the same way: a folder with a `.git` entry that git stops on, such as a config with a parse error, reads `unreadable: config cannot be read`, with git's message after it. A folder with no `.git` entry, or one that git reports as not a repository, is not a checkout and names no filter.
+- A folder that git refuses because another user owns it reads `unreadable: git refused the folder: it is owned by another user; add it to safe.directory or fix its ownership`, and an apply names that fix. A global or system config that git cannot parse refuses every guarded command: the reason is `git could not read its configuration, so the filter guard cannot be passed:` with git's own message after it, and an apply names the config file.
+- The git versions the installer needs: git 2.31 or later, without which every guarded command is refused, since the settings are read from the environment (a git that is older prints nothing for the probe, and the reason says it is too old); and git 2.44 or later for the changed-file counts of `-Update`, which read the cache with `--no-lazy-fetch` (without it the counts read `unknown`).
+- `-Source` applies to an apply or an audit. `-Status`, `-Remove`, and `-Uninstall` read the recorded sources and take no `-Source`.
+
+The lock records each layer's source as an object. A git source records its URL, its ref, the full commit it resolved to, and `override`:
+
+```json
+"source": { "kind": "git", "url": "https://github.com/simpsonm09/pstack-claude.git", "ref": "feat/opencode-runtime", "commit": "<40 hex characters>", "override": true }
+```
+
+A local source records HEAD and the dirty flag of its checkout. It never records a commit it cannot read, so a folder that is not a git checkout has `commit` and `dirty` set to `null`:
+
+```json
+"source": { "kind": "local", "url": null, "ref": null, "commit": "<40 hex characters>", "dirty": true, "override": true, "path": "<absolute path>" }
+```
+
+`override` is `true` for anything that differs from the `layers.json` default. A recorded override is checked each time the lock is read, with the same rules as a `-Source` spec: an https url, a safe ref, a full commit, and an absolute local path. In a plain apply, a value that fails stops the run before git or the install runs, and the message names the layer, the field, and the repair (`-Source <name>=default -Apply`). Any other run warns, names the same layer and field, ignores the recorded override for that run, and uses the `layers.json` source. A local override records its absolute path, since `-Update` reads the checkout again. That is the one lock value with an absolute path, and it appears only in an override record. A lock from before this record holds the source as a string, and it still verifies.
+
+`-Status` and an audit print the layer sources that are not at their committed pin, above the state rows:
+
+```text
+Layer sources not at their committed pin:
+  pstack: override, git <url> ref feat/opencode-runtime at <commit>
+  simpsonm09-org-ai-plugin: local, default projects/repos/simpsonm09-org-ai-plugin (not a git checkout)
+```
+
+Every override, every local source, and every branch or tag override is listed. A git layer pinned by commit in `layers.json` is not.
+
+### Updating the sources
+
+`-Update` re-resolves each selected layer's recorded source. A branch or tag override moves to its current commit, and the layer records that commit. A commit pin stays as it is, and so does a `layers.json` pin. A local source is read again. The recorded selection applies, so `-Update` takes no `-Runtimes`, `-Layers`, or `-Source`, and it cannot be combined with `-Remove`, `-Uninstall`, or `-Status`.
+
+```powershell
+pwsh -File scripts/Install-Workspace.ps1 -Update -Check
+pwsh -File scripts/Install-Workspace.ps1 -Update -Check -Strict
+pwsh -File scripts/Install-Workspace.ps1 -Update -Apply
+```
+
+Without `-Apply`, `-Update` prints the report and writes nothing. That is already a dry run, so `-Check` only names the report: `-Update` alone prints the same report, and `-Check` is accepted only with `-Update` and never with `-Apply`. For each selected layer it prints the old and new commit, the number of files that would change under the layer's folder, and each owned path an apply would rewrite. A commit the cache does not hold is reported as `needs fetch`, and its changed files are known after an apply fetches it. The check reads the cache with `--no-lazy-fetch`, so it never fetches an object into the cache. That flag needs git 2.44 or later. On an older git the report says `changed files unknown` rather than fetch. The count runs with rename detection off, so a partial clone that lacks a blob still gives a count, and a count git cannot read is reported as `changed files unknown`.
+
+- `-Update -Check` writes nothing: not the tree, the lock, or the cache. It exits 0.
+- `-Update -Check -Strict` exits 1 when anything would change.
+- `-Update -Apply` applies the change like an apply, and `-Strict` is refused with it.
+- `-Update` never changes `layers.json`. When a `layers.json` branch has moved past its pin, the report prints a one-line hint of the change to make by hand.
+- `-Update` needs a lock that names a selection. A workspace without one is refused, and the message says to run an apply first.
+
+`MAXSTACK_TEST_GITHUB_ROOT` is a test-only seam. The test suite sets it so that the `owner/repo` shorthand reads a local bare repository instead of GitHub. The installer honours it only when `MAXSTACK_TEST_MODE` is `1` and the folder is under the temp folder. Otherwise the shorthand names github.com. Each use prints a warning, and a real run never sets either variable.
 
 ## Ownership and status
 

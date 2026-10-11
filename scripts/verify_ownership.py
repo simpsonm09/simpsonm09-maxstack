@@ -20,6 +20,13 @@ BACKUP_PATH = re.compile(r"\.bak(\.\d+)?$")
 BACKUP_ROLES = ("original", "edited", "user")
 
 
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def is_commit(value: object) -> bool:
+    return isinstance(value, str) and HEX40.match(value) is not None
+
+
 def is_nonempty_str(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -104,6 +111,83 @@ def check_attribution(record: dict, where: str, failures: list[str]) -> None:
         failures.append(f"{where} layers must be a list of layer names")
     elif len(set(layers)) != len(layers) or layers != sorted(layers, key=utf8_order):
         failures.append(f"{where} layers must be sorted by UTF-8 bytes, once each")
+
+
+# The source record each layer keeps in stack.lock.json. A git source is a pin or an override, and a local source is a
+# checkout. A string source is the record from before the source block, and passes. Anything else must hold exactly the
+# fields the installer writes, with a 40-character lowercase commit where a commit is named.
+SOURCE_KINDS = ("git", "local")
+GIT_SOURCE_KEYS = frozenset(("kind", "url", "ref", "commit", "override"))
+LOCAL_SOURCE_KEYS = frozenset(("kind", "url", "ref", "commit", "dirty", "override", "path"))
+
+
+def is_source_url(value: object) -> bool:
+    """A source's url: a string with no spaces or control characters. The installer checks the scheme when it resolves a
+    -Source spec, and a layers.json pin is a url the repository names, so the shape check does not repeat that rule."""
+    return (
+        isinstance(value, str)
+        and value != ""
+        and not any(char.isspace() or ord(char) < 32 for char in value)
+    )
+
+
+def check_git_source(where: str, source: dict, failures: list[str]) -> None:
+    if not is_source_url(source.get("url")):
+        failures.append(f"{where} url must be a source URL with no spaces")
+    if not is_nonempty_str(source.get("ref")):
+        failures.append(f"{where} ref must name the branch, tag, or commit it came from")
+    if not is_commit(source.get("commit")):
+        failures.append(f"{where} commit must be a 40-character lowercase commit SHA")
+
+
+def check_local_source(where: str, source: dict, failures: list[str]) -> None:
+    url = source.get("url")
+    if url is not None and not is_source_url(url):
+        failures.append(f"{where} url must be a source URL with no spaces, or null")
+    if source.get("ref") is not None:
+        failures.append(f"{where} ref must be null for a local source")
+    if not is_nonempty_str(source.get("path")):
+        failures.append(f"{where} path must name the checkout folder")
+    commit = source.get("commit")
+    if commit is not None and not is_commit(commit):
+        failures.append(f"{where} commit must be a 40-character lowercase commit SHA or null")
+    dirty = source.get("dirty")
+    if commit is None and dirty is not None:
+        failures.append(f"{where} dirty must be null where there is no commit to compare")
+    if commit is not None and not isinstance(dirty, bool):
+        failures.append(f"{where} dirty must be true or false where there is a commit")
+
+
+def check_source_record(where: str, source: object, failures: list[str]) -> None:
+    """A layer's source record. A string is the record from before the source block, and it passes."""
+    if isinstance(source, str):
+        return
+    if not isinstance(source, dict):
+        failures.append(f"{where} source must be an object, or the legacy string")
+        return
+    kind = source.get("kind")
+    if kind not in SOURCE_KINDS:
+        failures.append(f"{where} source kind must be one of {list(SOURCE_KINDS)}")
+        return
+    expected = GIT_SOURCE_KEYS if kind == "git" else LOCAL_SOURCE_KEYS
+    if set(source) != expected:
+        failures.append(f"{where} source must hold exactly {sorted(expected)}, found {sorted(source)}")
+    if not isinstance(source.get("override"), bool):
+        failures.append(f"{where} source override must be true or false")
+    if kind == "git":
+        check_git_source(where, source, failures)
+    else:
+        check_local_source(where, source, failures)
+
+
+def check_layer_sources(lock: dict, failures: list[str]) -> None:
+    layers = lock.get("layers")
+    if not isinstance(layers, list):
+        return
+    for index, layer in enumerate(layers):
+        if isinstance(layer, dict) and "source" in layer:
+            where = f"stack.lock.json layers[{index}] ({layer.get('name')})"
+            check_source_record(where, layer["source"], failures)
 
 
 def check_created(lock: dict, field: str, failures: list[str]) -> None:
@@ -238,6 +322,7 @@ def check_selection(lock: dict, failures: list[str]) -> None:
 def check_owned(lock: dict, failures: list[str]) -> None:
     """The ownership record in stack.lock.json: a schema version, and one sorted list of records."""
     check_selection(lock, failures)
+    check_layer_sources(lock, failures)
     if lock.get("ownedSchema") != OWNED_SCHEMA or isinstance(
         lock.get("ownedSchema"), bool
     ):

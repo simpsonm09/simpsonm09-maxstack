@@ -7,9 +7,11 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:net';
 import {
   appendFileSync,
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -23,10 +25,11 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join, relative, resolve } from 'node:path';
+import { delimiter, dirname, join, parse as parsePath, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -40,11 +43,10 @@ const MISSING_PI = 'maxstack-test-no-such-pi';
 
 let layersCounter = 0;
 
+// The installer needs PowerShell 7 (#requires -Version 7.0), so only pwsh is tried. Windows PowerShell 5.1 stops every installer
+// run with a version error, so it is never the shell. Without pwsh the tests skip with that reason.
 function findShell() {
-  for (const name of ['pwsh', 'powershell']) {
-    if (spawnSync(name, ['-NoProfile', '-Command', 'exit 0']).status === 0) return name;
-  }
-  return null;
+  return spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status === 0 ? 'pwsh' : null;
 }
 
 // On Windows a bash on PATH can be the WSL launcher, so use the one Git for Windows ships.
@@ -160,7 +162,7 @@ function writeFakePi(base) {
 // folder into its prefix, and nothing else here. FAKE_NPM_EXTRA names one more file it writes, and FAKE_NPM_REWRITE
 // makes it write a different lock, as npm does to a lock the layer ships. A node script runs it, behind a .cmd on
 // Windows and a shell file elsewhere.
-const FAKE_NPM_SCRIPT = `import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+const FAKE_NPM_SCRIPT = `import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
@@ -176,6 +178,19 @@ if (process.env.FAKE_NPM_EXTRA) {
   const extra = join(prefix, process.env.FAKE_NPM_EXTRA);
   mkdirSync(dirname(extra), { recursive: true });
   writeFileSync(extra, 'written by npm\\n');
+}
+// FAKE_NPM_BROKEN_SCOPE leaves a scope folder that is a junction to a folder that is gone, which listing it cannot read.
+if (process.env.FAKE_NPM_BROKEN_SCOPE) {
+  mkdirSync(join(prefix, 'node_modules'), { recursive: true });
+  symlinkSync(join(prefix, 'gone-target'), join(prefix, 'node_modules', '@broken'), 'junction');
+}
+// FAKE_NPM_SCRIPTED lists installed packages that declare a postinstall script, so the ignore-scripts scan has them.
+if (process.env.FAKE_NPM_SCRIPTED) {
+  for (const name of JSON.parse(process.env.FAKE_NPM_SCRIPTED)) {
+    const dir = join(prefix, 'node_modules', ...name.split('/'));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0', scripts: { postinstall: 'node build.js' } }));
+  }
 }
 `;
 
@@ -248,8 +263,14 @@ function layerNamed(manifest, name) {
   return manifest.layers.find((layer) => layer.name === name);
 }
 
+// The environment a test run gives the installer. MAXSTACK_TEST_MODE turns on the test seam, which lets the fixtures'
+// file remotes be read, so every installer run in these tests sets it. A test of the unset seam builds its own env.
+function testEnvironment(base) {
+  return { ...(base ?? process.env), MAXSTACK_TEST_MODE: '1' };
+}
+
 // Runs the installer. Copilot and Pi are the stand-ins unless the caller names their command.
-function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = writeLayers(ctx) } = {}) {
+function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = writeLayers(ctx), env = undefined } = {}) {
   const copilot = extra.includes('-CopilotCommand') ? [] : ['-CopilotCommand', ctx.fakeCopilot];
   const pi = extra.includes('-PiCommand') ? [] : ['-PiCommand', ctx.fakePi];
   const args = [
@@ -261,7 +282,7 @@ function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = write
     ...(apply ? ['-Apply'] : []),
     ...extra,
   ];
-  return spawnSync(shell, args, { encoding: 'utf8', env: ctx.env });
+  return spawnSync(shell, args, { encoding: 'utf8', env: testEnvironment(env ?? ctx.env) });
 }
 
 // A junction reports as a symbolic link to lstat.
@@ -339,7 +360,8 @@ withWorkspace('the lock records each layer once, with its runtimes and no absolu
   for (const record of lock.layers) {
     assert.equal(typeof record.name, 'string');
     assert.equal(typeof record.kind, 'string');
-    assert.equal(typeof record.source, 'string', `layer ${record.name} records its source`);
+    assert.equal(typeof record.source, 'object', `layer ${record.name} records its source block`);
+    assert.ok(['git', 'local'].includes(record.source.kind), `layer ${record.name} names its source kind`);
     for (const runtime of ['claude', 'opencode', 'copilot', 'pi']) {
       assert.equal(typeof record[runtime]?.enabled, 'boolean', `layer ${record.name} has a ${runtime} record`);
     }
@@ -682,15 +704,17 @@ withWorkspace('removing the claude runtime removes only its link and keeps the i
   assert.equal(lock.layers.find((record) => record.name === 'simpsonm09-org-ai-plugin').claude.enabled, false);
 }, {});
 
-withWorkspace('LayerSource overrides a local checkout, and refuses a git layer', (ctx) => {
+withWorkspace('LayerSource overrides a local checkout, and now also a git-pinned layer', (ctx) => {
   const alternate = join(ctx.base, 'alternate-org');
   writeLayerStub(alternate, { claudePlugin: 'simpsonm09-org-ai-plugin', extra: { 'from-override.txt': 'override\n' } });
   mustApply(ctx, ['-LayerSource', `simpsonm09-org-ai-plugin=${alternate}`]);
   assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'from-override.txt')));
 
-  const refused = runInstaller(shell, ctx, ['-LayerSource', `pstack=${alternate}`]);
-  assert.notEqual(refused.status, 0, 'LayerSource accepted a git layer');
-  assert.match(plainOutput(refused), /LayerSource applies to a local checkout, and pstack is pinned/);
+  // -LayerSource is the local alias of -Source, so it reads pstack from a checkout of the fork as well.
+  const pstackCheckout = join(ctx.base, 'pstack-checkout');
+  cpSync(join(ctx.fixture.dir), pstackCheckout, { recursive: true });
+  mustApply(ctx, ['-LayerSource', `pstack=${pstackCheckout}`]);
+  assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'pstack', 'opencode', 'index.ts')), 'pstack was not installed from the checkout');
 }, {});
 
 withWorkspace('the installer has no live-server check and no skip switch', (ctx) => {
@@ -2578,7 +2602,7 @@ withWorkspace('the removal switches refuse each other, -Status, and a missing se
     [['-Uninstall', '-Status'], /Choose -Status, -Remove, or -Uninstall/],
     [['-Uninstall', '-Runtimes', 'pi'], /takes no -Runtimes or -Layers/],
     [['-Remove'], /names what to remove/],
-    [['-Strict'], /applies to -Status, -Remove, and -Uninstall/],
+    [['-Strict'], /applies to -Status, -Remove, -Uninstall, and -Update/],
   ];
   for (const [args, pattern] of cases) {
     const run = runInstaller(shell, ctx, args, { apply: false });
@@ -3207,4 +3231,1933 @@ withWorkspace('a plain apply keeps a journaled quarantine whose files changed, n
   const kept = readJson(lockPath(ctx));
   assert.equal(ownedRecord(kept, ORG_FOLDER, 'dir').quarantine, 'simpsonm09-org-ai-plugin.maxstack-removing', 'the journal was dropped');
   assert.doesNotMatch(run.stdout, /Rerun -Uninstall/, run.stdout);
+}, {});
+
+// ---- Layer sources: -Source, the -LayerSource alias, and the recorded override -----------------------------------
+// A git command in a folder. A failing command fails the test, so a fixture that did not build is never a result.
+function gitRun(dir, args) {
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8' });
+  assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
+  return run.stdout.trim();
+}
+
+// The test stand-in for github.com. MAXSTACK_TEST_GITHUB_ROOT names the folder, and owner/repo resolves to
+// <root>/<owner>/<repo>.git. GIT_TERMINAL_PROMPT stops git from waiting for a credential.
+function githubEnv(ctx) {
+  return { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(ctx.base, 'github'), GIT_TERMINAL_PROMPT: '0' };
+}
+
+function remoteUrl(ctx, owner, repo) {
+  return join(ctx.base, 'github', owner, `${repo}.git`).replace(/\\/g, '/');
+}
+
+// Serves a copy of a repository as <owner>/<repo>.git under the test GitHub root, and returns the bare path.
+function serveRepo(ctx, owner, repo, sourceDir) {
+  const bare = join(ctx.base, 'github', owner, `${repo}.git`);
+  mkdirSync(dirname(bare), { recursive: true });
+  gitRun(ctx.base, ['clone', '--bare', '--quiet', sourceDir, bare]);
+  gitRun(bare, ['config', 'uploadpack.allowFilter', 'true']);
+  gitRun(bare, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);
+  return bare;
+}
+
+// Commits one file on a branch of a served repository, starting from the branch or from the default branch, and
+// pushes it there. Returns the new commit.
+function commitToBranch(ctx, bare, branch, relPath, content) {
+  const work = join(ctx.base, 'work');
+  if (!existsSync(work)) gitRun(ctx.base, ['clone', '--quiet', bare, work]);
+  gitRun(work, ['fetch', '--quiet', 'origin']);
+  const hasBranch = spawnSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).status === 0;
+  gitRun(work, ['checkout', '-q', '-B', branch, hasBranch ? `origin/${branch}` : 'origin/HEAD']);
+  writeFile(work, relPath, content);
+  gitRun(work, ['add', '-A']);
+  gitRun(work, ['commit', '-q', '-m', `change on ${branch}`]);
+  gitRun(work, ['push', '-q', 'origin', branch]);
+  return gitRun(work, ['rev-parse', 'HEAD']);
+}
+
+const SKILL_PATH = 'plugins/pstack/skills/poteto-mode/SKILL.md';
+const SKILL_FEAT = '---\nname: poteto-mode\ndescription: fixture\n---\nfeat body\n';
+const installedSkill = (ctx) => join(ctx.workspace, '.opencode', 'plugins', 'pstack', 'skills', 'poteto-mode', 'SKILL.md');
+
+// pstack served as simpsonm09/pstack-claude, with a feat branch that changes its skill.
+function servedFeature(ctx) {
+  const bare = serveRepo(ctx, 'simpsonm09', 'pstack-claude', ctx.fixture.dir);
+  const featCommit = commitToBranch(ctx, bare, 'feat', SKILL_PATH, SKILL_FEAT);
+  return { bare, featCommit };
+}
+
+function sourceOf(ctx, name) {
+  const record = readJson(lockPath(ctx)).layers.find((layer) => layer.name === name);
+  assert.ok(record, `the lock has no record for ${name}`);
+  return record;
+}
+
+withWorkspace('-Source owner/repo@branch installs the branch commit, and the lock records it as an override', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/, 'the branch content was not installed');
+
+  const pstack = sourceOf(ctx, 'pstack');
+  assert.deepEqual(pstack.source, { kind: 'git', url: remoteUrl(ctx, 'simpsonm09', 'pstack-claude'), ref: 'feat', commit: featCommit, override: true });
+  assert.equal(pstack.commit, featCommit, 'the layer commit is the resolved branch commit');
+  assert.equal(sourceOf(ctx, 'simpsonm09-org-ai-plugin').source.override, false, 'a layer no flag names is not an override');
+}, {});
+
+withWorkspace('a recorded override persists across a plain apply, and -Source name=default drops it', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  mustApply(ctx, [], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').source.override, true, 'the plain apply dropped the override');
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'the plain apply moved the recorded commit');
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/);
+
+  mustApply(ctx, ['-Source', 'pstack=default'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').source.override, false, '-Source name=default kept the override');
+  assert.equal(sourceOf(ctx, 'pstack').commit, ctx.fixture.commit, 'the default pin is installed again');
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /fixture body/);
+}, {});
+
+withWorkspace('a local source installs the working tree as it is, and the lock records HEAD and the dirty flag', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const head = gitRun(checkout, ['rev-parse', 'HEAD']);
+  writeFile(checkout, 'index.ts', 'export default { edited: true };\n');
+
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assert.match(readFileSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'index.ts'), 'utf8'), /edited: true/);
+  const org = sourceOf(ctx, 'simpsonm09-org-ai-plugin');
+  assert.deepEqual(org.source, { kind: 'local', url: null, ref: null, commit: head, dirty: true, override: true, path: checkout });
+  assert.equal(org.commit, head);
+}, {});
+
+withWorkspace('pstack installs from a local checkout, comma-separated with another layer, and a folder that is not git records no commit', (ctx) => {
+  const pstackCheckout = join(ctx.base, 'pstack-checkout');
+  cpSync(ctx.fixture.dir, pstackCheckout, { recursive: true });
+  const head = gitRun(pstackCheckout, ['rev-parse', 'HEAD']);
+  writeFile(pstackCheckout, SKILL_PATH, '---\nname: poteto-mode\ndescription: fixture\n---\nlocal edit\n');
+  const orgCheckout = join(ctx.base, 'org-plain');
+  writeLayerStub(orgCheckout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+
+  mustApply(ctx, ['-Source', `pstack=local:${pstackCheckout},simpsonm09-org-ai-plugin=local:${orgCheckout}`]);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /local edit/, 'pstack was not installed from its checkout');
+  assert.ok(existsSync(join(ctx.workspace, '.claude', 'plugins', 'pstack', '.claude-plugin', 'plugin.json')), 'the Claude copy lacks the manifest');
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'plugins', 'pstack', '.git')), false, 'the Claude copy carries .git');
+  assert.deepEqual(sourceOf(ctx, 'pstack').source, { kind: 'local', url: null, ref: null, commit: head, dirty: true, override: true, path: pstackCheckout });
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'cache', 'pstack')), false, 'a local source keeps no git cache');
+
+  const org = sourceOf(ctx, 'simpsonm09-org-ai-plugin');
+  assert.equal(org.commit, null, 'a folder that is not a git checkout records no commit');
+  assert.equal(org.source.dirty, null, 'a folder that is not a git checkout records no dirty flag');
+}, {});
+
+const REFUSED_SOURCES = [
+  ['pstack=http://github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=ssh://git@github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=file:///tmp/pstack.git@feat', 'only https'],
+  ['pstack=https://user@github.com/simpsonm09/pstack-claude.git@feat', 'only https'],
+  ['pstack=simpsonm09/pstack-claude@feat..x', 'holds [.][.]'],
+  ['pstack=simpsonm09/pstack-claude@-feat', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat~1', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat.lock', 'not a safe git ref name'],
+  ['pstack=simpsonm09/pstack-claude@feat x', 'space or a control character'],
+  ['pstack=simpsonm09/pstack claude@feat', 'space or a control character'],
+  ['pstack=-simpsonm09/pstack-claude@feat', 'starts with a dash'],
+  ['pstack=simpsonm09/pstack-claude', 'needs @ref'],
+  ['pstack=simpsonm09/..x@feat', 'holds \\.\\.'],
+  ['pstack=local:relative/checkout', 'needs an absolute path'],
+  ['nosuchlayer=simpsonm09/pstack-claude@feat', 'names an unknown layer'],
+];
+
+withWorkspace('malformed -Source specs and unknown layers are refused before anything is written', (ctx) => {
+  for (const [spec, reason] of REFUSED_SOURCES) {
+    const run = runInstaller(shell, ctx, ['-Source', spec]);
+    assert.notEqual(run.status, 0, `the installer accepted -Source ${spec}`);
+    assert.match(plainOutput(run), new RegExp(reason), `${spec}: ${run.stdout}\n${run.stderr}`);
+    assert.equal(existsSync(lockPath(ctx)), false, `${spec} wrote a lock`);
+    assert.equal(existsSync(join(ctx.workspace, '.claude')), false, `${spec} wrote under .claude`);
+  }
+}, {});
+
+withWorkspace('a local source is refused for the workspace itself and for each folder the installer writes', (ctx) => {
+  for (const folder of [ctx.workspace, join(ctx.workspace, '.claude'), join(ctx.workspace, '.claude', 'cache')]) {
+    mkdirSync(folder, { recursive: true });
+    const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${folder}`]);
+    assert.notEqual(run.status, 0, `the installer accepted ${folder}`);
+    assert.match(plainOutput(run), /cannot be a layer source/, run.stdout);
+  }
+  assert.equal(existsSync(lockPath(ctx)), false, 'a refused local source wrote a lock');
+}, {});
+
+withWorkspace('an https source that cannot be reached fails with the reason, and leaves the install untouched', (ctx) => {
+  mustApply(ctx);
+  const before = snapshotTree(ctx.workspace);
+  const run = runInstaller(shell, ctx, ['-Source', 'pstack=https://127.0.0.1:1/simpsonm09/pstack-claude.git@feat'], { env: githubEnv(ctx) });
+  assert.notEqual(run.status, 0, 'an unreachable source was accepted');
+  assert.match(plainOutput(run), /could not read the refs of https:\/\/127\.0\.0\.1:1/, run.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a failed source changed the install');
+}, {});
+
+withWorkspace('-Status, -Remove, and -Uninstall refuse -Source, which only an apply or an audit takes', (ctx) => {
+  for (const args of [['-Status'], ['-Remove', '-Layers', 'pstack'], ['-Uninstall']]) {
+    const run = runInstaller(shell, ctx, [...args, '-Source', 'pstack=simpsonm09/pstack-claude@feat'], { apply: false });
+    assert.notEqual(run.status, 0, `${args.join(' ')} accepted -Source`);
+    assert.match(plainOutput(run), /-Source sets a layer source for an apply or an audit/, run.stdout);
+  }
+}, {});
+
+withWorkspace('an overridden layer is removed by -Uninstall like any other', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assertOk(removal(ctx, ['-Uninstall']));
+  assert.equal(existsSync(lockPath(ctx)), false, 'the lock remains');
+  assert.equal(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin')), false, 'the overridden folder remains');
+}, {});
+
+// The layer-source block: -Status and an audit name every override, every local source, and no pin that holds.
+const STATE_ROW = /^(matching|drifted|modified|missing|untracked|not selected)\s/;
+
+// The lines between the block's header and the first state row, or none when the block is absent.
+function sourceBlockOf(stdout) {
+  const lines = stdout.split(/\r?\n/);
+  const header = lines.indexOf('Layer sources not at their committed pin:');
+  if (header < 0) return null;
+  const firstState = lines.findIndex((line, index) => index > header && STATE_ROW.test(line));
+  return { header, lines: lines.slice(header + 1, firstState < 0 ? undefined : firstState), firstState };
+}
+
+withWorkspace('-Status prints the layer-source block above the state rows, with each override and each local source', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false, env: githubEnv(ctx) });
+  assertOk(status);
+
+  const block = sourceBlockOf(status.stdout);
+  assert.ok(block, `no source block:\n${status.stdout}`);
+  assert.ok(block.firstState > block.header, 'the block is below a state row');
+  const text = block.lines.join('\n');
+  assert.match(text, new RegExp(`pstack: override, git \\S+ ref feat at ${featCommit}`), text);
+  assert.match(text, /simpsonm09-org-ai-plugin: local, default /, text);
+  assert.doesNotMatch(text, /pstack: .*local/, 'a pinned git layer is listed as local');
+}, {});
+
+withWorkspace('a default workspace lists its local layers in the block and no git pin', (ctx) => {
+  mustApply(ctx);
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  const block = sourceBlockOf(status.stdout);
+  assert.ok(block, status.stdout);
+  const text = block.lines.join('\n');
+  assert.match(text, /simpsonm09-org-ai-plugin: local, default/);
+  assert.match(text, /simpsonm09-personal-ai-plugin: local, default/);
+  assert.doesNotMatch(text, /pstack/, 'the pinned pstack layer is listed');
+}, {});
+
+withWorkspace('an audit names the source it would install, and writes nothing', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx);
+  const before = snapshotTree(ctx.workspace);
+  const audit = runInstaller(shell, ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { apply: false, env: githubEnv(ctx) });
+  assertOk(audit);
+  const block = sourceBlockOf(audit.stdout);
+  assert.ok(block, audit.stdout);
+  assert.match(block.lines.join('\n'), new RegExp(`pstack: override, git \\S+ ref feat at ${featCommit}`));
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'an audit changed the workspace');
+}, {});
+
+// -Update: a branch or tag override moves to its current commit, a commit pin and a default pin do not, and a local
+// source is re-read. A check writes nothing. A failed resolve leaves the install as it was.
+const SKILL_FEAT_TWO = '---\nname: poteto-mode\ndescription: fixture\n---\nfeat body two\n';
+
+// Moves the feat branch on the served repository to a new commit, which the workspace has not fetched.
+function moveFeat(ctx, bare) {
+  return commitToBranch(ctx, bare, 'feat', SKILL_PATH, SKILL_FEAT_TWO);
+}
+
+withWorkspace('-Update moves a branch override to its current commit and records it, and a dry run changes nothing', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lockBefore = readFileSync(lockPath(ctx), 'utf8');
+  const featTwo = moveFeat(ctx, bare);
+
+  const dry = runInstaller(shell, ctx, ['-Update'], { apply: false, env: githubEnv(ctx) });
+  assertOk(dry);
+  assert.match(dry.stdout, new RegExp(`feat ${featCommit} -> ${featTwo}`), dry.stdout);
+  assert.equal(readFileSync(lockPath(ctx), 'utf8'), lockBefore, 'a dry -Update changed the lock');
+
+  mustApply(ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featTwo, 'the branch override did not move');
+  assert.equal(sourceOf(ctx, 'pstack').source.override, true);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body two/, 'the moved content was not installed');
+}, {});
+
+withWorkspace('-Update does not move a commit pin, even when its branch has moved', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', `pstack=simpsonm09/pstack-claude@${featCommit}`], { env: githubEnv(ctx) });
+  moveFeat(ctx, bare);
+  mustApply(ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'a commit pin moved');
+  assert.equal(sourceOf(ctx, 'pstack').source.ref, featCommit);
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/);
+  assert.doesNotMatch(readFileSync(installedSkill(ctx), 'utf8'), /feat body two/);
+}, {});
+
+withWorkspace('-Update -Check writes nothing, not even the cache, and reports the move and the drift', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const featTwo = moveFeat(ctx, bare);
+  const before = snapshotTree(ctx.workspace);
+  const lockBefore = readFileSync(lockPath(ctx));
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.match(check.stdout, new RegExp(`feat ${featCommit} -> ${featTwo}`), check.stdout);
+  assert.match(check.stdout, /needs fetch/, check.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, '-Update -Check changed the tree or the cache');
+  assert.deepEqual(readFileSync(lockPath(ctx)), lockBefore, '-Update -Check changed the lock');
+
+  const strict = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false, env: githubEnv(ctx) });
+  assert.equal(strict.status, 1, `-Strict did not exit 1 when a source would move:\n${strict.stdout}`);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'the strict check changed the tree or the cache');
+}, {});
+
+withWorkspace('-Update -Check -Strict exits 0 when nothing would change', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx);
+  const strict = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false, env: githubEnv(ctx) });
+  assert.equal(strict.status, 0, `${strict.stdout}\n${strict.stderr}`);
+  assert.match(strict.stdout, /Nothing would change/, strict.stdout);
+}, {});
+
+withWorkspace('-Update needs a lock with a selection, and refuses the flags it does not take', (ctx) => {
+  const none = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assert.notEqual(none.status, 0, '-Update ran without a lock');
+  assert.match(plainOutput(none), /needs a stack\.lock\.json with a selection/, none.stdout);
+
+  mustApply(ctx);
+  const lock = readJson(lockPath(ctx));
+  delete lock.selection;
+  setLock(ctx, lock);
+  const legacy = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assert.notEqual(legacy.status, 0, '-Update ran on a lock with no selection');
+  assert.match(plainOutput(legacy), /predates the selection/, legacy.stdout);
+
+  mustApply(ctx);
+  for (const [args, reason] of [
+    [['-Update', '-Remove', '-Layers', 'pstack'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Uninstall'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Status'], /-Update re-resolves the recorded sources/],
+    [['-Update', '-Source', 'pstack=simpsonm09/pstack-claude@feat'], /Set a source with -Source and an apply/],
+    [['-Update', '-Layers', 'pstack'], /applies the recorded selection/],
+    [['-Check'], /-Check applies to -Update/],
+    [['-Update', '-Check', '-Apply'], /-Check writes nothing/],
+    [['-Update', '-Apply', '-Strict'], /reports and writes nothing/],
+  ]) {
+    const run = runInstaller(shell, ctx, args, { apply: false, env: githubEnv(ctx) });
+    assert.notEqual(run.status, 0, `${args.join(' ')} was accepted`);
+    assert.match(plainOutput(run), reason, `${args.join(' ')}: ${run.stdout}\n${run.stderr}`);
+  }
+}, {});
+
+withWorkspace('-Update re-reads a local source, and an apply then installs what the checkout holds', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, 'index.ts', 'export default { edit: 1 };\n');
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+
+  writeFile(checkout, 'index.ts', 'export default { edit: 2 };\n');
+  const installed = join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-org-ai-plugin', 'index.ts');
+  const check = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false });
+  assert.equal(check.status, 1, `the edited checkout was not reported:\n${check.stdout}`);
+  assert.match(readFileSync(installed, 'utf8'), /edit: 1/, 'the check changed the install');
+
+  mustApply(ctx, ['-Update']);
+  assert.match(readFileSync(installed, 'utf8'), /edit: 2/, '-Update did not re-read the checkout');
+  assert.equal(sourceOf(ctx, 'simpsonm09-org-ai-plugin').source.dirty, true);
+}, {});
+
+withWorkspace('a -Update whose branch cannot be resolved fails with the reason, and leaves the install untouched', (ctx) => {
+  const { bare } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  gitRun(bare, ['update-ref', '-d', 'refs/heads/feat']);
+  const before = snapshotTree(ctx.workspace);
+  const run = runInstaller(shell, ctx, ['-Update'], { env: githubEnv(ctx) });
+  assert.notEqual(run.status, 0, '-Update resolved a branch that is gone');
+  assert.match(plainOutput(run), /has no branch or tag named feat/, run.stdout);
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a failed -Update changed the install');
+}, {});
+
+withWorkspace('-Update prints the pin hint when layers.json\'s branch has moved, and moves no pin', (ctx) => {
+  mustApply(ctx);
+  const lockBefore = readFileSync(lockPath(ctx), 'utf8');
+  gitRun(ctx.fixture.dir, ['checkout', '-q', '-b', 'test']);
+  writeFile(ctx.fixture.dir, SKILL_PATH, '---\nname: poteto-mode\ndescription: fixture\n---\nnewer\n');
+  gitRun(ctx.fixture.dir, ['add', '-A']);
+  gitRun(ctx.fixture.dir, ['commit', '-q', '-m', 'newer']);
+  const newer = gitRun(ctx.fixture.dir, ['rev-parse', 'HEAD']);
+
+  const run = runInstaller(shell, ctx, ['-Update'], { apply: false });
+  assertOk(run);
+  assert.match(run.stdout, new RegExp(`layers\\.json pins ${ctx.fixture.commit}, and test is at ${newer}`), run.stdout);
+  assert.match(run.stdout, /-Update never moves a pin/, run.stdout);
+  assert.equal(readFileSync(lockPath(ctx), 'utf8'), lockBefore, 'the hint changed the lock');
+}, {});
+
+withWorkspace('a lock from before the source block lists its local layers as defaults, and names no dirty state it never recorded', (ctx) => {
+  mustApply(ctx);
+  const lock = readJson(lockPath(ctx));
+  const LEGACY_COMMIT = 'b'.repeat(40);
+  for (const layer of lock.layers) {
+    layer.source = layer.source.url;
+  }
+  lock.layers.find((layer) => layer.name === 'simpsonm09-org-ai-plugin').commit = LEGACY_COMMIT;
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  const text = sourceBlockOf(status.stdout).lines.join('\n');
+  assert.match(text, new RegExp(`simpsonm09-org-ai-plugin: local, default \\S+ \\(HEAD ${LEGACY_COMMIT}, dirty state not recorded\\)`), text);
+  assert.doesNotMatch(text, /pstack/, 'the pinned pstack layer is listed');
+}, {});
+
+withWorkspace('-Source owner/repo@tag resolves an annotated tag to the commit it points at', (ctx) => {
+  const { bare, featCommit } = servedFeature(ctx);
+  gitRun(bare, ['tag', '-a', 'v1', '-m', 'release', featCommit]);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@v1'], { env: githubEnv(ctx) });
+  assert.equal(sourceOf(ctx, 'pstack').commit, featCommit, 'the annotated tag resolved to its tag object, not its commit');
+  assert.deepEqual(sourceOf(ctx, 'pstack').source, { kind: 'git', url: remoteUrl(ctx, 'simpsonm09', 'pstack-claude'), ref: 'v1', commit: featCommit, override: true });
+  assert.match(readFileSync(installedSkill(ctx), 'utf8'), /feat body/, 'the tagged content was not installed');
+}, {});
+
+// ---- Hardening of the layer sources: each test names one review finding, and each fails before its fix. ----
+
+// A config layer served from a local bare repository, pinned to its commit, for a git override of that layer.
+function servedConfigLayer(ctx) {
+  const source = join(ctx.base, 'cfg-src');
+  writeLayerStub(source, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(source, ['init', '-q']);
+  gitRun(source, ['add', '-A']);
+  gitRun(source, ['commit', '-q', '-m', 'config layer']);
+  const commit = gitRun(source, ['rev-parse', 'HEAD']);
+  serveRepo(ctx, 'simpsonm09', 'org-ai-plugin', source);
+  return commit;
+}
+
+// Finding 1: a config layer under a git override is read from its cache, and an audit with no cache says so.
+withWorkspace('a config layer under a git override runs -Status and -Update -Check without throwing', (ctx) => {
+  const commit = servedConfigLayer(ctx);
+  const override = ['-Source', `simpsonm09-org-ai-plugin=simpsonm09/org-ai-plugin@${commit}`];
+  mustApply(ctx, override, { env: githubEnv(ctx) });
+  assertOk(runInstaller(shell, ctx, ['-Status'], { apply: false, env: githubEnv(ctx) }));
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) }));
+}, {});
+
+withWorkspace('a config layer pinned by -Source and audited without -Apply names its config as unknown, and does not throw', (ctx) => {
+  const commit = servedConfigLayer(ctx);
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=simpsonm09/org-ai-plugin@${commit}`], { apply: false, env: githubEnv(ctx) });
+  assertOk(audit);
+  assert.match(audit.stdout, /Drift: .*opencode\.jsonc: unknown until -Apply syncs the layer cache/, audit.stdout);
+  assert.equal(existsSync(join(ctx.workspace, '.claude', 'cache')), false, 'an audit fetched the cache');
+}, {});
+
+// Finding 2: a local tree is read with git, and its .git/config may name a program git runs. An audit must run none of it.
+withWorkspace('an audit of a -Source local tree runs no program that its .git/config names', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'fsmonitor-marker');
+  gitRun(checkout, ['config', 'core.fsmonitor', `touch '${marker.split('\\').join('/')}'`]);
+  gitRun(checkout, ['status', '--porcelain']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the command that core.fsmonitor names when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the command that core.fsmonitor names');
+}, {});
+
+// Finding 3: a recorded local override whose folder is gone is reported, and only an apply stops on it.
+withWorkspace('a recorded local override whose folder is gone is reported by -Status, -Update -Check, and -Remove, and only -Apply stops', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  rmSync(checkout, { recursive: true, force: true });
+  const missing = `local ${checkout}: folder missing`;
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.ok(status.stdout.includes(missing), status.stdout);
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check', '-Strict'], { apply: false });
+  assert.equal(check.status, 1, `a missing folder is counted as a change, so -Strict exits 1:\n${check.stdout}`);
+  assert.ok(check.stdout.includes(missing), check.stdout);
+
+  assertOk(runInstaller(shell, ctx, ['-Uninstall'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], { apply: false }));
+  const refused = removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']);
+  assert.notEqual(refused.status, 0, 'a removal rewrote the config without the missing fragment');
+  assert.match(plainOutput(refused), /has no folder at .*Restore the folder, then rerun/, refused.stdout);
+  assert.doesNotMatch(plainOutput(refused), /-Source/, refused.stdout);
+  assert.ok(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-personal-ai-plugin')), 'a refused removal removed the layer');
+
+  mustApply(ctx, ['-Source', 'simpsonm09-org-ai-plugin=default']);
+  assertOk(removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']));
+  assert.equal(existsSync(join(ctx.workspace, '.opencode', 'plugins', 'simpsonm09-personal-ai-plugin')), false, 'the other layer was not removed');
+}, {});
+
+// Finding 3: -Update resolves only the layers it selects, so a remote the selection leaves out cannot abort it.
+withWorkspace('-Update resolves only the selected layers, so an unreachable remote of an unselected layer does not abort', (ctx) => {
+  const { bare } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lock = readJson(lockPath(ctx));
+  lock.selection.layers = lock.selection.layers.filter((name) => name !== 'pstack');
+  setLock(ctx, lock);
+  rmSync(bare, { recursive: true, force: true });
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.doesNotMatch(plainOutput(check), /could not read the refs/, check.stdout);
+}, {});
+
+// Finding 4: the changed-file count of an -Update -Check report. A rename makes git read blobs the partial cache lacks.
+// The feat branch moves the skill to a new name and edits it, which is an inexact rename that reads both blobs.
+const SKILL_MOVED = 'plugins/pstack/skills/poteto-renamed/SKILL.md';
+
+function renameSkillOnFeat(ctx) {
+  const work = join(ctx.base, 'work');
+  gitRun(work, ['fetch', '--quiet', 'origin']);
+  gitRun(work, ['checkout', '-q', '-B', 'feat', 'origin/feat']);
+  mkdirSync(join(work, dirname(SKILL_MOVED)), { recursive: true });
+  gitRun(work, ['mv', SKILL_PATH, SKILL_MOVED]);
+  writeFile(work, SKILL_MOVED, SKILL_FEAT_TWO);
+  gitRun(work, ['add', '-A']);
+  gitRun(work, ['commit', '-q', '-m', 'rename the skill']);
+  gitRun(work, ['push', '-q', 'origin', 'feat']);
+  return gitRun(work, ['rev-parse', 'HEAD']);
+}
+
+withWorkspace('-Update -Check counts the changed files of a rename that the partial cache must read, and does not report zero', (ctx) => {
+  const { featCommit } = servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const renamed = renameSkillOnFeat(ctx);
+  const cache = join(ctx.workspace, '.claude', 'cache', 'pstack');
+  gitRun(cache, ['fetch', '--quiet', '--filter=blob:none', 'origin', renamed]);
+
+  const check = runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false, env: githubEnv(ctx) });
+  assertOk(check);
+  assert.match(check.stdout, new RegExp(`feat ${featCommit} -> ${renamed}; 2 files changed under plugins/pstack`), check.stdout);
+  assert.doesNotMatch(check.stdout, /0 files changed/, check.stdout);
+}, {});
+
+// Finding 5: the owner/repo shorthand reads a local folder only in a test run, and only for a folder under the temp folder.
+// These call the resolver in a child that dot-sources the module, so nothing here reaches the network.
+const layerSourcesFile = join(repoRoot, 'scripts', 'Install-LayerSources.ps1');
+const SHORTHAND_URL = 'https://github.com/simpsonm09/pstack-claude.git';
+
+function resolveShorthand(env) {
+  const script = `. '${layerSourcesFile}'; Get-GitHubRemoteUrl -Owner 'simpsonm09' -Repo 'pstack-claude'`;
+  return spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+}
+
+test('without the test-mode flag the owner/repo shorthand names github.com, even when the test root is set', { skip }, () => {
+  const env = { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(tmpdir(), 'maxstack-seam-probe') };
+  delete env.MAXSTACK_TEST_MODE;
+  const run = resolveShorthand(env);
+  assertOk(run);
+  assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+}, {});
+
+test('with the test-mode flag and a root under the temp folder, the shorthand names that folder and warns', { skip }, () => {
+  const root = join(tmpdir(), 'maxstack-seam-probe');
+  const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: root });
+  assertOk(run);
+  assert.ok(run.stdout.split(/\r?\n/).includes(`${root.split('\\').join('/')}/simpsonm09/pstack-claude.git`), run.stdout);
+  assert.match(plainOutput(run), /MAXSTACK_TEST_GITHUB_ROOT is set/, plainOutput(run));
+}, {});
+
+test('with the test-mode flag but a root outside the temp folder, the shorthand names github.com', { skip }, () => {
+  const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: repoRoot });
+  assertOk(run);
+  assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+}, {});
+
+withWorkspace('without the test-mode flag, a -Source owner/repo at a commit is audited against github.com', (ctx) => {
+  const sha = 'a'.repeat(40);
+  const env = { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(ctx.base, 'github') };
+  delete env.MAXSTACK_TEST_MODE;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', ctx.workspace, '-LayersFile', writeLayers(ctx),
+    '-CopilotCommand', ctx.fakeCopilot, '-PiCommand', ctx.fakePi, '-Source', `pstack=simpsonm09/pstack-claude@${sha}`], { encoding: 'utf8', env });
+  assertOk(run);
+  assert.ok(run.stdout.includes(`override, git ${SHORTHAND_URL} ref ${sha} at ${sha}`), run.stdout);
+  assert.ok(!run.stdout.includes(join(ctx.base, 'github')), 'the test root was used');
+}, {});
+
+// Finding 6: a recorded override is checked as a -Source spec is, and a bad value is refused by layer and field.
+const BAD_RECORDS = [
+  ['commit', (block) => { block.commit = 'zz'; }],
+  ['ref', (block) => { block.ref = '--upload-pack=touch x'; }],
+  ['ref', (block) => { block.ref = 'feat..x'; }],
+  ['url', (block) => { block.url = 'ext::sh -c touch x'; }],
+  ['url', (block) => { block.url = 'https://user@github.com/simpsonm09/pstack-claude.git'; }],
+  ['url', (block) => { block.url = 'https://github.com/simpsonm09/pstack claude.git'; }],
+  ['url', (block) => { block.url = 'https://github.com/../x'; }],
+  ['url', (block) => { block.url = 'https://github.com/simpsonm09/pstack-claude.git\n'; }],
+  ['commit', (block) => { block.commit = `${block.commit}\n`; }],
+];
+
+function sourceBlockIn(lock, name) {
+  return lock.layers.find((layer) => layer.name === name).source;
+}
+
+// Round 2, B: an invalid recorded override is a warning for every mode that does not write its layer. A plain apply that
+// would write the layer stops before any write, and names the one command that repairs it.
+withWorkspace('a git override the lock holds with a bad url, ref, or commit is ignored with a warning, and a plain apply refuses it', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const good = readJson(lockPath(ctx));
+  for (const [field, mutate] of BAD_RECORDS) {
+    const lock = structuredClone(good);
+    mutate(sourceBlockIn(lock, 'pstack'));
+    setLock(ctx, lock);
+    const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+    assertOk(status);
+    assert.match(plainOutput(status), new RegExp(`layer 'pstack' has an invalid ${field}`), plainOutput(status));
+    assert.match(status.stdout, /pstack: invalid recorded source, ignored for this run/, status.stdout);
+  }
+  const lock = structuredClone(good);
+  sourceBlockIn(lock, 'pstack').url = 'ext::sh -c touch x';
+  setLock(ctx, lock);
+  const before = snapshotTree(ctx.workspace);
+  const apply = runInstaller(shell, ctx, [], { env: githubEnv(ctx) });
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded url is invalid');
+  assert.match(plainOutput(apply), /layer 'pstack' has an invalid url/, plainOutput(apply));
+  assert.match(plainOutput(apply), /-Source pstack=default -Apply/, plainOutput(apply));
+  assert.deepEqual(snapshotTree(ctx.workspace), before, 'a refused lock changed the install');
+}, {});
+
+withWorkspace('a local override the lock holds with a relative path is ignored by -Status, and a plain apply refuses it', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = 'relative/checkout';
+  setLock(ctx, lock);
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /layer 'simpsonm09-org-ai-plugin' has an invalid path/, plainOutput(status));
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded path is relative');
+  assert.match(plainOutput(apply), /-Source simpsonm09-org-ai-plugin=default -Apply/, plainOutput(apply));
+}, {});
+
+withWorkspace('an invalid recorded override is ignored by -Update, -Remove, and -Uninstall, and -Source name=default -Apply repairs it', (ctx) => {
+  servedFeature(ctx);
+  mustApply(ctx, ['-Source', 'pstack=simpsonm09/pstack-claude@feat'], { env: githubEnv(ctx) });
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'pstack').url = 'ext::sh -c touch x';
+  setLock(ctx, lock);
+  for (const args of [['-Update', '-Check'], ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], ['-Uninstall']]) {
+    const run = runInstaller(shell, ctx, args, { apply: false, env: githubEnv(ctx) });
+    assertOk(run);
+    assert.match(run.stdout, /pstack: invalid recorded source, ignored for this run/, `${args.join(' ')}: ${run.stdout}`);
+  }
+  mustApply(ctx, ['-Source', 'pstack=default']);
+  assert.equal(sourceOf(ctx, 'pstack').source.override, false, 'the repair did not drop the invalid override');
+}, {});
+
+// Finding 7: git never waits on a credential prompt, and ls-remote gives up after its time limit with the reason.
+function runAsync(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(shell, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // A run that never ends is killed, so a failing test cannot leave the process behind.
+    const guard = setTimeout(() => child.kill(), 100000);
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (status) => {
+      clearTimeout(guard);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+test('the git guard sets the prompt variables, and turns on file transport only in a test run', { skip }, () => {
+  const script = `. '${layerSourcesFile}'; $vars = Get-GitChildVariables -Settings (Get-GitGuardSettings); "PROMPT=$($vars.GIT_TERMINAL_PROMPT)"; "GCM=$($vars.GCM_INTERACTIVE)"; (Get-GitGuardSettings | ForEach-Object { "$($_.key)=$($_.value)" }) -join ' '`;
+  const real = { ...process.env };
+  delete real.MAXSTACK_TEST_MODE;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: real });
+  assertOk(run);
+  assert.match(run.stdout, /PROMPT=0/, run.stdout);
+  assert.match(run.stdout, /GCM=never/, run.stdout);
+  assert.match(run.stdout, /core\.fsmonitor= /, run.stdout);
+  assert.match(run.stdout, /core\.askPass= /, run.stdout);
+  assert.match(run.stdout, /protocol\.allow=never/, run.stdout);
+  assert.doesNotMatch(run.stdout, /protocol\.file\.allow/, 'a real run allows file transport');
+
+  const seam = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...real, MAXSTACK_TEST_MODE: '1' } });
+  assert.match(seam.stdout, /protocol\.file\.allow=always/, seam.stdout);
+}, {});
+
+test('an ls-remote that passes its time limit is stopped, and the error says so', { skip, timeout: 120000 }, async () => {
+  // The silent server takes each connection and never answers. The reset a stopped git causes is expected here.
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    const script = `. '${layerSourcesFile}'; Find-GitRefCommit -Url 'https://127.0.0.1:${port}/simpsonm09/pstack-claude.git' -Ref 'main' -TimeoutSeconds 2`;
+    const run = await runAsync(['-NoProfile', '-NonInteractive', '-Command', script], { ...process.env, GIT_TERMINAL_PROMPT: '0' });
+    assert.notEqual(run.status, 0, 'a silent remote was waited for');
+    assert.match(plainOutput(run), /ls-remote took longer than 2 seconds/, plainOutput(run));
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+});
+
+// Finding 8: npm runs with --ignore-scripts, and a layer that declares install scripts or a binding.gyp is named when it runs.
+// The stub org layer's node_modules is taken away, so npm runs for it, and its layer.json names the files the copy keeps.
+function orgNeedingNpm(ctx, { packageJson, files, extra = {} }) {
+  const org = join(ctx.workspace, ORG_SOURCE);
+  rmSync(join(org, 'node_modules'), { recursive: true, force: true });
+  writeFile(org, 'layer.json', JSON.stringify({ files }));
+  writeFile(org, 'package.json', JSON.stringify(packageJson));
+  for (const [rel, content] of Object.entries(extra)) writeFile(org, rel, content);
+}
+
+const ORG_FILES = ['index.ts', 'package.json', 'skills', '.claude-plugin'];
+
+withWorkspace('an apply that runs npm names a layer that declares an install script, since its scripts do not run', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0', scripts: { postinstall: 'node build.js' } }, files: ORG_FILES });
+  const run = mustApply(ctx);
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'simpsonm09-org-ai-plugin': its scripts\.postinstall did not run/, plainOutput(run));
+  assert.doesNotMatch(plainOutput(run), /ignore-scripts for layer 'pstack'/, 'a layer with no install script is named');
+}, NPM);
+
+withWorkspace('an apply that runs npm names a layer that ships a binding.gyp, since its native build does not run', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: [...ORG_FILES, 'binding.gyp'], extra: { 'binding.gyp': '{}\n' } });
+  const run = mustApply(ctx);
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'simpsonm09-org-ai-plugin': its binding\.gyp did not run/, plainOutput(run));
+}, NPM);
+
+withWorkspace('an apply that runs npm on a layer with no install script or binding.gyp prints no ignore-scripts warning', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: ORG_FILES });
+  const run = mustApply(ctx);
+  assert.doesNotMatch(plainOutput(run), /npm ran with --ignore-scripts/, plainOutput(run));
+}, NPM);
+
+// Finding 9: a local source is a checkout of its own only when git's top level is the folder; an ancestor of the workspace
+// would contain it; a long-path prefix and a junction are followed before a path is compared; a comma and a C:\x@ref
+// spec get a clear reason.
+withWorkspace('a plain folder inside another git repository is not a checkout, so no commit of that repository is recorded', (ctx) => {
+  const outer = join(ctx.base, 'outer');
+  writeFile(outer, 'README.md', 'outer\n');
+  gitRun(outer, ['init', '-q']);
+  gitRun(outer, ['add', '-A']);
+  gitRun(outer, ['commit', '-q', '-m', 'outer']);
+  const plain = join(outer, 'plain');
+  writeLayerStub(plain, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${plain}`], { apply: false });
+  assertOk(audit);
+  const text = sourceBlockOf(audit.stdout).lines.join('\n');
+  assert.match(text, /simpsonm09-org-ai-plugin: override, local .*plain \(not a git checkout\)/, text);
+  assert.doesNotMatch(text, /HEAD/, 'the enclosing repository was recorded');
+}, {});
+
+withWorkspace('a local source that contains the workspace is refused, since the layer would hold the installer that reads it', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${ctx.base}`], { apply: false });
+  assert.notEqual(run.status, 0, 'an ancestor of the workspace was accepted');
+  assert.match(plainOutput(run), /is an ancestor of the workspace/, run.stdout);
+}, {});
+
+withWorkspace('a local source reached through a junction, or named with a long-path prefix, is compared by the folder it names', (ctx) => {
+  const toClaude = join(ctx.base, 'to-claude');
+  mkdirSync(join(ctx.workspace, '.claude'), { recursive: true });
+  symlinkSync(join(ctx.workspace, '.claude'), toClaude, 'junction');
+  const viaJunction = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${toClaude}`], { apply: false });
+  assert.notEqual(viaJunction.status, 0, 'a junction into .claude was accepted');
+  assert.match(plainOutput(viaJunction), /is inside \.claude/, viaJunction.stdout);
+
+  const prefixed = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:\\\\?\\${ctx.workspace}`], { apply: false });
+  assert.notEqual(prefixed.status, 0, 'a long-path prefix hid the workspace');
+  assert.match(plainOutput(prefixed), /is the workspace itself/, prefixed.stdout);
+}, {});
+
+withWorkspace('a comma inside a -Source path is refused with the reason, since a comma separates entries', (ctx) => {
+  const folder = join(ctx.base, 'a');
+  mkdirSync(folder);
+  const run = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${folder},b`], { apply: false });
+  assert.notEqual(run.status, 0, 'a path with a comma was accepted');
+  assert.match(plainOutput(run), /comma separates -Source entries, so a path cannot hold one/i, run.stdout);
+}, {});
+
+withWorkspace('a -Source spec that is a folder with an @ref says to use local:', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', 'pstack=C:\\x@main'], { apply: false });
+  assert.notEqual(run.status, 0, 'a folder with an @ref was accepted as a git source');
+  assert.ok(plainOutput(run).includes('did you mean local:C:\\x?'), run.stdout);
+}, {});
+
+// Round 2, A: a recorded local override on a drive that is gone is reported as a missing folder, not a raw drive error.
+function absentDriveLetter() {
+  for (const letter of 'QRSTUVWXYZ') {
+    if (!existsSync(`${letter}:/`)) return letter;
+  }
+  return null;
+}
+
+withWorkspace('a recorded override on a drive that is gone is reported as a missing folder, and -Status, -Update, -Remove, -Uninstall run', (ctx) => {
+  const gone = absentDriveLetter();
+  if (!gone) return;
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = `${gone}:/repo/org`;
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.ok(status.stdout.split('\\').join('/').includes(`${gone}:/repo/org: folder missing`), status.stdout);
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin'], { apply: false }));
+  assertOk(runInstaller(shell, ctx, ['-Uninstall'], { apply: false }));
+
+  const explicit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${gone}:/nope`], { apply: false });
+  assert.notEqual(explicit.status, 0, 'an explicit source on an absent drive was accepted');
+  assert.match(plainOutput(explicit), /folder does not exist/, explicit.stdout);
+}, {});
+
+// Round 2, C: a drive root or a share root is refused as a local source, and its path is kept whole, never cut to "Y:".
+test('the folder helper keeps a drive root whole, with its backslash', { skip }, () => {
+  const driveRoot = parsePath(tmpdir()).root;
+  const script = `. '${layerSourcesFile}'; Get-FullFolderPath '${driveRoot.split('\\').join('/')}'`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+  assertOk(run);
+  assert.equal(run.stdout.trim(), driveRoot, run.stdout);
+}, {});
+
+withWorkspace('a drive root or a share root is refused as a local source, with the reason', (ctx) => {
+  const driveRoot = parsePath(tmpdir()).root;
+  const drive = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${driveRoot}`], { apply: false });
+  assert.notEqual(drive.status, 0, 'a drive root was accepted as a layer source');
+  assert.match(plainOutput(drive), /is a drive or share root, which cannot be a layer source/, drive.stdout);
+
+  const share = runInstaller(shell, ctx, ['-Source', 'simpsonm09-org-ai-plugin=local://server/share'], { apply: false });
+  assert.notEqual(share.status, 0, 'a share root was accepted as a layer source');
+  assert.match(plainOutput(share), /is a drive or share root, which cannot be a layer source/, share.stdout);
+}, {});
+
+// Round 2, D: a clean filter that .git/config names is a program too. An audit of a local tree must run none of it.
+withWorkspace('an audit of a -Source local tree runs no clean filter that its .git/config names', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'filter-marker');
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  gitRun(checkout, ['config', 'filter.mark.clean', `sh -c "touch '${marker.split('\\').join('/')}'; cat"`]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean filter that .git/config names');
+}, {});
+
+// Round 2, E: the installer needs PowerShell 7. Windows PowerShell 5.1 must stop with that requirement, not a parse error.
+const windowsPowerShell = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']).status === 0;
+test('the installer under Windows PowerShell 5.1 stops with the PowerShell 7 requirement, not a parse error', { skip: windowsPowerShell ? false : 'powershell.exe is not available' }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-requires-'));
+  try {
+    const run = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', join(base, 'missing')], { encoding: 'utf8' });
+    const text = plainOutput(run);
+    assert.notEqual(run.status, 0, text);
+    assert.match(text, /#requires.*7\.0/i, text);
+    assert.doesNotMatch(text, /ParserError|Unexpected token|Array index expression/, text);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Round 2, G: a junction under the temp folder that leads outside it does not turn on the test root.
+test('a junction under the temp folder that leads outside it does not turn on the test root', { skip }, () => {
+  const junction = join(tmpdir(), `maxstack-jct-${process.pid}`);
+  symlinkSync(repoRoot, junction, 'junction');
+  try {
+    const run = resolveShorthand({ ...process.env, MAXSTACK_TEST_MODE: '1', MAXSTACK_TEST_GITHUB_ROOT: junction });
+    assertOk(run);
+    assert.equal(run.stdout.trim(), SHORTHAND_URL, run.stdout);
+  } finally {
+    rmdirSync(junction);
+  }
+}, {});
+
+// Round 2, H: the refusal for a missing layer folder names the absolute folder, and the command that fits the mode.
+const ORG_DEFAULT_FOLDER = (ctx) => join(ctx.workspace, 'projects', 'repos', 'simpsonm09-org-ai-plugin');
+
+withWorkspace('a missing default layer folder is refused with its absolute path and no -Source advice', (ctx) => {
+  rmSync(ORG_DEFAULT_FOLDER(ctx), { recursive: true, force: true });
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote past a missing default folder');
+  assert.ok(plainOutput(apply).includes(`has no folder at ${ORG_DEFAULT_FOLDER(ctx)}. Restore the folder, then rerun`), plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /-Source|drop the override/, plainOutput(apply));
+}, {});
+
+withWorkspace('a missing override folder is refused with its absolute path and the -Source repair that applies', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  rmSync(checkout, { recursive: true, force: true });
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote past a missing override folder');
+  assert.ok(plainOutput(apply).includes(`has no folder at ${checkout}. Restore the folder or drop the override with -Source simpsonm09-org-ai-plugin=default -Apply, then rerun`), plainOutput(apply));
+}, {});
+
+withWorkspace('a removal refused for a missing layer folder gives no -Source advice, since -Remove takes no -Source', (ctx) => {
+  mustApply(ctx);
+  rmSync(ORG_DEFAULT_FOLDER(ctx), { recursive: true, force: true });
+  const removed = removal(ctx, ['-Remove', '-Layers', 'simpsonm09-personal-ai-plugin']);
+  assert.notEqual(removed.status, 0, 'a removal rewrote the config without a missing fragment');
+  assert.match(plainOutput(removed), /has no folder at .*Restore the folder, then rerun/, plainOutput(removed));
+  assert.doesNotMatch(plainOutput(removed), /-Source/, plainOutput(removed));
+}, {});
+
+// Round 2, I: after npm runs, the installed dependencies that declare install scripts are counted and named, up to ten.
+withWorkspace('an apply that runs npm counts the installed packages that declare install scripts, and names up to ten', (ctx) => {
+  const names = Array.from({ length: 12 }, (_, index) => `dep-${String(index).padStart(2, '0')}`);
+  names.push('@acme/native');
+  const run = mustApply(ctx, [], { env: { ...ctx.env, FAKE_NPM_SCRIPTED: JSON.stringify(names) } });
+  assert.match(plainOutput(run), /npm ran with --ignore-scripts for layer 'pstack': 13 installed packages declare install scripts or a native build, which did not run: @acme\/native, dep-00.*and 3 more/, plainOutput(run));
+}, NPM);
+
+// Round 2, J: a pipe that a stopped git's child still holds open is not waited on past the bound.
+test('a git output read that never completes returns within its bound, with no output', { skip, timeout: 60000 }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $read = Read-GitPipeBounded -Task $task -Milliseconds 1000; "COMPLETE=$read"`;
+  const started = Date.now();
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 50000 });
+  assertOk(run);
+  assert.ok(Date.now() - started < 40000, 'the read was not bounded');
+  assert.ok(run.stdout.includes('COMPLETE=False'), run.stdout);
+}, {});
+
+// ---- Round 3: the filter guard. A clean command that the tree's config defines writes a marker file when it runs.
+// The fixture runs the command unguarded first, so a marker that is missing after an audit is a result, not a fixture gap.
+const touchAndCat = (marker) => `sh -c "touch '${marker.replace(/\\/g, '/')}'; cat"`;
+
+// Finding 1: the name comes from the config key. A clean command whose path has a dot ended the line the old parser read.
+withWorkspace('an audit of a -Source local tree runs no clean filter whose command has a dot in it', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'dotted-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  gitRun(checkout, ['config', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command that .git/config names');
+}, {});
+
+// Finding 2: the guard passes its settings in the child's environment, so a name is never split at "=", and a name the
+// guard cannot pass makes the tree unreadable, with no filter run. The checkout's clean command writes the marker.
+withWorkspace('an audit of a -Source local tree runs no clean filter whose name holds an equals sign', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'equals-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=a=b\n');
+  gitRun(checkout, ['config', 'filter.a=b.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command whose filter name holds an equals sign');
+}, {});
+
+withWorkspace('a filter name with a control character makes its tree unreadable, and no filter in it runs', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  const marker = join(ctx.base, 'control-marker.txt');
+  writeFile(checkout, '.gitattributes', '*.txt filter=a\x01b\n');
+  gitRun(checkout, ['config', 'filter.a\x01b.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  gitRun(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const status = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /simpsonm09-org-ai-plugin: override, local .*unreadable: .*control character/, plainOutput(status));
+  assert.equal(existsSync(marker), false, 'a tree with an unpassable filter name was read');
+}, {});
+
+withWorkspace('the guard passes its filter settings to git in the child process, and leaves the installer environment as it was', (ctx) => {
+  const tree = join(ctx.base, 'tree');
+  mkdirSync(tree);
+  gitRun(tree, ['init', '-q']);
+  gitRun(tree, ['config', 'filter.a=b.clean', 'touch x']);
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'status', '--porcelain'); "CODE=$($run.code)"; "LEFT=[$env:GIT_CONFIG_COUNT]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /CODE=0/, run.stdout);
+  assert.match(run.stdout, /LEFT=\[\]/, 'the guard left its settings in the installer environment');
+}, {});
+
+// Finding 3: a tree that names more than 100 filter drivers is unreadable, and every run reports it. Nothing throws.
+function manyFilters(count) {
+  return Array.from({ length: count }, (_, index) => `[filter "f${index}"]\n\tclean = false\n`).join('');
+}
+
+withWorkspace('a tree that names more than 100 filter drivers is reported as unreadable by -Status, -Update, and an audit', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  appendFileSync(join(checkout, '.git', 'config'), manyFilters(400));
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /simpsonm09-org-ai-plugin: override, local .*unreadable: too many filter drivers/, plainOutput(status));
+  assertOk(runInstaller(shell, ctx, ['-Update', '-Check'], { apply: false }));
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /unreadable: too many filter drivers/, plainOutput(audit));
+}, {});
+
+withWorkspace('a tree that names exactly 100 filter drivers is still read', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  gitRun(checkout, ['init', '-q']);
+  gitRun(checkout, ['add', '-A']);
+  gitRun(checkout, ['commit', '-q', '-m', 'layer']);
+  appendFileSync(join(checkout, '.git', 'config'), manyFilters(100));
+  // The user's global config may name filters of its own, such as git-lfs, so the count is taken with an empty global config.
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env: homeEnv(join(ctx.base, 'empty-home')) });
+  assertOk(audit);
+  assert.doesNotMatch(plainOutput(audit), /unreadable/, plainOutput(audit));
+  assert.match(plainOutput(audit), /simpsonm09-org-ai-plugin: override, local .*HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
+// Finding 3: a git failure inside the checkout probe is reported as an unreadable layer. Set-LayerChoice must not throw,
+// since a throw there would stop -Status, -Update, and -Remove.
+test('a checkout probe that throws is reported as unreadable, and Set-LayerChoice does not throw', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { throw 'simulated git failure' }; $state = Get-LocalCheckoutState -Root $env:TEMP; "STATE=[$($state.unreadable)]"; $layer = @{ name = 'x'; sourcePath = '.'; root = $null; override = $false }; $choice = [pscustomobject]@{ kind = 'local'; url = $null; ref = $null; commit = $null; path = $env:TEMP; checkout = $env:TEMP; override = $true }; Set-LayerChoice -Layer $layer -Choice $choice; "LAYER=[$($layer.unreadable)]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /STATE=\[the checkout could not be read: simulated git failure\]/, run.stdout);
+  assert.match(run.stdout, /LAYER=\[the checkout could not be read: simulated git failure\]/, run.stdout);
+}, {});
+
+// Finding 4: the guard turns off only the filters the tree itself defines: its own config, what its includes add, its per-worktree
+// config, and the names its attributes files use. The user's global and system filters run, as they do in any checkout.
+function runGit(dir, args, env = process.env) {
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8', env });
+  assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
+  return run.stdout.trim();
+}
+
+// The environment whose HOME holds a .gitconfig with the given settings, which is the user's global config. The installer's git
+// children read the global config from HOME, unless the caller sets GIT_CONFIG_GLOBAL to another file. XDG and the system config
+// are off, so the only global config is this one.
+function homeEnv(home, settings = []) {
+  mkdirSync(home, { recursive: true });
+  const file = join(home, '.gitconfig');
+  writeFileSync(file, '');
+  for (const [key, value] of settings) runGit(home, ['config', '-f', file, key, value]);
+  return { ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+// The environment with a user global config that holds one setting. The file is outside the checkout.
+function globalGitEnv(ctx, key, value) {
+  return homeEnv(join(ctx.base, 'home'), [[key, value]]);
+}
+
+// A local checkout with one committed file, and a .gitattributes that names the mark filter on text files.
+function markedCheckoutWithCommit(ctx) {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  return checkout;
+}
+
+withWorkspace('a checkout runs the smudge filter that the user global config defines, since the guard turns off only the tree filters', (ctx) => {
+  const source = join(ctx.base, 'source');
+  writeFile(source, '.gitattributes', '*.txt filter=up\n');
+  writeFile(source, 'a.txt', 'hello\n');
+  runGit(source, ['init', '-q']);
+  runGit(source, ['add', '-A']);
+  runGit(source, ['commit', '-q', '-m', 'source']);
+  const env = globalGitEnv(ctx, 'filter.up.smudge', 'tr a-z A-Z');
+  const target = join(ctx.base, 'target');
+  runGit(ctx.base, ['clone', '-q', '--no-checkout', source, target], env);
+
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $target = '${target.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $target -Arguments @('-C', $target, 'checkout', '--quiet', '-f', 'HEAD'); "CODE=$($run.code)"`;
+  const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment(env) });
+  assertOk(guarded);
+  assert.match(guarded.stdout, /CODE=0/, guarded.stdout);
+  assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'HELLO\n', 'the guarded checkout did not run the global smudge filter');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree reaches through an include in its own config', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'include-marker.txt');
+  const included = join(ctx.base, 'included.cfg');
+  runGit(ctx.base, ['config', '-f', included, 'filter.mark.clean', touchAndCat(marker)]);
+  runGit(checkout, ['config', 'include.path', included.replace(/\\/g, '/')]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the included clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that an include in the tree config defines');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree defines in its per-worktree config', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'worktree-marker.txt');
+  runGit(checkout, ['config', 'extensions.worktreeConfig', 'true']);
+  runGit(checkout, ['config', '--worktree', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the per-worktree clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command from the per-worktree config');
+}, {});
+
+withWorkspace('an audit turns off the filter that .git/info/attributes names when the tree config defines it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-marker.txt');
+  runGit(checkout, ['config', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command named by .git/info/attributes');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit runs no global filter that only the tree attributes name, since the tree defines none', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.gitattributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'global-marker.txt');
+  const env = globalGitEnv(ctx, 'filter.mark.clean', touchAndCat(marker));
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt'], env);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the global clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command that only the in-tree attributes name');
+}, {});
+
+// Finding 1: the guard reads git's UTF-8 output as UTF-8. A filter name or a folder with non-ASCII text is read whole.
+// The name rule is tested through .git/info/attributes, which git reads whatever the tree holds.
+// Moves a file's mtime a minute ahead, so git cannot take the index's stat as still matching and must read the content.
+// Without it a file committed in the same moment reads as unchanged, and whether a filter runs depends on the clock.
+function bumpMtime(path) {
+  const later = new Date(Date.now() + 60000);
+  utimesSync(path, later, later);
+}
+
+function infoAttributesCheckout(ctx, { dir = 'org-checkout', attributes, filters, edit = true, env = undefined }) {
+  const checkout = join(ctx.base, ...dir.split('/'));
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, '.git/info/attributes', attributes);
+  for (const [name, command] of filters) runGit(checkout, ['config', `filter.${name}.clean`, command]);
+  if (edit) {
+    // A same-size edit, so git must run the clean filter to see it.
+    writeFile(checkout, 'notes.txt', 'two\n');
+    runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt'], env);
+  }
+  bumpMtime(join(checkout, 'notes.txt'));
+  return checkout;
+}
+
+for (const [label, name] of [['a non-ASCII name', 'é'], ['a CJK name', '日本']]) {
+  withWorkspace(`an audit runs no clean filter named by ${label} in .git/info/attributes`, (ctx) => {
+    const marker = join(ctx.base, 'utf8-marker.txt');
+    const checkout = infoAttributesCheckout(ctx, { attributes: `*.txt filter=${name}\n`, filters: [[name, touchAndCat(marker)]] });
+    assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+    rmSync(marker);
+
+    const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+    assertOk(audit);
+    assert.equal(existsSync(marker), false, `the audit ran the clean command of the filter named ${name}`);
+  }, {});
+}
+
+withWorkspace('a checkout under a non-ASCII folder is read as a checkout, with its HEAD and dirty state', (ctx) => {
+  const checkout = infoAttributesCheckout(ctx, { dir: '日本語/org-checkout', attributes: '', filters: [] });
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+test('a non-ASCII setting reaches git intact, and a filter name git prints comes back as the same text', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-utf8-'));
+  try {
+    const tree = join(base, 'tree');
+    mkdirSync(tree);
+    runGit(tree, ['init', '-q']);
+    runGit(tree, ['config', 'filter.é.clean', 'x']);
+    runGit(tree, ['config', 'filter.日本.clean', 'x']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $names = @((Read-TreeFilterNames -Dir $tree).names); $probe = @([pscustomobject]@{ key = 'maxstack.probe'; value = '日本é' }); $run = Invoke-GitProcess -Arguments @('config', '--get', 'maxstack.probe') -Settings $probe; "NAMES has_e=$($names -contains 'é') has_cjk=$($names -contains '日本') count=$($names.Count)"; "ENV code=$($run.code) same=$($run.stdout[0] -ceq '日本é')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /NAMES has_e=True has_cjk=True count=2/, run.stdout);
+    assert.match(run.stdout, /ENV code=0 same=True/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Finding 2: an empty filter name is a name. git accepts filter..clean (a subsection that is empty), so the guard turns it off.
+withWorkspace('an audit runs no clean filter whose name is empty, which .git/config names as [filter ""]', (ctx) => {
+  const marker = join(ctx.base, 'empty-name-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=\n', filters: [['', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the empty-named clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of the empty-named filter');
+}, {});
+
+test('the driver name of filter..clean is the empty name, and the guard passes it to git', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $name = Get-FilterDriverName 'filter..clean'; "NAME=[$name] IS_NULL=$($null -eq $name)"; $settings = @(Get-GitGuardSettings -FilterNames @($name)) | ForEach-Object { $_.key }; "HAS=$($settings -contains 'filter..clean')"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /NAME=\[\] IS_NULL=False/, run.stdout);
+  assert.match(run.stdout, /HAS=True/, run.stdout);
+}, {});
+
+// Finding 3: git status spawns a status inside each populated submodule, and that status reads the submodule's own config.
+// The superproject's guard names only the superproject's filters, so the local status must not look inside a submodule.
+withWorkspace('an audit runs no filter that a populated submodule names in its own config', (ctx) => {
+  const source = join(ctx.base, 'sub-source');
+  writeFile(source, 'a.txt', 'one\n');
+  runGit(source, ['init', '-q']);
+  runGit(source, ['add', '-A']);
+  runGit(source, ['commit', '-q', '-m', 'sub']);
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  runGit(checkout, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', source, 'sub']);
+  runGit(checkout, ['commit', '-q', '-m', 'add submodule']);
+  const sub = join(checkout, 'sub');
+  const marker = join(ctx.base, 'submodule-marker.txt');
+  runGit(sub, ['config', 'filter.subm.clean', touchAndCat(marker)]);
+  writeFile(checkout, '.git/modules/sub/info/attributes', '*.txt filter=subm\n');
+  // The checkout is CRLF under core.autocrlf, so the edit keeps the byte length: git must hash the file, not compare sizes.
+  const subFile = join(sub, 'a.txt');
+  writeFileSync(subFile, readFileSync(subFile, 'utf8').replace('one', 'two'));
+  runGit(checkout, ['-c', 'protocol.file.allow=always', 'status', '--porcelain']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the submodule clean command when the status was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that a populated submodule names in its own config');
+}, {});
+
+// Finding 4: a status of a local tree turns off every filter name that any config scope defines, the user's global config
+// included, and it reads the tree's own attributes. So a global filter that the tree names runs in neither case, and writes
+// nothing into the tree. touchAndCatInTree records its run in the marker and writes a file inside the tree, as git-lfs does.
+const touchAndCatInTree = (marker, file) => `sh -c "touch '${marker.replace(/\\/g, '/')}' '${file.replace(/\\/g, '/')}'; cat"`;
+
+withWorkspace('a status runs no global filter that .git/info/attributes names, and writes nothing into the tree', (ctx) => {
+  const marker = join(ctx.base, 'global-marker.txt');
+  const written = join(ctx.base, 'org-checkout', '.git', 'lfs-written.txt');
+  const env = globalGitEnv(ctx, 'filter.lfs.clean', touchAndCatInTree(marker, written));
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=lfs\n', filters: [], env });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the global clean command when git was not guarded');
+  rmSync(marker);
+  rmSync(written);
+  const before = snapshotTree(checkout);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command that the tree attributes name');
+  assert.equal(existsSync(written), false, 'the audit wrote a file into the tree');
+  assert.deepEqual(snapshotTree(checkout), before, 'the audit changed the tree');
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('a clean tree whose .git/info/attributes names a global filter reports clean, and runs no filter', (ctx) => {
+  const marker = join(ctx.base, 'clean-global-marker.txt');
+  const env = globalGitEnv(ctx, 'filter.lfs.clean', touchAndCat(marker));
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=lfs\n', filters: [], edit: false, env });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command on a tree with no change');
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('a changed file makes a local tree read as uncommitted changes', (ctx) => {
+  const checkout = infoAttributesCheckout(ctx, { attributes: '', filters: [] });
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('an eol=crlf file that is unchanged reads as clean, since the status reads the tree attributes', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, '.gitattributes', '*.ps1 text eol=crlf\n');
+  writeFile(checkout, 'tool.ps1', 'one\r\ntwo\r\n');
+  runGit(checkout, ['init', '-q']);
+  // The system config may set core.autocrlf, which would convert the CRLF file on its own. Off, only the attributes can match it.
+  runGit(checkout, ['config', 'core.autocrlf', 'false']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  bumpMtime(join(checkout, 'tool.ps1'));
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, clean\)/, plainOutput(audit));
+}, {});
+
+// Finding 5: a git command that names no tree runs in a fresh empty folder, so the config of the folder the installer runs in
+// does not reach it. That config below rewrites the url of the remote, so a ref lookup must not read the other remote.
+function bareRepoWithCommit(base, name, text) {
+  const work = join(base, `${name}-work`);
+  writeFile(work, 'a.txt', text);
+  runGit(work, ['init', '-q', '-b', 'main']);
+  runGit(work, ['add', '-A']);
+  runGit(work, ['commit', '-q', '-m', text]);
+  const bare = join(base, `${name}.git`);
+  runGit(base, ['clone', '-q', '--bare', work, bare]);
+  return bare;
+}
+
+withWorkspace('a ref lookup reads the remote it names, not the one a config in the folder it runs from rewrites it to', (ctx) => {
+  const remote = bareRepoWithCommit(ctx.base, 'remote', 'the remote');
+  const other = bareRepoWithCommit(ctx.base, 'other', 'the other remote');
+  const remoteSha = runGit(remote, ['rev-parse', 'main']);
+  const otherSha = runGit(other, ['rev-parse', 'main']);
+  const evil = join(ctx.base, 'evil');
+  mkdirSync(evil);
+  runGit(evil, ['init', '-q']);
+  runGit(evil, ['config', `url.${other.replace(/\\/g, '/')}.insteadOf`, remote.replace(/\\/g, '/')]);
+
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, new RegExp(`REF=${remoteSha}`), run.stdout);
+  assert.notEqual(otherSha, remoteSha);
+  assert.doesNotMatch(run.stdout, new RegExp(otherSha), 'the ref lookup read the remote that the folder config rewrote it to');
+}, {});
+
+test('a git command that names no tree runs outside every repository, so the folder it runs from is not read', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-neutral-'));
+  try {
+    const evil = join(base, 'evil');
+    mkdirSync(evil);
+    runGit(evil, ['init', '-q']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('rev-parse', '--is-inside-work-tree'); "CODE=$($run.code)"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+    assertOk(run);
+    assert.doesNotMatch(run.stdout, /CODE=0/, 'a command that names no tree ran inside the repository of the folder it started from');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Finding 6: git takes its repository, its worktree, and its settings from variables the installer inherits. The guard removes
+// the variables that name a repository, a config, or a program from each child, and leaves the installer's own environment alone.
+function committedRepo(base, name, text) {
+  const dir = join(base, name);
+  writeFile(dir, 'a.txt', text);
+  runGit(dir, ['init', '-q']);
+  runGit(dir, ['add', '-A']);
+  runGit(dir, ['commit', '-q', '-m', text]);
+  return dir;
+}
+
+function checkoutStateScript(root) {
+  return `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $state = Get-LocalCheckoutState -Root '${root.replace(/\\/g, '/')}'; "COMMIT=$($state.commit) DIRTY=$($state.dirty) UNREADABLE=$($state.unreadable)"`;
+}
+
+test('a checkout state reads its own HEAD, not the HEAD of the repository that GIT_DIR names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-gitdir-'));
+  try {
+    const mine = committedRepo(base, 'mine', 'mine\n');
+    const other = committedRepo(base, 'other', 'other\n');
+    const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
+    const env = { ...testEnvironment(), GIT_DIR: join(other, '.git') };
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} `), run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+test('a checkout state reads its own worktree, not the worktree that GIT_WORK_TREE names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-worktree-'));
+  try {
+    const mine = committedRepo(base, 'mine', 'mine\n');
+    writeFile(mine, 'a.txt', 'changed\n');
+    const clean = committedRepo(base, 'clean', 'clean\n');
+    const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
+    const env = { ...testEnvironment(), GIT_WORK_TREE: clean };
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} DIRTY=True `), run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+withWorkspace('an audit runs no core.fsmonitor that the installer environment names in GIT_CONFIG_PARAMETERS', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  const marker = join(ctx.base, 'params-marker.txt');
+  const command = `sh -c "touch ${marker.replace(/\\/g, '/')}"`;
+  const env = { ...process.env, GIT_CONFIG_PARAMETERS: `'core.fsmonitor'='${command}'` };
+  runGit(checkout, ['status', '--porcelain'], env);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the fsmonitor command that GIT_CONFIG_PARAMETERS names');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the fsmonitor command that GIT_CONFIG_PARAMETERS names');
+}, {});
+
+test('the child environment loses each inherited git variable that names a repository, config, or program, and keeps the rest', { skip }, () => {
+  const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF',
+    'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR',
+    'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'];
+  // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_NOSYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+// Round 5, finding 2: GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are not scrubbed. A user who moved the global config with GIT_CONFIG_GLOBAL
+// keeps the credential helper it names, and the guard reads the same file that the status does.
+test('the child environment keeps GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM, which name the config git reads', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); $child['GIT_CONFIG_GLOBAL'] = 'x'; $child['GIT_CONFIG_SYSTEM'] = 'x'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_GLOBAL,GIT_CONFIG_SYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+// Round 5, finding 3: GIT_ALLOW_PROTOCOL overrides protocol.allow, so a child that inherits it would run a transport the guard refuses.
+// This run is not a test run, so the file transport is refused by the guard, and the inherited variable must not allow it.
+test('a guarded ls-remote over file transport is refused in a real run, even when the installer environment allows file', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-protocol-'));
+  try {
+    const remote = bareRepoWithCommit(base, 'remote', 'the remote');
+    const env = { ...process.env, GIT_ALLOW_PROTOCOL: 'file' };
+    delete env.MAXSTACK_TEST_MODE;
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('ls-remote', '--', 'file:///${remote.replace(/\\/g, '/')}'); "CODE=$($run.code) ERR=$(@($run.stderr) -join ' ')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env });
+    assertOk(run);
+    assert.doesNotMatch(run.stdout, /CODE=0 /, 'the guard read a file remote, because GIT_ALLOW_PROTOCOL allowed the transport');
+    assert.match(run.stdout, /CODE=128 .*not allowed/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Round 5, finding 5: git never prompts for a credential, and runs no askpass program. The guard sets core.askPass to the empty string,
+// which overrides the global value, and the child loses GIT_ASKPASS and SSH_ASKPASS. The askpass program writes a marker when it runs.
+test('a guarded credential fill runs no askpass program that the global config names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-askpass-'));
+  try {
+    const marker = join(base, 'askpass-marker.txt');
+    // git runs core.askPass as a program, not through a shell, so the program is a script that writes the marker and answers.
+    const askpassScript = join(base, 'askpass.sh');
+    writeFileSync(askpassScript, `#!/bin/sh\ntouch '${marker.replace(/\\/g, '/')}'\necho x\n`);
+    const env = homeEnv(join(base, 'home'), [['core.askPass', askpassScript.replace(/\\/g, '/')]]);
+    const input = 'protocol=https\nhost=example.invalid\n\n';
+    // The fixture runs git with prompts on, so the askpass program runs, and a marker that is missing after the guard is a result.
+    const fixture = spawnSync('git', ['credential', 'fill'], { windowsHide: true, input, encoding: 'utf8', env: { ...env, GIT_TERMINAL_PROMPT: '1' } });
+    assert.equal(existsSync(marker), true, `the fixture did not run the askpass program when git was not guarded: ${fixture.stderr}`);
+    rmSync(marker);
+
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('credential', 'fill'); "CODE=$($run.code)"`;
+    const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, input, encoding: 'utf8', env: testEnvironment(env) });
+    assertOk(guarded);
+    assert.equal(existsSync(marker), false, 'the guarded credential fill ran the askpass program that core.askPass names');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+test('a guarded command reads the global config that GIT_CONFIG_GLOBAL names, and its credential helper', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-global-'));
+  try {
+    const home = join(base, 'home');
+    const env = homeEnv(home);
+    const relocated = join(base, 'relocated.gitconfig');
+    runGit(base, ['config', '-f', relocated, 'credential.helper', 'relocated-helper']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('config', '--get', 'credential.helper'); "CODE=$($run.code) VALUE=$(@($run.stdout) -join ',')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment({ ...env, GIT_CONFIG_GLOBAL: relocated.replace(/\\/g, '/') }) });
+    assertOk(run);
+    assert.match(run.stdout, /CODE=0 VALUE=relocated-helper/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Finding 7: the older filter fixtures again, with the attribute line in .git/info/attributes, so the name rule is what runs.
+withWorkspace('an audit runs no clean filter whose command has a dot in it, when .git/info/attributes names it', (ctx) => {
+  const marker = join(ctx.base, 'info-dotted-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=mark\n', filters: [['mark', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command with a dot in it, named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit runs no clean filter whose name holds an equals sign, when .git/info/attributes names it', (ctx) => {
+  const marker = join(ctx.base, 'info-equals-marker.txt');
+  const checkout = infoAttributesCheckout(ctx, { attributes: '*.txt filter=a=b\n', filters: [['a=b', touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command whose name holds an equals sign, named by .git/info/attributes');
+}, {});
+
+withWorkspace('an audit turns off a filter that the tree reaches through an include, when .git/info/attributes names it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-include-marker.txt');
+  const included = join(ctx.base, 'info-included.cfg');
+  runGit(ctx.base, ['config', '-f', included, 'filter.mark.clean', touchAndCat(marker)]);
+  runGit(checkout, ['config', 'include.path', included.replace(/\\/g, '/')]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the included clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command that an include in the tree config defines');
+}, {});
+
+withWorkspace('an audit turns off a filter in the per-worktree config, when .git/info/attributes names it', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  writeFile(checkout, '.git/info/attributes', '*.txt filter=mark\n');
+  const marker = join(ctx.base, 'info-worktree-marker.txt');
+  runGit(checkout, ['config', 'extensions.worktreeConfig', 'true']);
+  runGit(checkout, ['config', '--worktree', 'filter.mark.clean', touchAndCat(marker)]);
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  assert.equal(existsSync(marker), true, 'the fixture did not run the per-worktree clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a clean command from the per-worktree config, named by .git/info/attributes');
+}, {});
+
+// Finding 7: the guard turns off core.hooksPath too. A commit the guard runs must not run the hook the tree names.
+test('a commit the guard runs runs no hook that the tree names in core.hooksPath', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-hooks-'));
+  try {
+    const tree = join(base, 'tree');
+    mkdirSync(tree);
+    runGit(tree, ['init', '-q']);
+    const marker = join(base, 'hook-marker.txt');
+    const hooks = join(base, 'hooks');
+    writeFile(base, 'hooks/pre-commit', `#!/bin/sh\ntouch '${marker.replace(/\\/g, '/')}'\n`);
+    runGit(tree, ['config', 'core.hooksPath', hooks.replace(/\\/g, '/')]);
+    runGit(tree, ['commit', '-q', '--allow-empty', '-m', 'fixture']);
+    assert.equal(existsSync(marker), true, 'the fixture did not run the hook when git was not guarded');
+    rmSync(marker);
+
+    const env = { ...testEnvironment(), GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'commit', '-q', '--allow-empty', '-m', 'guarded'); "CODE=$($run.code)"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.match(run.stdout, /CODE=0/, run.stdout);
+    assert.equal(existsSync(marker), false, 'the guarded commit ran the hook that core.hooksPath names');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Finding 8: a tree whose config git cannot parse is not "not a repository". git stops with a parse error, so it is unreadable.
+withWorkspace('a tree whose config git cannot parse is reported unreadable, not as a folder that is not a checkout', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const broken = join(ctx.base, 'bad.cfg');
+  writeFileSync(broken, '[broken\n');
+  runGit(checkout, ['config', 'include.path', broken.replace(/\\/g, '/')]);
+  const fixture = spawnSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  assert.notEqual(fixture.status, 0, 'the fixture config parsed, so the tree is not broken');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: config cannot be read/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+  assert.notEqual(runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]).status, 0, 'an apply wrote a layer from a tree whose config it cannot read');
+}, {});
+
+// Finding 9: a filter name the guard cannot pass is refused as too long, with the reason, and never read as "not a checkout".
+withWorkspace('a filter name of 33000 characters makes its tree unreadable as too long, and the tree is not read as a non-checkout', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  appendFileSync(join(checkout, '.git', 'config'), `[filter "${'a'.repeat(33000)}"]\n\tclean = x\n`);
+  const fixture = spawnSync('git', ['-C', checkout, 'status', '--porcelain'], { encoding: 'utf8' });
+  assert.equal(fixture.status, 0, 'the fixture config does not parse for git, so the case is not the name length');
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: filter name too long/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+}, {});
+
+withWorkspace('filter names that together need more environment than git can take make the tree unreadable as too long', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const lines = Array.from({ length: 100 }, (_, index) => `[filter "n${index}-${'x'.repeat(1000)}"]\n\tclean = x\n`).join('');
+  appendFileSync(join(checkout, '.git', 'config'), lines);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: filter name too long/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /org-checkout \(not a git checkout\)/, plainOutput(audit));
+}, {});
+
+test('a cut-off read of the tree config is unreadable, not a list with no filter names', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitProcess { param($Arguments, $Settings, $TimeoutSeconds = 0, $WorkingDirectory = '', $CeilingDirectory = '') [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = (@($Arguments) -contains 'config') } }; $info = Read-TreeFilterNames -Dir 'C:/nowhere'; "FAULT=[$($info.fault)]"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /FAULT=\[.*cut off/, run.stdout);
+}, {});
+
+// Finding 10: core.fsmonitor is off with the empty string, which git reads as no monitor on every version. On git 2.31 to 2.35
+// "false" is read as a path, so the value that means off is the empty string.
+test('the guard turns core.fsmonitor off with the empty string, which no git version reads as a path', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $setting = Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }; "FSM=[$($setting.value)] COUNT=$(@(Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }).Count)"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /FSM=\[\] COUNT=1/, run.stdout);
+}, {});
+
+// Finding 11: the eol attributes that the status now reads must not hide a real change. A changed eol=crlf file is dirty.
+withWorkspace('a changed eol=crlf file reads as uncommitted changes, so the tree attributes do not hide an edit', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, '.gitattributes', '*.ps1 text eol=crlf\n');
+  writeFile(checkout, 'tool.ps1', 'one\r\ntwo\r\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['config', 'core.autocrlf', 'false']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  writeFile(checkout, 'tool.ps1', 'one\r\nthree\r\n');
+  bumpMtime(join(checkout, 'tool.ps1'));
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /HEAD [0-9a-f]{40}, uncommitted changes\)/, plainOutput(audit));
+}, {});
+
+// Finding 5: the scan of the packages npm installed is a warning only. A folder it cannot read must not stop an apply after the
+// plugin folder is replaced and before the lock is written.
+withWorkspace('an apply whose npm scan cannot read a scoped folder still writes its lock, with no ignore-scripts warning', (ctx) => {
+  orgNeedingNpm(ctx, { packageJson: { name: 'simpsonm09-org-ai-plugin', version: '0.1.0' }, files: ORG_FILES });
+  const run = mustApply(ctx, [], { env: { ...ctx.env, FAKE_NPM_BROKEN_SCOPE: '1' } });
+  assert.doesNotMatch(plainOutput(run), /ignore-scripts/, plainOutput(run));
+  assert.ok(existsSync(lockPath(ctx)), 'the apply stopped before the lock was written');
+}, NPM);
+
+// Finding 6: a long-path prefix is dropped only from a drive path. \\?\UNC\server\share names a share, and stays one.
+withWorkspace('a long-path UNC share is refused as a share root, not read as a folder under the current directory', (ctx) => {
+  const run = runInstaller(shell, ctx, ['-Source', 'simpsonm09-org-ai-plugin=local:\\\\?\\UNC\\server\\share'], { apply: false });
+  assert.notEqual(run.status, 0, 'a long-path UNC share was accepted as a layer source');
+  assert.match(plainOutput(run), /is a drive or share root, which cannot be a layer source/, run.stdout);
+}, {});
+
+// A SHA-256 repository reads its HEAD and its dirty state like a SHA-1 one: the status names no SHA-1 object.
+withWorkspace('a SHA-256 checkout reads its HEAD and dirty state', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q', '--object-format=sha256']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*HEAD [0-9a-f]{64}, clean\)/, plainOutput(audit));
+}, {});
+
+// Finding 9: a recorded fault already ends in a period, so the warning and the refusal join it with a space, not a second period.
+withWorkspace('a recorded override with a relative path is warned and refused with one period after the reason', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  mustApply(ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  const lock = readJson(lockPath(ctx));
+  sourceBlockIn(lock, 'simpsonm09-org-ai-plugin').path = 'relative/checkout';
+  setLock(ctx, lock);
+
+  const status = runInstaller(shell, ctx, ['-Status'], { apply: false });
+  assertOk(status);
+  assert.match(plainOutput(status), /has an invalid path: needs an absolute path\. This run ignores/, plainOutput(status));
+  assert.doesNotMatch(plainOutput(status), /absolute path\.\./, plainOutput(status));
+
+  const apply = runInstaller(shell, ctx, []);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer whose recorded path is relative');
+  assert.match(plainOutput(apply), /has an invalid path: needs an absolute path\. Repair it with/, plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /absolute path\.\./, plainOutput(apply));
+}, {});
+
+// Finding 10: git that exits 0 while a grandchild holds its output open gives an incomplete read. That is a cut-off output,
+// not a result, so the ref lookup says so instead of "no branch or tag named".
+test('a ref lookup whose git output was cut off says so, and does not report a missing ref', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = $true } }; try { Find-GitRefCommit -Url 'https://example.com/team/layer.git' -Ref 'main' } catch { "ERR=$($_.Exception.Message)" }`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /ERR=.*git output was cut off/, run.stdout);
+  assert.doesNotMatch(run.stdout, /no branch or tag named/, run.stdout);
+}, {});
+
+// ---- Round 5, finding 1: git's output is read as bytes and decoded strictly. A filter name that is not valid UTF-8 cannot be
+// written as a string, so the config and attribute bytes are written as a Buffer. The guard must refuse that tree, since a name it
+// cannot read back exactly is a filter it cannot turn off.
+const INVALID_NAME = Buffer.from([0xff]);
+
+// A [filter] section whose subsection name is the given bytes, with a clean command. The value is quoted as a whole, since an
+// unquoted ";" starts a comment, and its quotes and backslashes are escaped, so git reads the command that is given.
+function rawFilterSection(nameBytes, command) {
+  const value = `"${command.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return Buffer.concat([Buffer.from('[filter "'), nameBytes, Buffer.from(`"]\n\tclean = ${value}\n`)]);
+}
+
+// A local checkout whose .git/config defines a filter by raw name bytes, and whose attributes name it in the file given. A committed
+// .gitattributes is committed before the filter is defined. A same-size edit makes git run the clean command when it reads the file.
+function rawNameCheckout(ctx, { attributesFile, attributes, nameBytes, command }) {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q']);
+  writeFile(checkout, 'notes.txt', 'one\n');
+  writeFile(checkout, attributesFile, attributes);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  appendFileSync(join(checkout, '.git', 'config'), rawFilterSection(nameBytes, command));
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  bumpMtime(join(checkout, 'notes.txt'));
+  return checkout;
+}
+
+// The attribute line "<prefix>filter=<invalid byte>", as bytes.
+const invalidAttributes = (prefix) => Buffer.concat([Buffer.from(`${prefix}filter=`), INVALID_NAME, Buffer.from('\n')]);
+
+withWorkspace('an audit turns off no filter whose name is not valid UTF-8 in .git/info/attributes, and reports the tree unreadable', (ctx) => {
+  const marker = join(ctx.base, 'invalid-name-info-marker.txt');
+  const checkout = rawNameCheckout(ctx, { attributesFile: '.git/info/attributes', attributes: invalidAttributes('*.txt '), nameBytes: INVALID_NAME, command: touchAndCat(marker) });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of a filter whose name is not valid UTF-8');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer from a tree with a filter name that is not valid UTF-8');
+  assert.match(plainOutput(apply), /cannot be read at .*: a filter driver name is not valid UTF-8/, plainOutput(apply));
+  assert.equal(existsSync(marker), false, 'the apply ran the clean command of a filter whose name is not valid UTF-8');
+}, {});
+
+withWorkspace('an audit turns off no filter whose name is not valid UTF-8 in a committed .gitattributes, and reports the tree unreadable', (ctx) => {
+  const marker = join(ctx.base, 'invalid-name-tracked-marker.txt');
+  const checkout = rawNameCheckout(ctx, { attributesFile: '.gitattributes', attributes: invalidAttributes('*.txt '), nameBytes: INVALID_NAME, command: touchAndCat(marker) });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of a filter named by a committed .gitattributes');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+}, {});
+
+test('a checkout state whose filter name is not valid UTF-8 is unreadable, with no commit, and runs no filter', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-invalid-name-'));
+  try {
+    const marker = join(base, 'state-marker.txt');
+    const checkout = join(base, 'tree');
+    mkdirSync(checkout);
+    runGit(checkout, ['init', '-q']);
+    writeFile(checkout, 'notes.txt', 'one\n');
+    writeFile(checkout, '.gitattributes', invalidAttributes('*.txt '));
+    runGit(checkout, ['add', '-A']);
+    runGit(checkout, ['commit', '-q', '-m', 'tree']);
+    appendFileSync(join(checkout, '.git', 'config'), rawFilterSection(INVALID_NAME, touchAndCat(marker)));
+    writeFile(checkout, 'notes.txt', 'two\n');
+    bumpMtime(join(checkout, 'notes.txt'));
+
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(checkout)], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /COMMIT= DIRTY= UNREADABLE=a filter driver name is not valid UTF-8/, run.stdout);
+    assert.equal(existsSync(marker), false, 'the checkout state ran the clean command of a filter whose name is not valid UTF-8');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+withWorkspace('a global filter name that is not valid UTF-8 makes a local status report the tree unreadable, and runs no filter', (ctx) => {
+  const home = join(ctx.base, 'home');
+  const env = homeEnv(home);
+  const marker = join(ctx.base, 'global-invalid-marker.txt');
+  appendFileSync(join(home, '.gitconfig'), rawFilterSection(INVALID_NAME, touchAndCat(marker)));
+  const checkout = markedCheckoutWithCommit(ctx);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command whose name is not valid UTF-8');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+}, {});
+
+// A name that is valid UTF-8 is disabled whatever its script: an astral-plane character is one name, two UTF-16 units in .NET.
+withWorkspace('an audit runs no clean filter named by an astral-plane name in .git/info/attributes', (ctx) => {
+  const marker = join(ctx.base, 'utf8-astral-marker.txt');
+  const name = '\u{1F600}';
+  const checkout = infoAttributesCheckout(ctx, { attributes: `*.txt filter=${name}\n`, filters: [[name, touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of the astral-plane filter');
+}, {});
+
+// A ref name is read strictly too: a name that is not valid UTF-8 is an error that says so, never a name with U+FFFD in it.
+test('a ref lookup whose ref name is not valid UTF-8 fails with that reason, and reads no ref with a replaced name', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-invalid-ref-'));
+  try {
+    const remote = bareRepoWithCommit(base, 'remote', 'the remote');
+    const sha = runGit(remote, ['rev-parse', 'main']);
+    appendFileSync(join(remote, 'packed-refs'), Buffer.concat([Buffer.from(`${sha} refs/heads/`), INVALID_NAME, Buffer.from('\n')]));
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; try { $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref" } catch { "ERR=$($_.Exception.Message)" }`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /ERR=.*git output is not valid UTF-8/, run.stdout);
+    assert.doesNotMatch(run.stdout, /REF=/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Round 5, finding 4a: git refuses a folder that another user owns. The reason names that, and the apply names the fix for it, not
+// the tree's config. GIT_TEST_ASSUME_DIFFERENT_OWNER makes git see a different owner on every folder.
+withWorkspace('a folder git refuses as owned by another user is unreadable for that reason, and an apply names the fix for it', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  const env = { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' };
+  const source = ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`];
+
+  const audit = runInstaller(shell, ctx, source, { apply: false, env });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: git refused the folder: it is owned by another user; add it to safe\.directory or fix its ownership/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /config cannot be read/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, source, { env });
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer from a folder git refused');
+  assert.match(plainOutput(apply), /cannot be read at .*: git refused the folder: it is owned by another user; add it to safe\.directory or fix its ownership/, plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /Fix the tree's git config/, plainOutput(apply));
+}, {});
+
+// Round 5, finding 4b: a global config that git cannot parse makes the guard's probe fail. git is new enough, so the reason is git's own
+// message, and the apply names the config, not a git that is too old.
+withWorkspace('a global config that git cannot parse is named with git\'s message, not as a git that is too old', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const home = join(ctx.base, 'home');
+  const env = homeEnv(home);
+  appendFileSync(join(home, '.gitconfig'), '[broken\n');
+  const fixture = spawnSync('git', ['config', '--get', 'user.name'], { windowsHide: true, encoding: 'utf8', env, cwd: checkout });
+  assert.notEqual(fixture.status, 0, 'the fixture global config parsed, so git reads it');
+  const source = ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`];
+
+  const audit = runInstaller(shell, ctx, source, { apply: false, env });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /unreadable: git could not read its configuration, so the filter guard cannot be passed: .*bad config/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /git 2\.31 or later is needed/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, source, { env });
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer while git could not read its config');
+  assert.match(plainOutput(apply), /cannot be read at .*: git could not read its configuration.*Fix the config file that the reason names/, plainOutput(apply));
+}, {});
+
+// Round 5, finding 4b: a git older than 2.31 is named as too old, and a git that cannot run is named with its reason.
+test('a git that is too old is named as too old, a git that is new enough gives its own config error, and a git that cannot start says so', { skip }, () => {
+  // A git older than 2.31 ignores the settings, so its probe is silent. A git whose config cannot be parsed prints git's error.
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Get-GitVersion { [version] '2.30' }; $old = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "OLD=$old"; function Get-GitVersion { [version] '2.55' }; $new = Get-GitEnvConfigFault ([pscustomobject]@{ code = 128; stderr = @('fatal: bad config line 1') }); "NEW=$new"; $silent = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "SILENT=$silent"; function Get-GitVersion { $null }; $absent = Get-GitEnvConfigFault ([pscustomobject]@{ code = $null; stderr = @('git could not start: no such file') }); "ABSENT=$absent"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /OLD=git 2\.31 or later is needed, so the filter guard cannot be passed/, run.stdout);
+  assert.match(run.stdout, /NEW=git could not read its configuration, so the filter guard cannot be passed: fatal: bad config line 1/, run.stdout);
+  assert.match(run.stdout, /SILENT=git did not read the guard settings, so the filter guard cannot be passed/, run.stdout);
+  assert.match(run.stdout, /ABSENT=git 2\.31 or later is needed, so the filter guard cannot be passed: git could not start: no such file/, run.stdout);
 }, {});
