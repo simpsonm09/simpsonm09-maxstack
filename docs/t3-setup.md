@@ -52,7 +52,7 @@ The pstack folder is a copy, not a junction. It is not a junction because the Op
 
 The Copilot provider does not take plugin folders from the instance's arguments. T3 ignores `commandArgs` for registry ACP agents. So the installer writes a wrapper, `.maxstack\bin\copilot.cmd`, and the `copilotSimpsonm09` instance starts the wrapper instead of `copilot`. The default `copilot` instance starts the registry `copilot.exe` and needs no wrapper.
 
-1. Generate the wrapper: `pwsh -File scripts/Install-Workspace.ps1 -Apply`. It needs the Copilot CLI installed. If Copilot is not on `PATH`, the installer skips the wrapper and says so. Install Copilot, then run it again.
+1. Generate the wrapper: `pwsh -File scripts/Install-Workspace.ps1 -Apply`. It needs the Copilot CLI installed. If Copilot is not on `PATH`, the installer keeps the wrappers it already wrote, as they are, and warns; with none recorded, it skips them and says so. Install Copilot, then run it again.
 2. In T3, select the `copilotSimpsonm09` instance, Copilot (maxstack). Its `config.commandPath` is `D:/dev/simpsonm09/.maxstack/bin/copilot.cmd`. To set it up again, copy the registry `copilot` instance and set the copy's `config.commandPath` to `<workspace>/.maxstack/bin/copilot.cmd`. On macOS, use `copilot.sh` in the same folder.
 3. Fleet projects select that instance through the project's default model.
 
