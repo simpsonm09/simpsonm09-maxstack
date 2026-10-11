@@ -3901,6 +3901,7 @@ test('the git guard sets the prompt variables, and turns on file transport only 
   assert.match(run.stdout, /PROMPT=0/, run.stdout);
   assert.match(run.stdout, /GCM=never/, run.stdout);
   assert.match(run.stdout, /core\.fsmonitor= /, run.stdout);
+  assert.match(run.stdout, /core\.askPass= /, run.stdout);
   assert.match(run.stdout, /protocol\.allow=never/, run.stdout);
   assert.doesNotMatch(run.stdout, /protocol\.file\.allow/, 'a real run allows file transport');
 
@@ -4687,7 +4688,7 @@ test('the child environment loses each inherited git variable that names a repos
   const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF',
     'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR',
-    'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER'];
+    'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'];
   // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
@@ -4717,6 +4718,31 @@ test('a guarded ls-remote over file transport is refused in a real run, even whe
     assertOk(run);
     assert.doesNotMatch(run.stdout, /CODE=0 /, 'the guard read a file remote, because GIT_ALLOW_PROTOCOL allowed the transport');
     assert.match(run.stdout, /CODE=128 .*not allowed/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+// Round 5, finding 5: git never prompts for a credential, and runs no askpass program. The guard sets core.askPass to the empty string,
+// which overrides the global value, and the child loses GIT_ASKPASS and SSH_ASKPASS. The askpass program writes a marker when it runs.
+test('a guarded credential fill runs no askpass program that the global config names', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-askpass-'));
+  try {
+    const marker = join(base, 'askpass-marker.txt');
+    // git runs core.askPass as a program, not through a shell, so the program is a script that writes the marker and answers.
+    const askpassScript = join(base, 'askpass.sh');
+    writeFileSync(askpassScript, `#!/bin/sh\ntouch '${marker.replace(/\\/g, '/')}'\necho x\n`);
+    const env = homeEnv(join(base, 'home'), [['core.askPass', askpassScript.replace(/\\/g, '/')]]);
+    const input = 'protocol=https\nhost=example.invalid\n\n';
+    // The fixture runs git with prompts on, so the askpass program runs, and a marker that is missing after the guard is a result.
+    const fixture = spawnSync('git', ['credential', 'fill'], { input, encoding: 'utf8', env: { ...env, GIT_TERMINAL_PROMPT: '1' } });
+    assert.equal(existsSync(marker), true, `the fixture did not run the askpass program when git was not guarded: ${fixture.stderr}`);
+    rmSync(marker);
+
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('credential', 'fill'); "CODE=$($run.code)"`;
+    const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { input, encoding: 'utf8', env: testEnvironment(env) });
+    assertOk(guarded);
+    assert.equal(existsSync(marker), false, 'the guarded credential fill ran the askpass program that core.askPass names');
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

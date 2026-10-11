@@ -68,7 +68,8 @@ function Resolve-PathLink {
 }
 
 # The settings every git command the installer runs under. They stop git from running a program that a checkout names
-# (core.fsmonitor and hooks), and refuse every transport but https. The test seam also allows file, since its remotes
+# (core.fsmonitor and hooks), or that the user's config names (core.askPass, which the empty string turns off, so a credential
+# prompt runs no askpass program), and refuse every transport but https. The test seam also allows file, since its remotes
 # are local bare repositories. Each filter driver that a tree names is turned off as well (-FilterNames): a clean,
 # smudge, or process command is a program that git runs while it reads a file, and a driver that is missing is not required.
 function Get-GitGuardSettings {
@@ -77,6 +78,7 @@ function Get-GitGuardSettings {
     $settings = @(
         [pscustomobject]@{ key = 'core.fsmonitor'; value = '' }
         [pscustomobject]@{ key = 'core.hooksPath'; value = 'NUL' }
+        [pscustomobject]@{ key = 'core.askPass'; value = '' }
         [pscustomobject]@{ key = 'protocol.allow'; value = 'never' }
         [pscustomobject]@{ key = 'protocol.https.allow'; value = 'always' }
     )
@@ -113,7 +115,8 @@ function Get-GitChildVariables {
 $script:GitInheritedVariables = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_ASKPASS',
-    'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR', 'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER'
+    'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR', 'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER',
+    'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'
 )
 
 # Sets a git child's environment to those variables. The child inherits the installer's environment, so the variables in
