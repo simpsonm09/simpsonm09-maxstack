@@ -4686,7 +4686,8 @@ withWorkspace('an audit runs no core.fsmonitor that the installer environment na
 test('the child environment loses each inherited git variable that names a repository, config, or program, and keeps the rest', { skip }, () => {
   const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF',
-    'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'];
+    'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR',
+    'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER'];
   // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
@@ -4701,6 +4702,24 @@ test('the child environment keeps GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM, which
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_GLOBAL,GIT_CONFIG_SYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+// Round 5, finding 3: GIT_ALLOW_PROTOCOL overrides protocol.allow, so a child that inherits it would run a transport the guard refuses.
+// This run is not a test run, so the file transport is refused by the guard, and the inherited variable must not allow it.
+test('a guarded ls-remote over file transport is refused in a real run, even when the installer environment allows file', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-protocol-'));
+  try {
+    const remote = bareRepoWithCommit(base, 'remote', 'the remote');
+    const env = { ...process.env, GIT_ALLOW_PROTOCOL: 'file' };
+    delete env.MAXSTACK_TEST_MODE;
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('ls-remote', '--', 'file:///${remote.replace(/\\/g, '/')}'); "CODE=$($run.code) ERR=$(@($run.stderr) -join ' ')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+    assertOk(run);
+    assert.doesNotMatch(run.stdout, /CODE=0 /, 'the guard read a file remote, because GIT_ALLOW_PROTOCOL allowed the transport');
+    assert.match(run.stdout, /CODE=128 .*not allowed/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }, {});
 
 test('a guarded command reads the global config that GIT_CONFIG_GLOBAL names, and its credential helper', { skip }, () => {
