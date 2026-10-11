@@ -1013,21 +1013,107 @@ withWorkspace('a pi runtime without claude is rejected, because the Pi settings 
   assert.match(plainOutput(run), /declares pi, which lists the Claude plugin folder's skills, so it also needs claude/);
 }, {});
 
-withWorkspace('pi is skipped with a message when no executable is found, and its settings still list the layers', (ctx) => {
+withWorkspace('pi with no executable found warns, keeps the recorded wrappers, and its settings still list the layers', (ctx) => {
   mustApply(ctx);
   assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')));
 
   const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
   assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'the Pi wrapper is still there');
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'the Pi script is still there');
+  assert.match(plainOutput(run), /Kept .*pi\.cmd.*because Pi was not found/, run.stdout);
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'the recorded Pi wrapper was removed for a Pi that was only missing on this run');
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'the recorded Pi script was removed for a Pi that was only missing on this run');
   assert.ok(existsSync(join(ctx.workspace, '.pi', 'agent', 'settings.json')), 'the settings were not written without the CLI');
+
+  const lock = readJson(join(ctx.workspace, 'stack.lock.json'));
+  assert.equal(lock.pi.enabled, true, 'the lock dropped the wrappers it still holds');
+  assert.ok(ownedRecord(lock, '.maxstack/bin/pi.cmd', 'file'), 'the lock no longer owns the kept Pi wrapper');
+  assert.ok(lock.layers.every((record) => record.opencode.enabled), 'the OpenCode runtimes still install');
+}, {});
+
+withWorkspace('a workspace with no Pi and no Pi wrappers warns and skips, and writes no wrapper', (ctx) => {
+  const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+  assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
+  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'a Pi wrapper was written without a Pi CLI');
+  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'a Pi script was written without a Pi CLI');
 
   const lock = readJson(join(ctx.workspace, 'stack.lock.json'));
   assert.equal(lock.pi.enabled, false);
   assert.match(lock.pi.reason, /no 'maxstack-test-no-such-pi' application/);
-  assert.ok(lock.layers.every((record) => record.opencode.enabled), 'the OpenCode runtimes still install');
 }, {});
+
+// The workspace-local Pi install: npm puts the bin of a Pi the workspace installed for itself under .maxstack\npm, and the
+// installer finds it there before PATH. Each case runs with no Pi on PATH, through -PiCommand naming a missing command.
+const LOCAL_PI_BIN = ['.maxstack', 'npm', 'node_modules', '.bin'];
+const piWrapperText = (ctx, name) => readFileSync(join(ctx.workspace, '.maxstack', 'bin', name), 'utf8');
+function writeLocalPi(ctx) {
+  mkdirSync(join(ctx.workspace, ...LOCAL_PI_BIN), { recursive: true });
+  return writeFakeCli(join(ctx.workspace, ...LOCAL_PI_BIN), 'pi');
+}
+
+test('a Pi installed under the workspace is found with none on PATH, and its wrappers survive a run without it', { skip }, async (t) => {
+  const withFreshWorkspace = (body) => {
+    const ctx = buildWorkspace();
+    try {
+      body(ctx);
+    } finally {
+      rmSync(ctx.base, { recursive: true, force: true });
+    }
+  };
+
+  await t.test('(a) apply writes both wrappers pointing at the workspace-local Pi', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.doesNotMatch(plainOutput(run), /Pi CLI not found/, run.stdout);
+    assert.ok(piWrapperText(ctx, 'pi.cmd').includes(`set "PI_BIN=${stub}"`), 'pi.cmd does not name the workspace-local Pi');
+    assert.ok(piWrapperText(ctx, 'pi.sh').includes(stub.replaceAll('\\', '/')), 'pi.sh does not name the workspace-local Pi');
+  }));
+
+  await t.test('(b) a second apply changes no wrapper and no lock entry', () => withFreshWorkspace((ctx) => {
+    writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const before = { cmd: piWrapperText(ctx, 'pi.cmd'), sh: piWrapperText(ctx, 'pi.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) };
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.doesNotMatch(plainOutput(run), /Removed the stale wrapper|Kept .*pi\.cmd/, run.stdout);
+    assert.deepEqual({ cmd: piWrapperText(ctx, 'pi.cmd'), sh: piWrapperText(ctx, 'pi.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) }, before);
+  }));
+
+  await t.test('(c) with the Pi CLI gone, apply warns and keeps the recorded wrappers', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const before = { cmd: piWrapperText(ctx, 'pi.cmd'), sh: piWrapperText(ctx, 'pi.sh') };
+    rmSync(stub);
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
+    assert.match(plainOutput(run), /Kept .*pi\.cmd.*because Pi was not found/, run.stdout);
+    assert.equal(piWrapperText(ctx, 'pi.cmd'), before.cmd, 'the Pi wrapper changed');
+    assert.equal(piWrapperText(ctx, 'pi.sh'), before.sh, 'the Pi script changed');
+    const lock = readJson(lockPath(ctx));
+    assert.ok(ownedRecord(lock, '.maxstack/bin/pi.cmd', 'file'), 'the lock dropped the Pi wrapper it recorded');
+    assert.ok(ownedRecord(lock, '.maxstack/bin/pi.sh', 'file'), 'the lock dropped the Pi script it recorded');
+  }));
+
+  await t.test('(d) status reports the kept wrappers as matching', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const withStub = statusRows(runStatus(ctx, ['-PiCommand', MISSING_PI]));
+    rmSync(stub);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const run = runStatus(ctx, ['-PiCommand', MISSING_PI]);
+    assert.equal(run.status, 0, run.stderr);
+    for (const rows of [withStub, statusRows(run)]) {
+      for (const name of ['.maxstack/bin/pi.cmd', '.maxstack/bin/pi.sh']) {
+        assert.deepEqual(rows.find((row) => row.label === name), { state: 'matching', label: name }, `${name} is not reported as matching`);
+      }
+    }
+  }));
+});
+
+// The lock without its timestamp, so two applies of the same workspace compare equal.
+function withoutTimestamp(lock) {
+  const copy = { ...lock };
+  delete copy.generatedAt;
+  return copy;
+}
 
 withWorkspaceNeeding('python', python, 'the verifier fails when a configured CLI is on PATH but its wrapper was never generated', (ctx) => {
   mustApply(ctx, ['-PiCommand', MISSING_PI]);
