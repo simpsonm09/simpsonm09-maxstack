@@ -107,11 +107,13 @@ function Get-GitChildVariables {
 
 # git's variables that name a repository, a worktree, a config, or a program. A child inherits them from the installer, so one of
 # them could point git at another repository, or add a setting or run a program that the guard does not name. They are removed
-# from the child only. GIT_CONFIG_NOSYSTEM is not here: it is a hardening flag, so the user's choice is left as it is.
+# from the child only. GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are not here: the guard reads the same file that a status reads, so
+# a user's relocated config keeps its credential helper. GIT_CONFIG_NOSYSTEM is not here either: it is a hardening flag, so the
+# user's choice is left as it is.
 $script:GitInheritedVariables = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
-    'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_ASKPASS',
+    'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'
 )
 
 # Sets a git child's environment to those variables. The child inherits the installer's environment, so the variables in

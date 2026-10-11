@@ -4294,8 +4294,8 @@ function runGit(dir, args, env = process.env) {
 }
 
 // The environment whose HOME holds a .gitconfig with the given settings, which is the user's global config. The installer's git
-// children read the global config from HOME, since GIT_CONFIG_GLOBAL is not passed to them. XDG and the system config are off,
-// so the only global config is this one.
+// children read the global config from HOME, unless the caller sets GIT_CONFIG_GLOBAL to another file. XDG and the system config
+// are off, so the only global config is this one.
 function homeEnv(home, settings = []) {
   mkdirSync(home, { recursive: true });
   const file = join(home, '.gitconfig');
@@ -4685,13 +4685,38 @@ withWorkspace('an audit runs no core.fsmonitor that the installer environment na
 
 test('the child environment loses each inherited git variable that names a repository, config, or program, and keeps the rest', { skip }, () => {
   const names = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXTERNAL_DIFF',
+    'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF',
     'GIT_PAGER', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR'];
   // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_NOSYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+// Round 5, finding 2: GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are not scrubbed. A user who moved the global config with GIT_CONFIG_GLOBAL
+// keeps the credential helper it names, and the guard reads the same file that the status does.
+test('the child environment keeps GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM, which name the config git reads', { skip }, () => {
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); $child['GIT_CONFIG_GLOBAL'] = 'x'; $child['GIT_CONFIG_SYSTEM'] = 'x'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_GLOBAL,GIT_CONFIG_SYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
+}, {});
+
+test('a guarded command reads the global config that GIT_CONFIG_GLOBAL names, and its credential helper', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-global-'));
+  try {
+    const home = join(base, 'home');
+    const env = homeEnv(home);
+    const relocated = join(base, 'relocated.gitconfig');
+    runGit(base, ['config', '-f', relocated, 'credential.helper', 'relocated-helper']);
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('config', '--get', 'credential.helper'); "CODE=$($run.code) VALUE=$(@($run.stdout) -join ',')"`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment({ ...env, GIT_CONFIG_GLOBAL: relocated.replace(/\\/g, '/') }) });
+    assertOk(run);
+    assert.match(run.stdout, /CODE=0 VALUE=relocated-helper/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }, {});
 
 // Finding 7: the older filter fixtures again, with the attribute line in .git/info/attributes, so the name rule is what runs.
