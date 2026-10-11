@@ -864,7 +864,9 @@ function Sync-GitPlugin {
     # --end-of-options, not --: a -- before the commit would make it a pathspec.
     $checkout = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, '-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', '--end-of-options', $Layer.commit)
     if ($checkout.code -ne 0) { Write-GitStderr $checkout; throw "git checkout of $($Layer.commit) failed in $cache." }
-    $head = Get-GitLine (Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'rev-parse', 'HEAD'))
+    $headRun = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'rev-parse', 'HEAD')
+    if ($null -ne $headRun.unreadable) { throw "Could not read the HEAD of the cache for '$($Layer.name)': $($headRun.unreadable)." }
+    $head = Get-GitLine $headRun
     if ($head -ne $Layer.commit) { throw "The cache is at $head, not the pinned $($Layer.commit) for '$($Layer.name)'." }
     # The cache holds exactly the pinned commit: a file the checkout does not track is removed, and printed.
     $clean = Invoke-GitGuarded -Dir $cache -Arguments @('-C', $cache, 'clean', '-ffdx')

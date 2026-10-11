@@ -4148,12 +4148,12 @@ withWorkspace('an apply that runs npm counts the installed packages that declare
 
 // Round 2, J: a pipe that a stopped git's child still holds open is not waited on past the bound.
 test('a git output read that never completes returns within its bound, with no output', { skip, timeout: 60000 }, () => {
-  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $read = Read-GitPipeBounded -Task $task -Milliseconds 1000; "READ=[$($read.text)] COMPLETE=$($read.complete)"`;
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $read = Read-GitPipeBounded -Task $task -Milliseconds 1000; "COMPLETE=$read"`;
   const started = Date.now();
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 50000 });
   assertOk(run);
   assert.ok(Date.now() - started < 40000, 'the read was not bounded');
-  assert.ok(run.stdout.includes('READ=[] COMPLETE=False'), run.stdout);
+  assert.ok(run.stdout.includes('COMPLETE=False'), run.stdout);
 }, {});
 
 // ---- Round 3: the filter guard. A clean command that the tree's config defines writes a marker file when it runs.
@@ -4906,4 +4906,132 @@ test('a ref lookup whose git output was cut off says so, and does not report a m
   assertOk(run);
   assert.match(run.stdout, /ERR=.*git output was cut off/, run.stdout);
   assert.doesNotMatch(run.stdout, /no branch or tag named/, run.stdout);
+}, {});
+
+// ---- Round 5, finding 1: git's output is read as bytes and decoded strictly. A filter name that is not valid UTF-8 cannot be
+// written as a string, so the config and attribute bytes are written as a Buffer. The guard must refuse that tree, since a name it
+// cannot read back exactly is a filter it cannot turn off.
+const INVALID_NAME = Buffer.from([0xff]);
+
+// A [filter] section whose subsection name is the given bytes, with a clean command. The value is quoted as a whole, since an
+// unquoted ";" starts a comment, and its quotes and backslashes are escaped, so git reads the command that is given.
+function rawFilterSection(nameBytes, command) {
+  const value = `"${command.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return Buffer.concat([Buffer.from('[filter "'), nameBytes, Buffer.from(`"]\n\tclean = ${value}\n`)]);
+}
+
+// A local checkout whose .git/config defines a filter by raw name bytes, and whose attributes name it in the file given. A committed
+// .gitattributes is committed before the filter is defined. A same-size edit makes git run the clean command when it reads the file.
+function rawNameCheckout(ctx, { attributesFile, attributes, nameBytes, command }) {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  runGit(checkout, ['init', '-q']);
+  writeFile(checkout, 'notes.txt', 'one\n');
+  writeFile(checkout, attributesFile, attributes);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  appendFileSync(join(checkout, '.git', 'config'), rawFilterSection(nameBytes, command));
+  writeFile(checkout, 'notes.txt', 'two\n');
+  runGit(checkout, ['hash-object', '--path=notes.txt', 'notes.txt']);
+  bumpMtime(join(checkout, 'notes.txt'));
+  return checkout;
+}
+
+// The attribute line "<prefix>filter=<invalid byte>", as bytes.
+const invalidAttributes = (prefix) => Buffer.concat([Buffer.from(`${prefix}filter=`), INVALID_NAME, Buffer.from('\n')]);
+
+withWorkspace('an audit turns off no filter whose name is not valid UTF-8 in .git/info/attributes, and reports the tree unreadable', (ctx) => {
+  const marker = join(ctx.base, 'invalid-name-info-marker.txt');
+  const checkout = rawNameCheckout(ctx, { attributesFile: '.git/info/attributes', attributes: invalidAttributes('*.txt '), nameBytes: INVALID_NAME, command: touchAndCat(marker) });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of a filter whose name is not valid UTF-8');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`]);
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer from a tree with a filter name that is not valid UTF-8');
+  assert.match(plainOutput(apply), /cannot be read at .*: a filter driver name is not valid UTF-8/, plainOutput(apply));
+  assert.equal(existsSync(marker), false, 'the apply ran the clean command of a filter whose name is not valid UTF-8');
+}, {});
+
+withWorkspace('an audit turns off no filter whose name is not valid UTF-8 in a committed .gitattributes, and reports the tree unreadable', (ctx) => {
+  const marker = join(ctx.base, 'invalid-name-tracked-marker.txt');
+  const checkout = rawNameCheckout(ctx, { attributesFile: '.gitattributes', attributes: invalidAttributes('*.txt '), nameBytes: INVALID_NAME, command: touchAndCat(marker) });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of a filter named by a committed .gitattributes');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+}, {});
+
+test('a checkout state whose filter name is not valid UTF-8 is unreadable, with no commit, and runs no filter', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-invalid-name-'));
+  try {
+    const marker = join(base, 'state-marker.txt');
+    const checkout = join(base, 'tree');
+    mkdirSync(checkout);
+    runGit(checkout, ['init', '-q']);
+    writeFile(checkout, 'notes.txt', 'one\n');
+    writeFile(checkout, '.gitattributes', invalidAttributes('*.txt '));
+    runGit(checkout, ['add', '-A']);
+    runGit(checkout, ['commit', '-q', '-m', 'tree']);
+    appendFileSync(join(checkout, '.git', 'config'), rawFilterSection(INVALID_NAME, touchAndCat(marker)));
+    writeFile(checkout, 'notes.txt', 'two\n');
+    bumpMtime(join(checkout, 'notes.txt'));
+
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(checkout)], { encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /COMMIT= DIRTY= UNREADABLE=a filter driver name is not valid UTF-8/, run.stdout);
+    assert.equal(existsSync(marker), false, 'the checkout state ran the clean command of a filter whose name is not valid UTF-8');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}, {});
+
+withWorkspace('a global filter name that is not valid UTF-8 makes a local status report the tree unreadable, and runs no filter', (ctx) => {
+  const home = join(ctx.base, 'home');
+  const env = homeEnv(home);
+  const marker = join(ctx.base, 'global-invalid-marker.txt');
+  appendFileSync(join(home, '.gitconfig'), rawFilterSection(INVALID_NAME, touchAndCat(marker)));
+  const checkout = markedCheckoutWithCommit(ctx);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false, env });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran a global clean command whose name is not valid UTF-8');
+  assert.match(plainOutput(audit), /override, local .*unreadable: a filter driver name is not valid UTF-8/, plainOutput(audit));
+}, {});
+
+// A name that is valid UTF-8 is disabled whatever its script: an astral-plane character is one name, two UTF-16 units in .NET.
+withWorkspace('an audit runs no clean filter named by an astral-plane name in .git/info/attributes', (ctx) => {
+  const marker = join(ctx.base, 'utf8-astral-marker.txt');
+  const name = '\u{1F600}';
+  const checkout = infoAttributesCheckout(ctx, { attributes: `*.txt filter=${name}\n`, filters: [[name, touchAndCat(marker)]] });
+  assert.equal(existsSync(marker), true, 'the fixture did not run the clean command when git was not guarded');
+  rmSync(marker);
+
+  const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
+  assertOk(audit);
+  assert.equal(existsSync(marker), false, 'the audit ran the clean command of the astral-plane filter');
+}, {});
+
+// A ref name is read strictly too: a name that is not valid UTF-8 is an error that says so, never a name with U+FFFD in it.
+test('a ref lookup whose ref name is not valid UTF-8 fails with that reason, and reads no ref with a replaced name', { skip }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'maxstack-invalid-ref-'));
+  try {
+    const remote = bareRepoWithCommit(base, 'remote', 'the remote');
+    const sha = runGit(remote, ['rev-parse', 'main']);
+    appendFileSync(join(remote, 'packed-refs'), Buffer.concat([Buffer.from(`${sha} refs/heads/`), INVALID_NAME, Buffer.from('\n')]));
+    const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; try { $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref" } catch { "ERR=$($_.Exception.Message)" }`;
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+    assertOk(run);
+    assert.match(run.stdout, /ERR=.*git output is not valid UTF-8/, run.stdout);
+    assert.doesNotMatch(run.stdout, /REF=/, run.stdout);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }, {});

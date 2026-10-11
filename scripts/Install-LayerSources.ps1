@@ -128,17 +128,35 @@ function Set-GitChildEnvironment {
     }
 }
 
-# The result of a command the guard refused to run. Nothing ran, so there is no exit code, and the reason is the stderr.
+# The result of a command the guard refused to run, or whose output it could not read. Nothing ran, or the output is not used, so there
+# is no exit code, and the reason is the stderr. InvalidUtf8 marks an output that is not valid UTF-8, so a caller can name it.
 function New-GitFault {
-    param([string] $Reason)
+    param([string] $Reason, [switch] $InvalidUtf8)
 
-    return [pscustomobject]@{ unreadable = $Reason; timedOut = $false; code = $null; text = ''; stdout = @(); stderr = @($Reason); incomplete = $false }
+    return [pscustomobject]@{ unreadable = $Reason; timedOut = $false; code = $null; text = ''; stdout = @(); stderr = @($Reason); incomplete = $false; invalidUtf8 = [bool] $InvalidUtf8 }
+}
+
+# Decodes git's output as UTF-8, strictly. A byte that is not UTF-8 is not replaced with U+FFFD: a name with a replaced byte is a
+# different name, so a guard that turned it off would miss the filter that git runs. Returns $null for bytes that are not valid
+# UTF-8, and for text that holds U+FFFD, which a replaced byte would also produce.
+function ConvertFrom-GitUtf8 {
+    param([byte[]] $Bytes)
+
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
+    } catch [Text.DecoderFallbackException] {
+        return $null
+    }
+    if ($text.Contains([char] 0xFFFD)) { return $null }
+    return $text
 }
 
 # Runs git with the settings in the child's environment, and a time limit when one is given (zero waits without one). A run past
 # the limit is stopped with its process tree, so a silent remote cannot hold the installer. Returns the exit code and each stream.
 # The process and its pipes are disposed on every path. Callers go through Invoke-GitGuarded, which applies the guard.
 # WorkingDirectory is the folder the child starts in, and CeilingDirectory is one git does not search above for a repository.
+# Standard output is copied as bytes and decoded strictly (ConvertFrom-GitUtf8). An output that is not valid UTF-8 is a refused
+# result with InvalidUtf8 set, so no caller reads a name, a path, or a commit that git did not print.
 function Invoke-GitProcess {
     param([string[]] $Arguments, $Settings, [int] $TimeoutSeconds = 0, [string] $WorkingDirectory = '', [string] $CeilingDirectory = '')
 
@@ -146,9 +164,6 @@ function Invoke-GitProcess {
     foreach ($argument in $Arguments) { $info.ArgumentList.Add([string] $argument) }
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
-    # git writes UTF-8 (config names, paths, refs). Without these, .NET decodes the streams with the console code page.
-    $info.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
-    $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $info.UseShellExecute = $false
     if ($WorkingDirectory) { $info.WorkingDirectory = $WorkingDirectory }
     Set-GitChildEnvironment -Environment $info.Environment -Settings $Settings
@@ -158,8 +173,11 @@ function Invoke-GitProcess {
     } catch {
         return (New-GitFault "git could not start: $($_.Exception.Message)")
     }
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
+    # The raw bytes are kept. A stream reader would replace an invalid byte with U+FFFD before anything could see it.
+    $outBytes = [IO.MemoryStream]::new()
+    $errBytes = [IO.MemoryStream]::new()
+    $stdout = $process.StandardOutput.BaseStream.CopyToAsync($outBytes)
+    $stderr = $process.StandardError.BaseStream.CopyToAsync($errBytes)
     try {
         $timedOut = $false
         if ($TimeoutSeconds -gt 0) {
@@ -171,16 +189,24 @@ function Invoke-GitProcess {
             try { $process.Kill($true) } catch { }
             [void] $process.WaitForExit(5000)
         }
-        $out = Read-GitPipeBounded -Task $stdout
-        $err = Read-GitPipeBounded -Task $stderr
+        $outComplete = Read-GitPipeBounded -Task $stdout
+        $errComplete = Read-GitPipeBounded -Task $stderr
+        $text = ''
+        if ($outComplete) {
+            $text = ConvertFrom-GitUtf8 -Bytes $outBytes.ToArray()
+            if ($null -eq $text) { return (New-GitFault 'git output is not valid UTF-8' -InvalidUtf8) }
+        }
+        # stderr is only shown and matched for a reason, so a byte that is not UTF-8 is replaced there, and nothing decides on it.
+        $errText = if ($errComplete) { [Text.UTF8Encoding]::new($false).GetString($errBytes.ToArray()) } else { '' }
         return [pscustomobject]@{
-            unreadable = $null
-            timedOut   = $timedOut
-            code       = $(if ($timedOut) { $null } else { $process.ExitCode })
-            text       = $out.text
-            stdout     = @(($out.text -split "`r?`n") | Where-Object { $_ })
-            stderr     = @(($err.text -split "`r?`n") | Where-Object { $_ })
-            incomplete = -not ($out.complete -and $err.complete)
+            unreadable  = $null
+            timedOut    = $timedOut
+            code        = $(if ($timedOut) { $null } else { $process.ExitCode })
+            text        = $text
+            stdout      = @(($text -split "`r?`n") | Where-Object { $_ })
+            stderr      = @(($errText -split "`r?`n") | Where-Object { $_ })
+            incomplete  = -not ($outComplete -and $errComplete)
+            invalidUtf8 = $false
         }
     } finally {
         foreach ($task in @($stdout, $stderr)) {
@@ -238,6 +264,8 @@ function Read-TreeFilterNames {
         $scopeArgs = @()
         if ($scope) { $scopeArgs = @($scope) }
         $run = Invoke-GitProcess -Arguments (@('-C', $Dir, 'config') + $scopeArgs + @('--includes', '--name-only', '-z', '--get-regexp', '^filter\.')) -Settings $settings
+        # A name that is not valid UTF-8 is refused by name, since the guard cannot turn off the name git would look up.
+        if ($run.invalidUtf8) { return [pscustomobject]@{ names = @(); fault = 'a filter driver name is not valid UTF-8' } }
         if ($null -ne $run.unreadable) { return [pscustomobject]@{ names = @(); fault = $run.unreadable } }
         # A read that was cut off has no end, so its names are not known. It is unreadable, not a list with fewer names.
         if ($run.incomplete) { return [pscustomobject]@{ names = @(); fault = 'git output was cut off, so the filter names are unknown' } }
@@ -546,14 +574,13 @@ function New-UnreadableState {
     return [pscustomobject]@{ commit = $null; dirty = $null; unreadable = $Reason }
 }
 
-# The text a git output pipe yields, waiting at most the given time. A pipe that a stopped git's child still holds open
-# gives no end, so the wait is bounded and the read gives up rather than holding the installer. The result says whether
-# the read completed: a read that gave up has no text and is incomplete, which is not the same as empty output.
+# Whether a git output pipe's copy completed within the given time. A pipe that a stopped git's child still holds open gives
+# no end, so the wait is bounded and the read gives up rather than holding the installer. A copy that gave up is incomplete,
+# which is not the same as empty output, so the caller reads the bytes only when this returns true.
 function Read-GitPipeBounded {
     param($Task, [int] $Milliseconds = 5000)
 
-    if ($Task.Wait($Milliseconds)) { return [pscustomobject]@{ text = [string] $Task.Result; complete = $true } }
-    return [pscustomobject]@{ text = ''; complete = $false }
+    return [bool] $Task.Wait($Milliseconds)
 }
 
 # The commit a branch, tag, or full commit names on a remote, read with git ls-remote. Nothing is written. A
@@ -566,6 +593,7 @@ function Find-GitRefCommit {
     if ($run.timedOut) {
         throw "could not read the refs of ${Url}: git ls-remote took longer than $TimeoutSeconds seconds, so it was stopped. Check the network and the url."
     }
+    if ($null -ne $run.unreadable) { throw "could not read the refs of ${Url}: $($run.unreadable)." }
     # A read that gave up is not an empty listing: git may have printed the refs, and the output was cut off before they arrived.
     if ($run.incomplete) { throw "could not read the refs of ${Url}: git output was cut off, so the refs are unknown. A process may still hold the output open." }
     if ($run.code -ne 0) { throw "could not read the refs of ${Url}: $((@($run.stdout) + @($run.stderr)) -join ' ')" }
