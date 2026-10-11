@@ -2,6 +2,7 @@
 
 - `AGENTS.md` sets working rules for changes to this repository.
 - `layers.json` is the ordered layer manifest. Each layer is described once: its `name` (the plugin id), its `kind`, its `source`, and a `runtimes` map. The `pstack` layer's source is a git pin into the fork. The org and personal layers are local checkouts with a `path` and a git URL. A layer lists the runtimes it installs for: `claude`, `opencode`, and `copilot`.
+- `scripts/generate-layers.mjs` and `scripts/lib/` project layer skills and OpenCode MCP into a dedicated output directory. `docs/neutral-layer-generator.md` defines the contract.
 - `.github/workflows/ci.yml` calls the shared `repo-standard` checks and runs the manifest validation. `mise.toml` pins the linters.
 - `justfile` is the local task runner; its recipes mirror the CI checks.
 - `pstack.lock.json` is the one pin for the pstack plugin: the fork, the `path` inside it, the commit, and the branch it came from. `scripts/verify-manifests.py --online` checks that the branch still points at the commit.
