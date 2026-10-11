@@ -551,20 +551,87 @@ withWorkspaceNeeding('bash', findBash(), 'copilot.sh runs copilot from PATH with
   assert.match(run.stdout, /ARG=--foo\nARG=a b/, 'the caller arguments follow, unsplit');
 }, {});
 
-withWorkspace('copilot is skipped with a message when no executable is found, and an old wrapper goes', (ctx) => {
+withWorkspace('copilot with no executable found warns, keeps the recorded wrappers, and the lock keeps their records', (ctx) => {
   mustApply(ctx);
   assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'copilot.cmd')));
 
   const run = mustApply(ctx, ['-CopilotCommand', MISSING_COPILOT]);
   assert.match(plainOutput(run), /Copilot CLI not found/, run.stdout);
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'copilot.cmd')), 'the wrapper is still there');
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'copilot.sh')), 'the script is still there');
+  assert.match(plainOutput(run), /Kept .*copilot\.cmd.*because Copilot was not found/, run.stdout);
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'copilot.cmd')), 'the recorded Copilot wrapper was removed for a Copilot that was only missing on this run');
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'copilot.sh')), 'the recorded Copilot script was removed for a Copilot that was only missing on this run');
 
   const lock = readJson(join(ctx.workspace, 'stack.lock.json'));
-  assert.equal(lock.copilot.enabled, false);
-  assert.match(lock.copilot.reason, /no 'maxstack-test-no-such-copilot' application/);
+  assert.equal(lock.copilot.enabled, true, 'the lock dropped the Copilot wrappers it still holds');
+  assert.ok(ownedRecord(lock, '.maxstack/bin/copilot.cmd', 'file'), 'the lock no longer owns the kept Copilot wrapper');
+  assert.ok(ownedRecord(lock, '.maxstack/bin/copilot.sh', 'file'), 'the lock no longer owns the kept Copilot script');
   assert.ok(lock.layers.every((record) => record.opencode.enabled), 'the OpenCode runtimes still install');
 }, {});
+
+// Copilot is found on the command line only, so a run that names a missing command cannot find it. The wrappers it
+// wrote are kept; removal happens only when the runtime or every layer stops naming copilot.
+test('a Copilot run that cannot find Copilot keeps the recorded wrappers, and a deselected runtime removes them', { skip }, async (t) => {
+  const copilotCmd = (ctx) => join(ctx.workspace, '.maxstack', 'bin', 'copilot.cmd');
+  const copilotSh = (ctx) => join(ctx.workspace, '.maxstack', 'bin', 'copilot.sh');
+
+  await t.test('(a) the recorded wrappers are kept byte for byte, and the lock keeps their records', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    const before = { cmd: wrapperText(ctx, 'copilot.cmd'), sh: wrapperText(ctx, 'copilot.sh') };
+    mustApply(ctx, ['-CopilotCommand', MISSING_COPILOT]);
+    assert.equal(wrapperText(ctx, 'copilot.cmd'), before.cmd, 'the Copilot wrapper changed');
+    assert.equal(wrapperText(ctx, 'copilot.sh'), before.sh, 'the Copilot script changed');
+    const lock = readJson(lockPath(ctx));
+    assert.ok(ownedRecord(lock, '.maxstack/bin/copilot.cmd', 'file'), 'the lock dropped the Copilot wrapper it recorded');
+    assert.ok(ownedRecord(lock, '.maxstack/bin/copilot.sh', 'file'), 'the lock dropped the Copilot script it recorded');
+  }));
+
+  await t.test('(b) a re-run with no Copilot changes no wrapper and no lock entry', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    mustApply(ctx, ['-CopilotCommand', MISSING_COPILOT]);
+    const before = { cmd: wrapperText(ctx, 'copilot.cmd'), sh: wrapperText(ctx, 'copilot.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) };
+    const run = mustApply(ctx, ['-CopilotCommand', MISSING_COPILOT]);
+    assert.doesNotMatch(plainOutput(run), /Removed the stale wrapper|Wrote .*copilot/, run.stdout);
+    assert.deepEqual({ cmd: wrapperText(ctx, 'copilot.cmd'), sh: wrapperText(ctx, 'copilot.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) }, before);
+  }));
+
+  await t.test('(c) status reports the kept Copilot wrappers as matching', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    mustApply(ctx, ['-CopilotCommand', MISSING_COPILOT]);
+    const run = runStatus(ctx, ['-CopilotCommand', MISSING_COPILOT]);
+    assert.equal(run.status, 0, run.stderr);
+    for (const name of ['.maxstack/bin/copilot.cmd', '.maxstack/bin/copilot.sh']) {
+      assert.deepEqual(statusRows(run).find((row) => row.label === name), { state: 'matching', label: name }, `${name} is not reported as matching`);
+    }
+  }));
+
+  await t.test('(d) -Remove -Runtimes copilot removes the recorded wrappers and their records', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    assertOk(removal(ctx, ['-Remove', '-Runtimes', 'copilot']));
+    assert.ok(!existsSync(copilotCmd(ctx)), 'the Copilot wrapper is still there after its runtime was removed');
+    assert.ok(!existsSync(copilotSh(ctx)), 'the Copilot script is still there after its runtime was removed');
+    const lock = readJson(lockPath(ctx));
+    assert.equal(ownedRecord(lock, '.maxstack/bin/copilot.cmd', 'file'), undefined, 'the lock still owns the removed Copilot wrapper');
+    assert.equal(ownedRecord(lock, '.maxstack/bin/copilot.sh', 'file'), undefined, 'the lock still owns the removed Copilot script');
+  }));
+
+  await t.test('(d2) -Remove -Runtimes copilot removes them even when the command names a missing Copilot', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    assertOk(removal(ctx, ['-Remove', '-Runtimes', 'copilot', '-CopilotCommand', MISSING_COPILOT]));
+    assert.ok(!existsSync(copilotCmd(ctx)), 'a missing Copilot kept a wrapper of a runtime that was removed');
+    assert.ok(!existsSync(copilotSh(ctx)), 'a missing Copilot kept a script of a runtime that was removed');
+  }));
+
+  await t.test('(e) when no layer declares copilot, an apply removes the recorded wrappers', () => withFreshWorkspace((ctx) => {
+    mustApply(ctx);
+    const layersFile = writeLayers(ctx, (manifest) => {
+      for (const layer of manifest.layers) delete layer.runtimes.copilot;
+    });
+    const run = runInstaller(shell, ctx, [], { layersFile });
+    assertOk(run);
+    assert.match(plainOutput(run), /Removed the stale wrapper/, run.stdout);
+    assert.ok(!existsSync(copilotCmd(ctx)), 'a Copilot wrapper no layer declares is still there');
+  }));
+});
 
 withWorkspace('copilot never wraps the generated wrapper itself', (ctx) => {
   const bin = join(ctx.workspace, '.maxstack', 'bin');
@@ -1013,21 +1080,108 @@ withWorkspace('a pi runtime without claude is rejected, because the Pi settings 
   assert.match(plainOutput(run), /declares pi, which lists the Claude plugin folder's skills, so it also needs claude/);
 }, {});
 
-withWorkspace('pi is skipped with a message when no executable is found, and its settings still list the layers', (ctx) => {
+withWorkspace('pi with no executable found warns, keeps the recorded wrappers, and its settings still list the layers', (ctx) => {
   mustApply(ctx);
   assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')));
 
   const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
   assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'the Pi wrapper is still there');
-  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'the Pi script is still there');
+  assert.match(plainOutput(run), /Kept .*pi\.cmd.*because Pi was not found/, run.stdout);
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'the recorded Pi wrapper was removed for a Pi that was only missing on this run');
+  assert.ok(existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'the recorded Pi script was removed for a Pi that was only missing on this run');
   assert.ok(existsSync(join(ctx.workspace, '.pi', 'agent', 'settings.json')), 'the settings were not written without the CLI');
+
+  const lock = readJson(join(ctx.workspace, 'stack.lock.json'));
+  assert.equal(lock.pi.enabled, true, 'the lock dropped the wrappers it still holds');
+  assert.ok(ownedRecord(lock, '.maxstack/bin/pi.cmd', 'file'), 'the lock no longer owns the kept Pi wrapper');
+  assert.ok(lock.layers.every((record) => record.opencode.enabled), 'the OpenCode runtimes still install');
+}, {});
+
+withWorkspace('a workspace with no Pi and no Pi wrappers warns and skips, and writes no wrapper', (ctx) => {
+  const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+  assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
+  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd')), 'a Pi wrapper was written without a Pi CLI');
+  assert.ok(!existsSync(join(ctx.workspace, '.maxstack', 'bin', 'pi.sh')), 'a Pi script was written without a Pi CLI');
 
   const lock = readJson(join(ctx.workspace, 'stack.lock.json'));
   assert.equal(lock.pi.enabled, false);
   assert.match(lock.pi.reason, /no 'maxstack-test-no-such-pi' application/);
-  assert.ok(lock.layers.every((record) => record.opencode.enabled), 'the OpenCode runtimes still install');
 }, {});
+
+// The workspace-local Pi install: npm puts the bin of a Pi the workspace installed for itself under .maxstack\npm, and the
+// installer finds it there before PATH. Each case runs with no Pi on PATH, through -PiCommand naming a missing command.
+// A workspace for one test, removed afterwards whatever the outcome.
+function withFreshWorkspace(body) {
+  const ctx = buildWorkspace();
+  try {
+    body(ctx);
+  } finally {
+    rmSync(ctx.base, { recursive: true, force: true });
+  }
+}
+
+const LOCAL_PI_BIN = ['.maxstack', 'npm', 'node_modules', '.bin'];
+const wrapperText = (ctx, name) => readFileSync(join(ctx.workspace, '.maxstack', 'bin', name), 'utf8');
+function writeLocalPi(ctx) {
+  mkdirSync(join(ctx.workspace, ...LOCAL_PI_BIN), { recursive: true });
+  return writeFakeCli(join(ctx.workspace, ...LOCAL_PI_BIN), 'pi');
+}
+
+test('a Pi installed under the workspace is found with none on PATH, and its wrappers survive a run without it', { skip }, async (t) => {
+  await t.test('(a) apply writes both wrappers pointing at the workspace-local Pi', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.doesNotMatch(plainOutput(run), /Pi CLI not found/, run.stdout);
+    assert.ok(wrapperText(ctx, 'pi.cmd').includes(`set "PI_BIN=${stub}"`), 'pi.cmd does not name the workspace-local Pi');
+    assert.ok(wrapperText(ctx, 'pi.sh').includes(stub.replaceAll('\\', '/')), 'pi.sh does not name the workspace-local Pi');
+  }));
+
+  await t.test('(b) a second apply changes no wrapper and no lock entry', () => withFreshWorkspace((ctx) => {
+    writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const before = { cmd: wrapperText(ctx, 'pi.cmd'), sh: wrapperText(ctx, 'pi.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) };
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.doesNotMatch(plainOutput(run), /Removed the stale wrapper|Kept .*pi\.cmd/, run.stdout);
+    assert.deepEqual({ cmd: wrapperText(ctx, 'pi.cmd'), sh: wrapperText(ctx, 'pi.sh'), lock: withoutTimestamp(readJson(lockPath(ctx))) }, before);
+  }));
+
+  await t.test('(c) with the Pi CLI gone, apply warns and keeps the recorded wrappers', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const before = { cmd: wrapperText(ctx, 'pi.cmd'), sh: wrapperText(ctx, 'pi.sh') };
+    rmSync(stub);
+    const run = mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    assert.match(plainOutput(run), /Pi CLI not found/, run.stdout);
+    assert.match(plainOutput(run), /Kept .*pi\.cmd.*because Pi was not found/, run.stdout);
+    assert.equal(wrapperText(ctx, 'pi.cmd'), before.cmd, 'the Pi wrapper changed');
+    assert.equal(wrapperText(ctx, 'pi.sh'), before.sh, 'the Pi script changed');
+    const lock = readJson(lockPath(ctx));
+    assert.ok(ownedRecord(lock, '.maxstack/bin/pi.cmd', 'file'), 'the lock dropped the Pi wrapper it recorded');
+    assert.ok(ownedRecord(lock, '.maxstack/bin/pi.sh', 'file'), 'the lock dropped the Pi script it recorded');
+  }));
+
+  await t.test('(d) status reports the kept wrappers as matching', () => withFreshWorkspace((ctx) => {
+    const stub = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const withStub = statusRows(runStatus(ctx, ['-PiCommand', MISSING_PI]));
+    rmSync(stub);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const run = runStatus(ctx, ['-PiCommand', MISSING_PI]);
+    assert.equal(run.status, 0, run.stderr);
+    for (const rows of [withStub, statusRows(run)]) {
+      for (const name of ['.maxstack/bin/pi.cmd', '.maxstack/bin/pi.sh']) {
+        assert.deepEqual(rows.find((row) => row.label === name), { state: 'matching', label: name }, `${name} is not reported as matching`);
+      }
+    }
+  }));
+});
+
+// The lock without its timestamp, so two applies of the same workspace compare equal.
+function withoutTimestamp(lock) {
+  const copy = { ...lock };
+  delete copy.generatedAt;
+  return copy;
+}
 
 withWorkspaceNeeding('python', python, 'the verifier fails when a configured CLI is on PATH but its wrapper was never generated', (ctx) => {
   mustApply(ctx, ['-PiCommand', MISSING_PI]);
@@ -1044,6 +1198,16 @@ withWorkspaceNeeding('python', python, 'the verifier fails when a configured CLI
   const run = spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8', env });
   assert.notEqual(run.status, 0, 'the verifier passed with the Pi CLI on PATH and no Pi wrapper');
   assert.match(plainOutput(run), /the pi CLI is on PATH.*rerun Install-Workspace\.ps1 -Apply/);
+}, {});
+
+withWorkspaceNeeding('python', python, 'the verifier fails when a workspace-local Pi has no recorded wrapper, as the installer finds it before PATH', (ctx) => {
+  mustApply(ctx, ['-PiCommand', MISSING_PI]);
+  const home = join(ctx.base, 'home');
+  mkdirSync(home);
+  writeLocalPi(ctx);
+  const run = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
+  assert.notEqual(run.status, 0, 'the verifier passed with a workspace-local Pi and no Pi wrapper');
+  assert.match(plainOutput(run), /the pi CLI is installed under .*rerun Install-Workspace\.ps1 -Apply/);
 }, {});
 
 // T3 spawns binaryPath directly, so the .sh wrappers need the executable bit off Windows.

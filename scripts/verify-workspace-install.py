@@ -292,15 +292,28 @@ def check_shell_bit(path: pathlib.Path, failures: list[str]) -> None:
 
 
 def check_missing_wrapper(
-    lock: dict, runtime: str, command: str, bin_dir: pathlib.Path, failures: list[str]
+    lock: dict,
+    runtime: str,
+    command: str,
+    bin_dir: pathlib.Path,
+    failures: list[str],
+    local_bin: pathlib.Path | None = None,
 ) -> None:
-    """A disabled wrapper is wrong when layers configure the runtime and its CLI is on PATH.
+    """A disabled wrapper is wrong when layers configure the runtime and its CLI is installed for the workspace or on PATH.
 
     The installer left the wrapper out because the CLI was missing at apply time, so the
-    fix is to apply again. PATH is searched as the installer searches it, outside .maxstack\bin.
+    fix is to apply again. The workspace install under local_bin is searched first, then PATH
+    outside .maxstack\bin, as the installer searches them.
     """
     if not configured(lock, runtime):
         return
+    if local_bin is not None:
+        local = local_bin / (f"{command}.cmd" if os.name == "nt" else command)
+        if local.is_file():
+            failures.append(
+                f"the {command} CLI is installed under {local_bin}, and layers configure {runtime}, but stack.lock.json records no {runtime} wrapper; rerun Install-Workspace.ps1 -Apply"
+            )
+            return
     found = shutil.which(command)
     if found is None:
         return
@@ -502,7 +515,8 @@ def check_pi(lock: dict, workspace: pathlib.Path, failures: list[str]) -> None:
     bin_dir = workspace / ".maxstack" / "bin"
     agent_dir = workspace / lock_pi.get("agentDir", ".pi/agent")
     if not lock_pi.get("enabled"):
-        check_missing_wrapper(lock, "pi", "pi", bin_dir, failures)
+        local_bin = workspace / ".maxstack" / "npm" / "node_modules" / ".bin"
+        check_missing_wrapper(lock, "pi", "pi", bin_dir, failures, local_bin)
     check_pi_wrappers(lock_pi, bin_dir, agent_dir, failures)
     check_pi_settings(lock_pi, agent_dir, failures)
     check_pi_layers(lock, workspace, agent_dir, failures)
