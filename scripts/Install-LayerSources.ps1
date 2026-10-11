@@ -218,16 +218,57 @@ function Invoke-GitProcess {
     }
 }
 
+# The reasons a layer or a command is refused for the git it runs on, and not for its tree. The apply names the repair for each.
+$script:DubiousOwnershipReason = 'git refused the folder: it is owned by another user; add it to safe.directory or fix its ownership'
+$script:GitVersionReason = 'git 2.31 or later is needed, so the filter guard cannot be passed'
+$script:GitConfigReason = 'git could not read its configuration, so the filter guard cannot be passed'
+
 # Whether this git reads the GIT_CONFIG_* settings, which git 2.31 added. Without them the guard does not hold, so a git
 # that cannot read them runs no guarded command. The probe reads back a value that it sets, and runs once per run.
 $script:gitEnvConfigSupported = $null
+$script:gitEnvConfigFault = $null
 function Test-GitEnvConfigSupport {
     if ($null -eq $script:gitEnvConfigSupported) {
         $probe = @([pscustomobject]@{ key = 'maxstack.guardprobe'; value = 'on' })
         $run = Invoke-GitNeutral -Arguments @('config', '--get', 'maxstack.guardprobe') -Settings $probe
         $script:gitEnvConfigSupported = ($run.code -eq 0 -and (@($run.stdout) -contains 'on'))
+        if (-not $script:gitEnvConfigSupported) { $script:gitEnvConfigFault = Get-GitEnvConfigFault $run }
     }
     return $script:gitEnvConfigSupported
+}
+
+# The reason no guarded command runs when the probe fails. A probe that prints an error names it: git prints one when its config
+# cannot be parsed (a global or system file, for one), and the reason gives git's own message, since git is new enough to read
+# the settings. A probe that prints nothing is a git older than 2.31, or one that did not read the settings, and its version says which.
+function Get-GitEnvConfigFault {
+    param($Run)
+
+    $detail = [string] (@($Run.stderr) | Where-Object { $_ } | Select-Object -First 1)
+    if ($detail -and -not $detail.StartsWith('git could not start', [StringComparison]::Ordinal)) { return "$($script:GitConfigReason): $detail" }
+    $version = Get-GitVersion
+    if ($null -ne $version -and $version -ge [version] '2.31') { return 'git did not read the guard settings, so the filter guard cannot be passed' }
+    if ($detail) { return "$($script:GitVersionReason): $detail" }
+    return $script:GitVersionReason
+}
+
+# The version of the git on the path, or $null when it cannot be read. Only a probe that printed nothing gets here, so the config is readable.
+function Get-GitVersion {
+    $run = Invoke-GitNeutral -Arguments @('version') -Settings (Get-GitGuardSettings)
+    if ($run.code -ne 0) { return $null }
+    $line = Get-GitLine $run
+    if ($line -cmatch '(\d+)\.(\d+)') { return [version] "$($Matches[1]).$($Matches[2])" }
+    return $null
+}
+
+# The words an apply adds after a layer's unreadable reason. A dubious-ownership reason already names its fix, and a git reason
+# names the config or the git install that git reports. A tree reason names the tree's config.
+function Get-UnreadableRemedy {
+    param([string] $Reason)
+
+    if ($Reason -ceq $script:DubiousOwnershipReason) { return '' }
+    if ($Reason.StartsWith($script:GitVersionReason, [StringComparison]::Ordinal)) { return '. Install git 2.31 or later' }
+    if ($Reason.StartsWith($script:GitConfigReason, [StringComparison]::Ordinal)) { return '. Fix the config file that the reason names' }
+    return ". Fix the tree's git config"
 }
 
 # The driver name of one config key: everything between the first "filter." and the last dot, so a subsection may hold
@@ -256,6 +297,7 @@ function Read-TreeFilterNames {
         $reason = [string] (@($repo.stderr) | Select-Object -First 1)
         $hasGitEntry = Test-Path -LiteralPath (Join-Path $Dir '.git')
         if (-not $hasGitEntry -or $reason -match 'not a git repository') { return [pscustomobject]@{ names = @(); fault = $null } }
+        if ($reason -match 'dubious ownership') { return [pscustomobject]@{ names = @(); fault = $script:DubiousOwnershipReason } }
         return [pscustomobject]@{ names = @(); fault = "config cannot be read: $reason" }
     }
     # The tree's own scopes are its repository config and its per-worktree config. --includes follows an include.path in them,
@@ -345,7 +387,7 @@ function Invoke-GitNeutral {
 function Invoke-GitGuarded {
     param([string[]] $Arguments, [string] $Dir = '', [int] $TimeoutSeconds = 0, [switch] $AllFilterScopes)
 
-    if (-not (Test-GitEnvConfigSupport)) { return (New-GitFault 'git 2.31 or later is needed, so the filter guard cannot be passed') }
+    if (-not (Test-GitEnvConfigSupport)) { return (New-GitFault $script:gitEnvConfigFault) }
     $arguments = @('--no-optional-locks') + $Arguments
     if (-not $Dir) { return (Invoke-GitNeutral -Arguments $arguments -Settings (Get-GitGuardSettings) -TimeoutSeconds $TimeoutSeconds) }
     $tree = Read-TreeFilterNames -Dir $Dir -AllScopes:$AllFilterScopes

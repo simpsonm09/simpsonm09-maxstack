@@ -2953,7 +2953,7 @@ foreach ($layer in $layers) {
     # -Source is an apply or audit option, so only a plain apply names it, and only for an override that it would drop.
     $repair = if (-not $removing -and $layer.override) { " or drop the override with -Source $($layer.name)=default -Apply" } else { '' }
     if ($layer.folderMissing) { throw "Layer '$($layer.name)' has no folder at $($layer.repoRoot). Restore the folder$repair, then rerun." }
-    throw "Layer '$($layer.name)' cannot be read at $($layer.repoRoot): $($layer.unreadable). Fix the tree's git config$repair, then rerun."
+    throw "Layer '$($layer.name)' cannot be read at $($layer.repoRoot): $($layer.unreadable)$(Get-UnreadableRemedy $layer.unreadable)$repair, then rerun."
 }
 
 # Before any write, an apply records what already exists: the directories an install may create, the

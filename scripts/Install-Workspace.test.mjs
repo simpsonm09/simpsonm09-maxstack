@@ -5079,3 +5079,59 @@ test('a ref lookup whose ref name is not valid UTF-8 fails with that reason, and
     rmSync(base, { recursive: true, force: true });
   }
 }, {});
+
+// Round 5, finding 4a: git refuses a folder that another user owns. The reason names that, and the apply names the fix for it, not
+// the tree's config. GIT_TEST_ASSUME_DIFFERENT_OWNER makes git see a different owner on every folder.
+withWorkspace('a folder git refuses as owned by another user is unreadable for that reason, and an apply names the fix for it', (ctx) => {
+  const checkout = join(ctx.base, 'org-checkout');
+  writeLayerStub(checkout, { claudePlugin: 'simpsonm09-org-ai-plugin' });
+  writeFile(checkout, 'notes.txt', 'one\n');
+  runGit(checkout, ['init', '-q']);
+  runGit(checkout, ['add', '-A']);
+  runGit(checkout, ['commit', '-q', '-m', 'layer']);
+  const env = { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' };
+  const source = ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`];
+
+  const audit = runInstaller(shell, ctx, source, { apply: false, env });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /override, local .*unreadable: git refused the folder: it is owned by another user; add it to safe\.directory or fix its ownership/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /config cannot be read/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, source, { env });
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer from a folder git refused');
+  assert.match(plainOutput(apply), /cannot be read at .*: git refused the folder: it is owned by another user; add it to safe\.directory or fix its ownership/, plainOutput(apply));
+  assert.doesNotMatch(plainOutput(apply), /Fix the tree's git config/, plainOutput(apply));
+}, {});
+
+// Round 5, finding 4b: a global config that git cannot parse makes the guard's probe fail. git is new enough, so the reason is git's own
+// message, and the apply names the config, not a git that is too old.
+withWorkspace('a global config that git cannot parse is named with git\'s message, not as a git that is too old', (ctx) => {
+  const checkout = markedCheckoutWithCommit(ctx);
+  const home = join(ctx.base, 'home');
+  const env = homeEnv(home);
+  appendFileSync(join(home, '.gitconfig'), '[broken\n');
+  const fixture = spawnSync('git', ['config', '--get', 'user.name'], { encoding: 'utf8', env, cwd: checkout });
+  assert.notEqual(fixture.status, 0, 'the fixture global config parsed, so git reads it');
+  const source = ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`];
+
+  const audit = runInstaller(shell, ctx, source, { apply: false, env });
+  assertOk(audit);
+  assert.match(plainOutput(audit), /unreadable: git could not read its configuration, so the filter guard cannot be passed: .*bad config/, plainOutput(audit));
+  assert.doesNotMatch(plainOutput(audit), /git 2\.31 or later is needed/, plainOutput(audit));
+
+  const apply = runInstaller(shell, ctx, source, { env });
+  assert.notEqual(apply.status, 0, 'an apply wrote a layer while git could not read its config');
+  assert.match(plainOutput(apply), /cannot be read at .*: git could not read its configuration.*Fix the config file that the reason names/, plainOutput(apply));
+}, {});
+
+// Round 5, finding 4b: a git older than 2.31 is named as too old, and a git that cannot run is named with its reason.
+test('a git that is too old is named as too old, a git that is new enough gives its own config error, and a git that cannot start says so', { skip }, () => {
+  // A git older than 2.31 ignores the settings, so its probe is silent. A git whose config cannot be parsed prints git's error.
+  const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Get-GitVersion { [version] '2.30' }; $old = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "OLD=$old"; function Get-GitVersion { [version] '2.55' }; $new = Get-GitEnvConfigFault ([pscustomobject]@{ code = 128; stderr = @('fatal: bad config line 1') }); "NEW=$new"; $silent = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "SILENT=$silent"; function Get-GitVersion { $null }; $absent = Get-GitEnvConfigFault ([pscustomobject]@{ code = $null; stderr = @('git could not start: no such file') }); "ABSENT=$absent"`;
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  assertOk(run);
+  assert.match(run.stdout, /OLD=git 2\.31 or later is needed, so the filter guard cannot be passed/, run.stdout);
+  assert.match(run.stdout, /NEW=git could not read its configuration, so the filter guard cannot be passed: fatal: bad config line 1/, run.stdout);
+  assert.match(run.stdout, /SILENT=git did not read the guard settings, so the filter guard cannot be passed/, run.stdout);
+  assert.match(run.stdout, /ABSENT=git 2\.31 or later is needed, so the filter guard cannot be passed: git could not start: no such file/, run.stdout);
+}, {});
