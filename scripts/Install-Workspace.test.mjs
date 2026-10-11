@@ -4700,7 +4700,7 @@ test('the child environment loses each inherited git variable that names a repos
 // keeps the credential helper it names, and the guard reads the same file that the status does.
 test('the child environment keeps GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM, which name the config git reads', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); $child['GIT_CONFIG_GLOBAL'] = 'x'; $child['GIT_CONFIG_SYSTEM'] = 'x'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_GLOBAL,GIT_CONFIG_SYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
 }, {});
@@ -4714,7 +4714,7 @@ test('a guarded ls-remote over file transport is refused in a real run, even whe
     const env = { ...process.env, GIT_ALLOW_PROTOCOL: 'file' };
     delete env.MAXSTACK_TEST_MODE;
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('ls-remote', '--', 'file:///${remote.replace(/\\/g, '/')}'); "CODE=$($run.code) ERR=$(@($run.stderr) -join ' ')"`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env });
     assertOk(run);
     assert.doesNotMatch(run.stdout, /CODE=0 /, 'the guard read a file remote, because GIT_ALLOW_PROTOCOL allowed the transport');
     assert.match(run.stdout, /CODE=128 .*not allowed/, run.stdout);
@@ -4735,12 +4735,12 @@ test('a guarded credential fill runs no askpass program that the global config n
     const env = homeEnv(join(base, 'home'), [['core.askPass', askpassScript.replace(/\\/g, '/')]]);
     const input = 'protocol=https\nhost=example.invalid\n\n';
     // The fixture runs git with prompts on, so the askpass program runs, and a marker that is missing after the guard is a result.
-    const fixture = spawnSync('git', ['credential', 'fill'], { input, encoding: 'utf8', env: { ...env, GIT_TERMINAL_PROMPT: '1' } });
+    const fixture = spawnSync('git', ['credential', 'fill'], { windowsHide: true, input, encoding: 'utf8', env: { ...env, GIT_TERMINAL_PROMPT: '1' } });
     assert.equal(existsSync(marker), true, `the fixture did not run the askpass program when git was not guarded: ${fixture.stderr}`);
     rmSync(marker);
 
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('credential', 'fill'); "CODE=$($run.code)"`;
-    const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { input, encoding: 'utf8', env: testEnvironment(env) });
+    const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, input, encoding: 'utf8', env: testEnvironment(env) });
     assertOk(guarded);
     assert.equal(existsSync(marker), false, 'the guarded credential fill ran the askpass program that core.askPass names');
   } finally {
@@ -4756,7 +4756,7 @@ test('a guarded command reads the global config that GIT_CONFIG_GLOBAL names, an
     const relocated = join(base, 'relocated.gitconfig');
     runGit(base, ['config', '-f', relocated, 'credential.helper', 'relocated-helper']);
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('config', '--get', 'credential.helper'); "CODE=$($run.code) VALUE=$(@($run.stdout) -join ',')"`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment({ ...env, GIT_CONFIG_GLOBAL: relocated.replace(/\\/g, '/') }) });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment({ ...env, GIT_CONFIG_GLOBAL: relocated.replace(/\\/g, '/') }) });
     assertOk(run);
     assert.match(run.stdout, /CODE=0 VALUE=relocated-helper/, run.stdout);
   } finally {
@@ -5054,7 +5054,7 @@ test('a checkout state whose filter name is not valid UTF-8 is unreadable, with 
     writeFile(checkout, 'notes.txt', 'two\n');
     bumpMtime(join(checkout, 'notes.txt'));
 
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(checkout)], { encoding: 'utf8', env: testEnvironment() });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(checkout)], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
     assertOk(run);
     assert.match(run.stdout, /COMMIT= DIRTY= UNREADABLE=a filter driver name is not valid UTF-8/, run.stdout);
     assert.equal(existsSync(marker), false, 'the checkout state ran the clean command of a filter whose name is not valid UTF-8');
@@ -5097,7 +5097,7 @@ test('a ref lookup whose ref name is not valid UTF-8 fails with that reason, and
     const sha = runGit(remote, ['rev-parse', 'main']);
     appendFileSync(join(remote, 'packed-refs'), Buffer.concat([Buffer.from(`${sha} refs/heads/`), INVALID_NAME, Buffer.from('\n')]));
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; try { $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref" } catch { "ERR=$($_.Exception.Message)" }`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
     assertOk(run);
     assert.match(run.stdout, /ERR=.*git output is not valid UTF-8/, run.stdout);
     assert.doesNotMatch(run.stdout, /REF=/, run.stdout);
@@ -5136,7 +5136,7 @@ withWorkspace('a global config that git cannot parse is named with git\'s messag
   const home = join(ctx.base, 'home');
   const env = homeEnv(home);
   appendFileSync(join(home, '.gitconfig'), '[broken\n');
-  const fixture = spawnSync('git', ['config', '--get', 'user.name'], { encoding: 'utf8', env, cwd: checkout });
+  const fixture = spawnSync('git', ['config', '--get', 'user.name'], { windowsHide: true, encoding: 'utf8', env, cwd: checkout });
   assert.notEqual(fixture.status, 0, 'the fixture global config parsed, so git reads it');
   const source = ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`];
 
@@ -5154,7 +5154,7 @@ withWorkspace('a global config that git cannot parse is named with git\'s messag
 test('a git that is too old is named as too old, a git that is new enough gives its own config error, and a git that cannot start says so', { skip }, () => {
   // A git older than 2.31 ignores the settings, so its probe is silent. A git whose config cannot be parsed prints git's error.
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Get-GitVersion { [version] '2.30' }; $old = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "OLD=$old"; function Get-GitVersion { [version] '2.55' }; $new = Get-GitEnvConfigFault ([pscustomobject]@{ code = 128; stderr = @('fatal: bad config line 1') }); "NEW=$new"; $silent = Get-GitEnvConfigFault ([pscustomobject]@{ code = 1; stderr = @() }); "SILENT=$silent"; function Get-GitVersion { $null }; $absent = Get-GitEnvConfigFault ([pscustomobject]@{ code = $null; stderr = @('git could not start: no such file') }); "ABSENT=$absent"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /OLD=git 2\.31 or later is needed, so the filter guard cannot be passed/, run.stdout);
   assert.match(run.stdout, /NEW=git could not read its configuration, so the filter guard cannot be passed: fatal: bad config line 1/, run.stdout);
