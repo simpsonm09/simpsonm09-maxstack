@@ -18,7 +18,7 @@ const RUN_CEILING_MS = 30_000;
 
 function findPwsh() {
   for (const name of ["pwsh", "powershell"]) {
-    if (spawnSync(name, ["-NoProfile", "-Command", "exit 0"]).status === 0)
+    if (spawnSync(name, ["-NoProfile", "-Command", "exit 0"], { windowsHide: true }).status === 0)
       return name;
   }
   return null;
@@ -42,7 +42,7 @@ function powerShellLiteral(value) {
 
 function runWithPipedOutput(args) {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(pwsh, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(pwsh, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const started = Date.now();

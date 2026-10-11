@@ -16,7 +16,7 @@ const verifier = join(repoRoot, 'scripts', 'verify-manifests.py');
 
 function findPython() {
   for (const name of ['python', 'python3']) {
-    if (spawnSync(name, ['--version']).status === 0) return name;
+    if (spawnSync(name, ['--version'], { windowsHide: true }).status === 0) return name;
   }
   return null;
 }
@@ -49,11 +49,11 @@ function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinL
     copyFileSync(join(repoRoot, 'scripts', 'verify_ownership.py'), join(root, 'scripts', 'verify_ownership.py'));
     for (const [rel, content] of Object.entries(extraFiles)) writeFileSync(join(root, rel), content);
     if (Object.keys(tracked).length > 0) {
-      spawnSync('git', ['init', '-q'], { cwd: root });
+      spawnSync('git', ['init', '-q'], { windowsHide: true, cwd: root });
       for (const [rel, content] of Object.entries(tracked)) {
         mkdirSync(dirname(join(root, rel)), { recursive: true });
         writeFileSync(join(root, rel), content);
-        spawnSync('git', ['add', '--', rel], { cwd: root });
+        spawnSync('git', ['add', '--', rel], { windowsHide: true, cwd: root });
       }
     }
     const args = [join(root, 'scripts', 'verify-manifests.py')];
@@ -61,7 +61,7 @@ function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinL
       writeFileSync(join(root, 'stack.lock.json'), JSON.stringify(lock));
       args.push('--lock', join(root, 'stack.lock.json'));
     }
-    return spawnSync(python, args, { encoding: 'utf8' });
+    return spawnSync(python, args, { windowsHide: true, encoding: 'utf8' });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -76,7 +76,7 @@ function failureOf(run) {
 }
 
 test('the shipped manifests pass the verifier', { skip }, () => {
-  const run = spawnSync(python, [verifier], { encoding: 'utf8' });
+  const run = spawnSync(python, [verifier], { windowsHide: true, encoding: 'utf8' });
   assert.equal(run.status, 0, failureOf(run));
   assert.match(run.stdout, /^PASS:/);
 });
@@ -187,7 +187,7 @@ test('the retired OpenCode port lock is refused while it exists', { skip }, () =
   assert.match(failureOf(run), /pstack-opencode\.lock\.json is retired/);
 });
 
-const git = spawnSync('git', ['--version']).status === 0;
+const git = spawnSync('git', ['--version'], { windowsHide: true }).status === 0;
 
 test('a tracked Python bytecode file is refused, and the message names it', { skip: python ? (git ? false : 'git is not available') : skip }, () => {
   const run = runVerifier({ tracked: { 'scripts/__pycache__/verify_ownership.cpython-312.pyc': 'bytecode\n' } });

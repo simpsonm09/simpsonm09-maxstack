@@ -44,7 +44,7 @@ function buildFixtures({ ids, rows }) {
 
 function runCheck(devSetup, orgPlugin) {
   const args = [script, '--dev-setup', devSetup, '--org-plugin', orgPlugin];
-  return spawnSync(process.execPath, args, { encoding: 'utf8', cwd: repoRoot });
+  return spawnSync(process.execPath, args, { windowsHide: true, encoding: 'utf8', cwd: repoRoot });
 }
 
 test('normalizeOwner drops npx and a leading at-sign, and takes the first command word', () => {
@@ -130,7 +130,7 @@ test(
   'the current workspace passes',
   { skip: hasSiblings ? false : 'the sibling checkouts are not present' },
   () => {
-    const run = spawnSync(process.execPath, [script], { encoding: 'utf8', cwd: repoRoot });
+    const run = spawnSync(process.execPath, [script], { windowsHide: true, encoding: 'utf8', cwd: repoRoot });
     assert.equal(run.status, 0, `expected a zero exit\n${run.stdout}\n${run.stderr}`);
     assert.match(run.stdout, /PASS: the agent tool set covers every service owner/);
   },

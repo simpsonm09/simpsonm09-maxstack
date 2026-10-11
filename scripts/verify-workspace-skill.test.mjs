@@ -19,7 +19,7 @@ const RUN_CEILING_MS = 90_000;
 
 function findPwsh() {
   for (const name of ['pwsh', 'powershell']) {
-    if (spawnSync(name, ['-NoProfile', '-Command', 'exit 0']).status === 0) return name;
+    if (spawnSync(name, ['-NoProfile', '-Command', 'exit 0'], { windowsHide: true }).status === 0) return name;
   }
   return null;
 }
@@ -73,6 +73,7 @@ test('the PowerShell check refuses to run without a model and starts no OpenCode
   try {
     const fake = writeStandIn(base, 'ps1', `'started' | Set-Content -LiteralPath '${marker}'\n`);
     const run = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-File', psScript, '-OpenCodeBinary', fake, '-Project', project], {
+      windowsHide: true,
       encoding: 'utf8',
       timeout: RUN_CEILING_MS,
     });
@@ -93,7 +94,7 @@ test('a hung PowerShell run stops at its limit and the check names the command',
     const run = spawnSync(
       pwsh,
       ['-NoProfile', '-NonInteractive', '-File', psScript, '-OpenCodeBinary', fake, '-Project', project, '-Model', 'opencode-go/test-model', '-CallTimeoutSeconds', '3'],
-      { encoding: 'utf8', timeout: RUN_CEILING_MS },
+      { windowsHide: true, encoding: 'utf8', timeout: RUN_CEILING_MS },
     );
     const elapsed = Date.now() - started;
     assertNoRunawayWait(run);
@@ -117,7 +118,7 @@ test('a run that loads the skill and reads its sibling file passes', { skip: pws
     const run = spawnSync(
       pwsh,
       ['-NoProfile', '-NonInteractive', '-File', psScript, '-OpenCodeBinary', fake, '-Project', project, '-Model', 'opencode-go/test-model'],
-      { encoding: 'utf8', timeout: RUN_CEILING_MS },
+      { windowsHide: true, encoding: 'utf8', timeout: RUN_CEILING_MS },
     );
     assertNoRunawayWait(run);
     assert.equal(run.status, 0, plainOutput(run));
@@ -128,7 +129,7 @@ test('a run that loads the skill and reads its sibling file passes', { skip: pws
 });
 
 test('the shell check refuses to run without a model argument', { skip: bash ? false : 'bash is not available' }, () => {
-  const run = spawnSync(bash, [forwardSlashes(shScript)], { encoding: 'utf8', timeout: RUN_CEILING_MS });
+  const run = spawnSync(bash, [forwardSlashes(shScript)], { windowsHide: true, encoding: 'utf8', timeout: RUN_CEILING_MS });
   assertNoRunawayWait(run);
   assert.equal(run.status, 1, run.stderr);
   assert.match(run.stderr, /pass the model as the second argument/);
@@ -139,6 +140,7 @@ test('a hung shell run stops at its limit and the check names the command', { sk
   try {
     const fake = writeStandIn(base, 'sh', 'sleep 120\n');
     const run = spawnSync(bash, [forwardSlashes(shScript), 'poteto-mode', 'opencode-go/test-model', '2'], {
+      windowsHide: true,
       encoding: 'utf8',
       timeout: RUN_CEILING_MS,
       env: {

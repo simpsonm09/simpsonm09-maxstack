@@ -46,7 +46,7 @@ let layersCounter = 0;
 // The installer needs PowerShell 7 (#requires -Version 7.0), so only pwsh is tried. Windows PowerShell 5.1 stops every installer
 // run with a version error, so it is never the shell. Without pwsh the tests skip with that reason.
 function findShell() {
-  return spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status === 0 ? 'pwsh' : null;
+  return spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0'], { windowsHide: true }).status === 0 ? 'pwsh' : null;
 }
 
 // On Windows a bash on PATH can be the WSL launcher, so use the one Git for Windows ships.
@@ -132,7 +132,7 @@ function makeFixture(base, { npm = false, shipLock = false, shipShrinkwrap = fal
   writeFile(dir, `${plugin}/pi/index.ts`, 'export default {};\n');
   writeFile(dir, 'other/notes.txt', 'outside the plugin folder\n');
   const git = (args) => {
-    const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8' });
+    const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { windowsHide: true, cwd: dir, encoding: 'utf8' });
     assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
     return run.stdout.trim();
   };
@@ -282,7 +282,7 @@ function runInstaller(shell, ctx, extra = [], { apply = true, layersFile = write
     ...(apply ? ['-Apply'] : []),
     ...extra,
   ];
-  return spawnSync(shell, args, { encoding: 'utf8', env: testEnvironment(env ?? ctx.env) });
+  return spawnSync(shell, args, { windowsHide: true, encoding: 'utf8', env: testEnvironment(env ?? ctx.env) });
 }
 
 // A junction reports as a symbolic link to lstat.
@@ -300,7 +300,7 @@ const skip = shell ? false : 'pwsh is not available';
 
 function findPython() {
   for (const name of ['python', 'python3']) {
-    if (spawnSync(name, ['--version']).status === 0) return name;
+    if (spawnSync(name, ['--version'], { windowsHide: true }).status === 0) return name;
   }
   return null;
 }
@@ -519,7 +519,7 @@ withWorkspace('copilot.cmd names each Claude folder in layer order, sets the swi
 withWorkspace('copilot.cmd runs the executable with the switch, the plugin folders, and the caller arguments', (ctx) => {
   mustApply(ctx);
   const wrapper = join(ctx.workspace, '.maxstack', 'bin', 'copilot.cmd');
-  const run = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --foo "a b""`], { encoding: 'utf8', windowsVerbatimArguments: true });
+  const run = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --foo "a b""`], { windowsHide: true, encoding: 'utf8', windowsVerbatimArguments: true });
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
   const plugins = join(ctx.workspace, '.claude', 'plugins');
   const args = run.stdout.split(/\r?\n/).find((line) => line.startsWith('ARGS='));
@@ -544,7 +544,7 @@ withWorkspaceNeeding('bash', findBash(), 'copilot.sh runs copilot from PATH with
   const env = { ...process.env };
   const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
   env[pathKey] = `${fakeBin}${process.platform === 'win32' ? ';' : ':'}${env[pathKey] ?? ''}`;
-  const run = spawnSync(bash, [join(ctx.workspace, '.maxstack', 'bin', 'copilot.sh').replaceAll('\\', '/'), '--foo', 'a b'], { encoding: 'utf8', env });
+  const run = spawnSync(bash, [join(ctx.workspace, '.maxstack', 'bin', 'copilot.sh').replaceAll('\\', '/'), '--foo', 'a b'], { windowsHide: true, encoding: 'utf8', env });
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
   assert.match(run.stdout, /ASK=allow/);
   assert.match(run.stdout, /ARG=--plugin-dir/);
@@ -605,11 +605,11 @@ withWorkspace('an offline re-apply reuses the cached commit', (ctx) => {
 withWorkspace('the cache follows the layer url, even when it was cloned from another remote', (ctx) => {
   mustApply(ctx);
   const cache = join(ctx.workspace, '.claude', 'cache', 'pstack');
-  const drifted = spawnSync('git', ['-C', cache, 'remote', 'set-url', 'origin', 'file:///nonexistent/other-remote'], { encoding: 'utf8' });
+  const drifted = spawnSync('git', ['-C', cache, 'remote', 'set-url', 'origin', 'file:///nonexistent/other-remote'], { windowsHide: true, encoding: 'utf8' });
   assert.equal(drifted.status, 0, drifted.stderr);
 
   mustApply(ctx);
-  const origin = spawnSync('git', ['-C', cache, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).stdout.trim();
+  const origin = spawnSync('git', ['-C', cache, 'remote', 'get-url', 'origin'], { windowsHide: true, encoding: 'utf8' }).stdout.trim();
   assert.equal(origin, ctx.fixture.url, 'the cache origin was not reset to the layer url');
 }, {});
 
@@ -804,7 +804,7 @@ withWorkspace('pi.cmd sets the agent folder and the ask switch, runs the Pi CLI 
   assert.ok(text.includes('set "AGENT_ACCESS_PI_ASK=allow"'), 'the ask switch is not set');
   assert.ok(text.includes(`set "PI_BIN=${ctx.fakePi}"`), 'the wrapper does not name the Pi CLI found at install time');
 
-  const run = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --mode rpc "a b""`], { encoding: 'utf8', windowsVerbatimArguments: true });
+  const run = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --mode rpc "a b""`], { windowsHide: true, encoding: 'utf8', windowsVerbatimArguments: true });
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
   assert.ok(run.stdout.includes(`AGENT_DIR=${join(ctx.workspace, '.pi', 'agent')}`), run.stdout);
   assert.match(run.stdout, /ASK=allow/);
@@ -812,7 +812,7 @@ withWorkspace('pi.cmd sets the agent folder and the ask switch, runs the Pi CLI 
 
   const other = join(ctx.base, 'other-pi.cmd');
   writeFileSync(other, '@echo off\r\necho OTHER=%PI_CODING_AGENT_DIR%\r\n');
-  const overridden = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --mode rpc"`], { encoding: 'utf8', windowsVerbatimArguments: true, env: { ...process.env, MAXSTACK_PI_BIN: other } });
+  const overridden = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" --mode rpc"`], { windowsHide: true, encoding: 'utf8', windowsVerbatimArguments: true, env: { ...process.env, MAXSTACK_PI_BIN: other } });
   assert.equal(overridden.status, 0, `${overridden.stdout}\n${overridden.stderr}`);
   assert.ok(overridden.stdout.includes(`OTHER=${join(ctx.workspace, '.pi', 'agent')}`), 'MAXSTACK_PI_BIN did not name the CLI that ran');
 }, {});
@@ -825,6 +825,7 @@ withWorkspace('pi.cmd passes arguments to an .exe target unchanged', (ctx) => {
   writeFileSync(script, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n');
   const wrapper = join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd');
   const run = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${wrapper}" "${script}" "a^b" "100%""`], {
+    windowsHide: true,
     encoding: 'utf8',
     windowsVerbatimArguments: true,
     env: { ...process.env, MAXSTACK_PI_BIN: process.execPath },
@@ -872,7 +873,7 @@ withWorkspaceNeeding('bash', findBash(), 'pi.sh runs pi from PATH with the agent
   const script = join(ctx.workspace, '.maxstack', 'bin', 'pi.sh').replaceAll('\\', '/');
   const agentDir = join(ctx.workspace, '.pi', 'agent').replaceAll('\\', '/');
 
-  const run = spawnSync(bash, [script, '--mode', 'rpc', 'a b'], { encoding: 'utf8', env });
+  const run = spawnSync(bash, [script, '--mode', 'rpc', 'a b'], { windowsHide: true, encoding: 'utf8', env });
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
   assert.ok(run.stdout.includes(`AGENT=${agentDir}`), run.stdout);
   assert.match(run.stdout, /ASK=allow/);
@@ -882,7 +883,7 @@ withWorkspaceNeeding('bash', findBash(), 'pi.sh runs pi from PATH with the agent
   writeFileSync(overrideBin, '#!/bin/sh\nprintf "OVERRIDE=%s\\n" "$1"\n');
   chmodSync(overrideBin, 0o755);
   const noPi = { ...process.env, [pathKey]: '/nonexistent-maxstack-path', MAXSTACK_PI_BIN: overrideBin.replaceAll('\\', '/') };
-  const overridden = spawnSync(bash, [script, 'rpc'], { encoding: 'utf8', env: noPi });
+  const overridden = spawnSync(bash, [script, 'rpc'], { windowsHide: true, encoding: 'utf8', env: noPi });
   assert.equal(overridden.status, 0, `${overridden.stdout}\n${overridden.stderr}`);
   assert.match(overridden.stdout, /OVERRIDE=rpc/);
 }, {});
@@ -1040,7 +1041,7 @@ withWorkspaceNeeding('python', python, 'the verifier fails when a configured CLI
   env[pathKey] = `${cliDir}${process.platform === 'win32' ? ';' : ':'}${env[pathKey] ?? ''}`;
   assert.ok(fakePi.startsWith(cliDir));
 
-  const run = spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8', env });
+  const run = spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8', env });
   assert.notEqual(run.status, 0, 'the verifier passed with the Pi CLI on PATH and no Pi wrapper');
   assert.match(plainOutput(run), /the pi CLI is on PATH.*rerun Install-Workspace\.ps1 -Apply/);
 }, {});
@@ -1058,7 +1059,7 @@ test('the shell wrappers are executable off Windows, and the verifier checks the
     const bin = join(ctx.workspace, '.maxstack', 'bin');
     const home = join(ctx.base, 'home');
     mkdirSync(home);
-    const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+    const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
 
     await t.test('pi.sh and copilot.sh have the executable bit', { skip: posix ? false : 'the executable bit is POSIX-only' }, () => {
       for (const name of ['pi.sh', 'copilot.sh']) {
@@ -1119,7 +1120,7 @@ test('a wrapper takes an extensionless CLI off Windows, and refuses PowerShell a
   try {
     const harness = join(dir, 'harness.ps1');
     writeFileSync(harness, wrapperTargetHarness(WRAPPER_TARGET_CASES));
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', harness, installer], { encoding: 'utf8' });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', harness, installer], { windowsHide: true, encoding: 'utf8' });
     assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
     const results = JSON.parse(run.stdout);
     for (const [path, windows, accepted] of WRAPPER_TARGET_CASES) {
@@ -1135,7 +1136,7 @@ withWorkspaceNeeding('python', python, 'the workspace verifier passes after an a
   mustApply(ctx);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
 
   const passed = verify();
   assert.equal(passed.status, 0, `${passed.stdout}\n${passed.stderr}`);
@@ -1154,7 +1155,7 @@ withWorkspaceNeeding('python', python, 'the verifier compares the agent folder i
   mustApply(ctx);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
   const shPath = join(ctx.workspace, '.maxstack', 'bin', 'pi.sh');
   const lockPath = join(ctx.workspace, 'stack.lock.json');
 
@@ -1178,7 +1179,7 @@ withWorkspaceNeeding('python', python, 'the workspace verifier checks the Pi wra
   mustApply(ctx);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = () => spawnSync(python, [join(repoRoot, 'scripts', 'verify-workspace-install.py'), '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
   const settingsPath = join(ctx.workspace, '.pi', 'agent', 'settings.json');
 
   const passed = verify();
@@ -1265,7 +1266,7 @@ withWorkspace('apply records an owned entry for every path it wrote, and the rec
     assert.ok(find(`.opencode/agents/${name}`, 'file'), `${name} is written but not recorded`);
   }
 
-  const check = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { encoding: 'utf8' });
+  const check = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { windowsHide: true, encoding: 'utf8' });
   assert.equal(check.status, 0, `${check.stdout}\n${check.stderr}`);
 }, {});
 
@@ -1488,7 +1489,7 @@ withWorkspaceNeeding('python', python, 'the workspace verifier checks each owned
   mustApply(ctx);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
   assert.equal(verify().status, 0, 'the verifier refused a fresh apply');
 
   const lock = readJson(lockPath(ctx));
@@ -1584,7 +1585,7 @@ withWorkspace('the recorded hashes match an independent recomputation, and each 
   assert.equal(ownedRecord(lock, '.opencode/agents/pstack-agent.md', 'file').sha256, sha256Upper(readFileSync(at('.opencode/agents/pstack-agent.md'))));
   assert.equal(ownedRecord(lock, '.claude/plugins/simpsonm09-org-ai-plugin', 'link').target, ORG_FOLDER);
   assert.deepEqual(ownedRecord(lock, '.pi/agent/settings.json', 'json-entries', 'packages').entries, ['../../.claude/cache/pstack']);
-  const check = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { encoding: 'utf8' });
+  const check = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { windowsHide: true, encoding: 'utf8' });
   assert.equal(check.status, 0, `${check.stdout}\n${check.stderr}`);
 }, {});
 
@@ -1670,7 +1671,7 @@ withWorkspace('an unsynced pinned cache reports only the entries it cannot know,
   // The pin moves to a commit the cache has not fetched: pstack's folders and entries are unknown.
   writeFileSync(join(ctx.fixture.dir, 'bump.txt'), 'bump\n');
   const commit = (args) => {
-    const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', '-C', ctx.fixture.dir, ...args], { encoding: 'utf8' });
+    const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', '-C', ctx.fixture.dir, ...args], { windowsHide: true, encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
     return run.stdout.trim();
   };
@@ -2002,7 +2003,7 @@ withWorkspaceNeeding('python', python, 'a lock with no selection reads as all, a
   assert.match(status.stdout, /^Selection: runtimes claude, copilot, opencode, pi; layers pstack, simpsonm09-org-ai-plugin, simpsonm09-personal-ai-plugin \(the lock predates the selection, so all\)\r?$/m, status.stdout);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
   assert.equal(verify.status, 0, `${verify.stdout}\n${verify.stderr}`);
   mustApply(ctx);
   assert.deepEqual(selectionOf(ctx), { runtimes: ALL_RUNTIMES, layers: ALL_LAYERS });
@@ -2035,9 +2036,9 @@ withWorkspaceNeeding('python', python, 'the owned list names only selected outpu
   }
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verify = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
+  const verify = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
   assert.equal(verify.status, 0, `${verify.stdout}\n${verify.stderr}`);
-  const manifests = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { encoding: 'utf8' });
+  const manifests = spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { windowsHide: true, encoding: 'utf8' });
   assert.equal(manifests.status, 0, `${manifests.stdout}\n${manifests.stderr}`);
 }, {});
 
@@ -2045,8 +2046,8 @@ withWorkspaceNeeding('python', python, 'the verifiers fail on an unknown, a malf
   mustApply(ctx, ['-Runtimes', 'claude,copilot']);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verifyWorkspace = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
-  const verifyLock = () => spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { encoding: 'utf8' });
+  const verifyWorkspace = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
+  const verifyLock = () => spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { windowsHide: true, encoding: 'utf8' });
   const cases = [
     [(lock) => { lock.selection.runtimes = ['claude', 'codex']; }, /names unknown \['codex'\]/],
     [(lock) => { lock.selection.runtimes = ['copilot']; }, /selects copilot without claude/],
@@ -2236,8 +2237,8 @@ withWorkspaceNeeding('python', python, 'the verifiers reject an enabled pi or co
   mustApply(ctx, ['-Runtimes', 'claude']);
   const home = join(ctx.base, 'home');
   mkdirSync(home);
-  const verifyWorkspace = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { encoding: 'utf8' });
-  const verifyLock = () => spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { encoding: 'utf8' });
+  const verifyWorkspace = () => spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
+  const verifyLock = () => spawnSync(python, [verifyManifestsScript, '--lock', lockPath(ctx)], { windowsHide: true, encoding: 'utf8' });
   const clean = verifyWorkspace();
   assert.equal(clean.status, 0, `${clean.stdout}\n${clean.stderr}`);
   assert.equal(verifyLock().status, 0);
@@ -2697,7 +2698,7 @@ withWorkspace('-Remove -Apply keeps a hand-edited Copilot wrapper even when the 
 function holdExclusive(path) {
   const ready = join(tmpdir(), `maxstack-ready-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const script = `$f = [IO.File]::Open('${path.replaceAll("'", "''")}', 'Open', 'Read', 'Read'); New-Item -ItemType File -Path '${ready.replaceAll("'", "''")}' | Out-Null; Start-Sleep -Seconds 300`;
-  const child = spawn(shell, ['-NoProfile', '-Command', script], { stdio: 'ignore' });
+  const child = spawn(shell, ['-NoProfile', '-Command', script], { windowsHide: true, stdio: 'ignore' });
   const deadline = Date.now() + 60000;
   while (!existsSync(ready)) {
     if (Date.now() > deadline) throw new Error(`the holder did not open ${path}`);
@@ -3236,7 +3237,7 @@ withWorkspace('a plain apply keeps a journaled quarantine whose files changed, n
 // ---- Layer sources: -Source, the -LayerSource alias, and the recorded override -----------------------------------
 // A git command in a folder. A failing command fails the test, so a fixture that did not build is never a result.
 function gitRun(dir, args) {
-  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8' });
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { windowsHide: true, cwd: dir, encoding: 'utf8' });
   assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
   return run.stdout.trim();
 }
@@ -3267,7 +3268,7 @@ function commitToBranch(ctx, bare, branch, relPath, content) {
   const work = join(ctx.base, 'work');
   if (!existsSync(work)) gitRun(ctx.base, ['clone', '--quiet', bare, work]);
   gitRun(work, ['fetch', '--quiet', 'origin']);
-  const hasBranch = spawnSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).status === 0;
+  const hasBranch = spawnSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { windowsHide: true }).status === 0;
   gitRun(work, ['checkout', '-q', '-B', branch, hasBranch ? `origin/${branch}` : 'origin/HEAD']);
   writeFile(work, relPath, content);
   gitRun(work, ['add', '-A']);
@@ -3765,7 +3766,7 @@ const SHORTHAND_URL = 'https://github.com/simpsonm09/pstack-claude.git';
 
 function resolveShorthand(env) {
   const script = `. '${layerSourcesFile}'; Get-GitHubRemoteUrl -Owner 'simpsonm09' -Repo 'pstack-claude'`;
-  return spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+  return spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env });
 }
 
 test('without the test-mode flag the owner/repo shorthand names github.com, even when the test root is set', { skip }, () => {
@@ -3795,7 +3796,7 @@ withWorkspace('without the test-mode flag, a -Source owner/repo at a commit is a
   const env = { ...process.env, MAXSTACK_TEST_GITHUB_ROOT: join(ctx.base, 'github') };
   delete env.MAXSTACK_TEST_MODE;
   const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', ctx.workspace, '-LayersFile', writeLayers(ctx),
-    '-CopilotCommand', ctx.fakeCopilot, '-PiCommand', ctx.fakePi, '-Source', `pstack=simpsonm09/pstack-claude@${sha}`], { encoding: 'utf8', env });
+    '-CopilotCommand', ctx.fakeCopilot, '-PiCommand', ctx.fakePi, '-Source', `pstack=simpsonm09/pstack-claude@${sha}`], { windowsHide: true, encoding: 'utf8', env });
   assertOk(run);
   assert.ok(run.stdout.includes(`override, git ${SHORTHAND_URL} ref ${sha} at ${sha}`), run.stdout);
   assert.ok(!run.stdout.includes(join(ctx.base, 'github')), 'the test root was used');
@@ -3877,7 +3878,7 @@ withWorkspace('an invalid recorded override is ignored by -Update, -Remove, and 
 // Finding 7: git never waits on a credential prompt, and ls-remote gives up after its time limit with the reason.
 function runAsync(args, env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(shell, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(shell, args, { windowsHide: true, env, stdio: ['ignore', 'pipe', 'pipe'] });
     // A run that never ends is killed, so a failing test cannot leave the process behind.
     const guard = setTimeout(() => child.kill(), 100000);
     let stdout = '';
@@ -3896,7 +3897,7 @@ test('the git guard sets the prompt variables, and turns on file transport only 
   const script = `. '${layerSourcesFile}'; $vars = Get-GitChildVariables -Settings (Get-GitGuardSettings); "PROMPT=$($vars.GIT_TERMINAL_PROMPT)"; "GCM=$($vars.GCM_INTERACTIVE)"; (Get-GitGuardSettings | ForEach-Object { "$($_.key)=$($_.value)" }) -join ' '`;
   const real = { ...process.env };
   delete real.MAXSTACK_TEST_MODE;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: real });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: real });
   assertOk(run);
   assert.match(run.stdout, /PROMPT=0/, run.stdout);
   assert.match(run.stdout, /GCM=never/, run.stdout);
@@ -3905,7 +3906,7 @@ test('the git guard sets the prompt variables, and turns on file transport only 
   assert.match(run.stdout, /protocol\.allow=never/, run.stdout);
   assert.doesNotMatch(run.stdout, /protocol\.file\.allow/, 'a real run allows file transport');
 
-  const seam = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...real, MAXSTACK_TEST_MODE: '1' } });
+  const seam = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: { ...real, MAXSTACK_TEST_MODE: '1' } });
   assert.match(seam.stdout, /protocol\.file\.allow=always/, seam.stdout);
 }, {});
 
@@ -4047,7 +4048,7 @@ withWorkspace('a recorded override on a drive that is gone is reported as a miss
 test('the folder helper keeps a drive root whole, with its backslash', { skip }, () => {
   const driveRoot = parsePath(tmpdir()).root;
   const script = `. '${layerSourcesFile}'; Get-FullFolderPath '${driveRoot.split('\\').join('/')}'`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8' });
   assertOk(run);
   assert.equal(run.stdout.trim(), driveRoot, run.stdout);
 }, {});
@@ -4082,11 +4083,11 @@ withWorkspace('an audit of a -Source local tree runs no clean filter that its .g
 }, {});
 
 // Round 2, E: the installer needs PowerShell 7. Windows PowerShell 5.1 must stop with that requirement, not a parse error.
-const windowsPowerShell = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']).status === 0;
+const windowsPowerShell = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { windowsHide: true }).status === 0;
 test('the installer under Windows PowerShell 5.1 stops with the PowerShell 7 requirement, not a parse error', { skip: windowsPowerShell ? false : 'powershell.exe is not available' }, () => {
   const base = mkdtempSync(join(tmpdir(), 'maxstack-requires-'));
   try {
-    const run = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', join(base, 'missing')], { encoding: 'utf8' });
+    const run = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', installer, '-Workspace', join(base, 'missing')], { windowsHide: true, encoding: 'utf8' });
     const text = plainOutput(run);
     assert.notEqual(run.status, 0, text);
     assert.match(text, /#requires.*7\.0/i, text);
@@ -4151,7 +4152,7 @@ withWorkspace('an apply that runs npm counts the installed packages that declare
 test('a git output read that never completes returns within its bound, with no output', { skip, timeout: 60000 }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $task = [System.Threading.Tasks.TaskCompletionSource[string]]::new().Task; $read = Read-GitPipeBounded -Task $task -Milliseconds 1000; "COMPLETE=$read"`;
   const started = Date.now();
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 50000 });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', timeout: 50000 });
   assertOk(run);
   assert.ok(Date.now() - started < 40000, 'the read was not bounded');
   assert.ok(run.stdout.includes('COMPLETE=False'), run.stdout);
@@ -4231,7 +4232,7 @@ withWorkspace('the guard passes its filter settings to git in the child process,
   gitRun(tree, ['init', '-q']);
   gitRun(tree, ['config', 'filter.a=b.clean', 'touch x']);
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'status', '--porcelain'); "CODE=$($run.code)"; "LEFT=[$env:GIT_CONFIG_COUNT]"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /CODE=0/, run.stdout);
   assert.match(run.stdout, /LEFT=\[\]/, 'the guard left its settings in the installer environment');
@@ -4280,7 +4281,7 @@ withWorkspace('a tree that names exactly 100 filter drivers is still read', (ctx
 // since a throw there would stop -Status, -Update, and -Remove.
 test('a checkout probe that throws is reported as unreadable, and Set-LayerChoice does not throw', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { throw 'simulated git failure' }; $state = Get-LocalCheckoutState -Root $env:TEMP; "STATE=[$($state.unreadable)]"; $layer = @{ name = 'x'; sourcePath = '.'; root = $null; override = $false }; $choice = [pscustomobject]@{ kind = 'local'; url = $null; ref = $null; commit = $null; path = $env:TEMP; checkout = $env:TEMP; override = $true }; Set-LayerChoice -Layer $layer -Choice $choice; "LAYER=[$($layer.unreadable)]"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /STATE=\[the checkout could not be read: simulated git failure\]/, run.stdout);
   assert.match(run.stdout, /LAYER=\[the checkout could not be read: simulated git failure\]/, run.stdout);
@@ -4289,7 +4290,7 @@ test('a checkout probe that throws is reported as unreadable, and Set-LayerChoic
 // Finding 4: the guard turns off only the filters the tree itself defines: its own config, what its includes add, its per-worktree
 // config, and the names its attributes files use. The user's global and system filters run, as they do in any checkout.
 function runGit(dir, args, env = process.env) {
-  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { cwd: dir, encoding: 'utf8', env });
+  const run = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args], { windowsHide: true, cwd: dir, encoding: 'utf8', env });
   assert.equal(run.status, 0, `git ${args.join(' ')} failed: ${run.stderr}`);
   return run.stdout.trim();
 }
@@ -4333,7 +4334,7 @@ withWorkspace('a checkout runs the smudge filter that the user global config def
   runGit(ctx.base, ['clone', '-q', '--no-checkout', source, target], env);
 
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $target = '${target.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $target -Arguments @('-C', $target, 'checkout', '--quiet', '-f', 'HEAD'); "CODE=$($run.code)"`;
-  const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment(env) });
+  const guarded = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment(env) });
   assertOk(guarded);
   assert.match(guarded.stdout, /CODE=0/, guarded.stdout);
   assert.equal(readFileSync(join(target, 'a.txt'), 'utf8'), 'HELLO\n', 'the guarded checkout did not run the global smudge filter');
@@ -4458,7 +4459,7 @@ test('a non-ASCII setting reaches git intact, and a filter name git prints comes
     runGit(tree, ['config', 'filter.é.clean', 'x']);
     runGit(tree, ['config', 'filter.日本.clean', 'x']);
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $names = @((Read-TreeFilterNames -Dir $tree).names); $probe = @([pscustomobject]@{ key = 'maxstack.probe'; value = '日本é' }); $run = Invoke-GitProcess -Arguments @('config', '--get', 'maxstack.probe') -Settings $probe; "NAMES has_e=$($names -contains 'é') has_cjk=$($names -contains '日本') count=$($names.Count)"; "ENV code=$($run.code) same=$($run.stdout[0] -ceq '日本é')"`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
     assertOk(run);
     assert.match(run.stdout, /NAMES has_e=True has_cjk=True count=2/, run.stdout);
     assert.match(run.stdout, /ENV code=0 same=True/, run.stdout);
@@ -4481,7 +4482,7 @@ withWorkspace('an audit runs no clean filter whose name is empty, which .git/con
 
 test('the driver name of filter..clean is the empty name, and the guard passes it to git', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $name = Get-FilterDriverName 'filter..clean'; "NAME=[$name] IS_NULL=$($null -eq $name)"; $settings = @(Get-GitGuardSettings -FilterNames @($name)) | ForEach-Object { $_.key }; "HAS=$($settings -contains 'filter..clean')"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /NAME=\[\] IS_NULL=False/, run.stdout);
   assert.match(run.stdout, /HAS=True/, run.stdout);
@@ -4601,7 +4602,7 @@ withWorkspace('a ref lookup reads the remote it names, not the one a config in t
   runGit(evil, ['config', `url.${other.replace(/\\/g, '/')}.insteadOf`, remote.replace(/\\/g, '/')]);
 
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $ref = Find-GitRefCommit -Url '${remote.replace(/\\/g, '/')}' -Ref 'main'; "REF=$ref"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', cwd: evil, env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, new RegExp(`REF=${remoteSha}`), run.stdout);
   assert.notEqual(otherSha, remoteSha);
@@ -4615,7 +4616,7 @@ test('a git command that names no tree runs outside every repository, so the fol
     mkdirSync(evil);
     runGit(evil, ['init', '-q']);
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $run = Invoke-GitGuarded -Arguments @('rev-parse', '--is-inside-work-tree'); "CODE=$($run.code)"`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', cwd: evil, env: testEnvironment() });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', cwd: evil, env: testEnvironment() });
     assertOk(run);
     assert.doesNotMatch(run.stdout, /CODE=0/, 'a command that names no tree ran inside the repository of the folder it started from');
   } finally {
@@ -4645,7 +4646,7 @@ test('a checkout state reads its own HEAD, not the HEAD of the repository that G
     const other = committedRepo(base, 'other', 'other\n');
     const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
     const env = { ...testEnvironment(), GIT_DIR: join(other, '.git') };
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { windowsHide: true, encoding: 'utf8', env });
     assertOk(run);
     assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} `), run.stdout);
   } finally {
@@ -4661,7 +4662,7 @@ test('a checkout state reads its own worktree, not the worktree that GIT_WORK_TR
     const clean = committedRepo(base, 'clean', 'clean\n');
     const mineSha = runGit(mine, ['rev-parse', 'HEAD']);
     const env = { ...testEnvironment(), GIT_WORK_TREE: clean };
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { encoding: 'utf8', env });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', checkoutStateScript(mine)], { windowsHide: true, encoding: 'utf8', env });
     assertOk(run);
     assert.match(run.stdout, new RegExp(`COMMIT=${mineSha} DIRTY=True `), run.stdout);
   } finally {
@@ -4691,7 +4692,7 @@ test('the child environment loses each inherited git variable that names a repos
     'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'];
   // The names are set in lower case in a case-insensitive table, the way a Windows child environment holds them.
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $child = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase); foreach ($n in @(${names.map((name) => `'${name}'`).join(',')})) { $child[$n.ToLowerInvariant()] = 'x' }; $child['GIT_CONFIG_NOSYSTEM'] = '1'; Set-GitChildEnvironment -Environment $child -Settings @(); "LEFT=" + (@($child.Keys | Sort-Object) -join ',')`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /LEFT=GCM_INTERACTIVE,GIT_CONFIG_COUNT,GIT_CONFIG_NOSYSTEM,GIT_TERMINAL_PROMPT/, run.stdout);
 }, {});
@@ -4837,7 +4838,7 @@ test('a commit the guard runs runs no hook that the tree names in core.hooksPath
 
     const env = { ...testEnvironment(), GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
     const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $tree = '${tree.replace(/\\/g, '/')}'; $run = Invoke-GitGuarded -Dir $tree -Arguments @('-C', $tree, 'commit', '-q', '--allow-empty', '-m', 'guarded'); "CODE=$($run.code)"`;
-    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env });
+    const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env });
     assertOk(run);
     assert.match(run.stdout, /CODE=0/, run.stdout);
     assert.equal(existsSync(marker), false, 'the guarded commit ran the hook that core.hooksPath names');
@@ -4852,7 +4853,7 @@ withWorkspace('a tree whose config git cannot parse is reported unreadable, not 
   const broken = join(ctx.base, 'bad.cfg');
   writeFileSync(broken, '[broken\n');
   runGit(checkout, ['config', 'include.path', broken.replace(/\\/g, '/')]);
-  const fixture = spawnSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  const fixture = spawnSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { windowsHide: true, encoding: 'utf8' });
   assert.notEqual(fixture.status, 0, 'the fixture config parsed, so the tree is not broken');
 
   const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
@@ -4866,7 +4867,7 @@ withWorkspace('a tree whose config git cannot parse is reported unreadable, not 
 withWorkspace('a filter name of 33000 characters makes its tree unreadable as too long, and the tree is not read as a non-checkout', (ctx) => {
   const checkout = markedCheckoutWithCommit(ctx);
   appendFileSync(join(checkout, '.git', 'config'), `[filter "${'a'.repeat(33000)}"]\n\tclean = x\n`);
-  const fixture = spawnSync('git', ['-C', checkout, 'status', '--porcelain'], { encoding: 'utf8' });
+  const fixture = spawnSync('git', ['-C', checkout, 'status', '--porcelain'], { windowsHide: true, encoding: 'utf8' });
   assert.equal(fixture.status, 0, 'the fixture config does not parse for git, so the case is not the name length');
 
   const audit = runInstaller(shell, ctx, ['-Source', `simpsonm09-org-ai-plugin=local:${checkout}`], { apply: false });
@@ -4888,7 +4889,7 @@ withWorkspace('filter names that together need more environment than git can tak
 
 test('a cut-off read of the tree config is unreadable, not a list with no filter names', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitProcess { param($Arguments, $Settings, $TimeoutSeconds = 0, $WorkingDirectory = '', $CeilingDirectory = '') [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = (@($Arguments) -contains 'config') } }; $info = Read-TreeFilterNames -Dir 'C:/nowhere'; "FAULT=[$($info.fault)]"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /FAULT=\[.*cut off/, run.stdout);
 }, {});
@@ -4897,7 +4898,7 @@ test('a cut-off read of the tree config is unreadable, not a list with no filter
 // "false" is read as a path, so the value that means off is the empty string.
 test('the guard turns core.fsmonitor off with the empty string, which no git version reads as a path', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; $setting = Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }; "FSM=[$($setting.value)] COUNT=$(@(Get-GitGuardSettings | Where-Object { $_.key -eq 'core.fsmonitor' }).Count)"`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /FSM=\[\] COUNT=1/, run.stdout);
 }, {});
@@ -4972,7 +4973,7 @@ withWorkspace('a recorded override with a relative path is warned and refused wi
 // not a result, so the ref lookup says so instead of "no branch or tag named".
 test('a ref lookup whose git output was cut off says so, and does not report a missing ref', { skip }, () => {
   const script = `$ErrorActionPreference = 'Stop'; . '${layerSourcesFile}'; function Invoke-GitGuarded { [pscustomobject]@{ unreadable = $null; timedOut = $false; code = 0; text = ''; stdout = @(); stderr = @(); incomplete = $true } }; try { Find-GitRefCommit -Url 'https://example.com/team/layer.git' -Ref 'main' } catch { "ERR=$($_.Exception.Message)" }`;
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: testEnvironment() });
+  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8', env: testEnvironment() });
   assertOk(run);
   assert.match(run.stdout, /ERR=.*git output was cut off/, run.stdout);
   assert.doesNotMatch(run.stdout, /no branch or tag named/, run.stdout);
