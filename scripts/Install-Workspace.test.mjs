@@ -1132,6 +1132,16 @@ withWorkspaceNeeding('python', python, 'the verifier fails when a configured CLI
   assert.match(plainOutput(run), /the pi CLI is on PATH.*rerun Install-Workspace\.ps1 -Apply/);
 }, {});
 
+withWorkspaceNeeding('python', python, 'the verifier fails when a workspace-local Pi has no recorded wrapper, as the installer finds it before PATH', (ctx) => {
+  mustApply(ctx, ['-PiCommand', MISSING_PI]);
+  const home = join(ctx.base, 'home');
+  mkdirSync(home);
+  writeLocalPi(ctx);
+  const run = spawnSync(python, [verifyWorkspaceScript, '--workspace', ctx.workspace, '--home', home], { windowsHide: true, encoding: 'utf8' });
+  assert.notEqual(run.status, 0, 'the verifier passed with a workspace-local Pi and no Pi wrapper');
+  assert.match(plainOutput(run), /the pi CLI is installed under .*rerun Install-Workspace\.ps1 -Apply/);
+}, {});
+
 // T3 spawns binaryPath directly, so the .sh wrappers need the executable bit off Windows.
 // Windows has no mode bits to check, so only those assertions are skipped there.
 test('the shell wrappers are executable off Windows, and the verifier checks the bit', { skip }, async (t) => {
