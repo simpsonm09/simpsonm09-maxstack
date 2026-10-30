@@ -132,7 +132,11 @@ The variable is set in the wrapper, not in the T3 instance, so other Copilot run
 
 ### What works on Copilot
 
-On Windows, pstack's PreToolUse hook is a no-op stub under Copilot, so its file-read and subagent-model checks do not run there. The SessionStart context, the skills, and the org gate work on Copilot. Hosted macOS CI checks wrapper generation and the no-login installer lifecycle. The owner still needs to run the installer on the work Mac, start a fresh session through `copilot.sh`, sign in, and confirm that PStack and the organization skills load. Copilot does not receive the generated workspace instruction file in a session inside a repository. This is a known gap. See [current delivery state](features/current-alignment.md).
+The selected PStack pin (`671d84b7eb799c2c38ec39b11deac54a45d524fb`) declares a Windows `PreToolUse` command in `hooks/copilot-hooks.json`. Its `pre-tool-use-windows.ps1` adapter converts Windows payload paths, locates Git for Windows shell tools, invokes the shared `pre-tool-use.sh`, and forwards successful hook output. The installed `.claude/plugins/pstack` adapter matches the selected source file by SHA-256. This evidence covers source and one installed file only.
+
+The adapter fails open with a silent exit 0 and no decision on setup or runtime errors, or after its internal 8-second kill timeout. Copilot declares a separate 10-second hook timeout; its handling of no decision and whether that timeout fires are unverified. The named Windows adapter test belongs to PStack and was not run for this Maxstack change because Bun was unavailable. Its source asserts Windows task-deny output parity with POSIX, but Windows behavior is unverified. No observation proves Copilot or T3 loads or invokes the hook. The PStack permission/model hook is separate from the organization access gate; this is not evidence of guard parity. Evidence for one does not establish the other. The SessionStart context, skills, and org gate have their own evidence.
+
+When selected layers declare workspace instructions, the generated Copilot wrappers append an installer-owned `.maxstack/copilot-instructions` directory to `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`; that directory contains a projected `AGENTS.md`, intended to let Copilot discover the selected-layer instructions from a nested repository. The wrappers preserve any existing comma-separated directory list, and planning refuses a projected instruction path containing a comma because the CLI variable has no escaping syntax, or an exclamation mark because cmd delayed expansion can remove it. Validation occurs before installer writes, even when Copilot is not installed. Hosted macOS CI checks wrapper generation and the no-login installer lifecycle. Offline fixtures verify environment and file projection only; the owner still needs to run the installer on the work Mac, start a fresh session through `copilot.sh`, sign in, and confirm that the T3 ACP provider launches the wrapper and Copilot loads the projected instructions. Actual T3 environment inheritance and live instruction consumption remain unverified. See [current delivery state](features/current-alignment.md).
 
 ## Pi (maxstack)
 
@@ -161,12 +165,17 @@ The Pi harness asks RPC `get_commands` for loaded commands and checks that `/loo
 
 Not verified: the `piSimpsonm09` instance in a T3 session, any model turn, a login, an org gate decision under a real Pi session (the rpc probe lists no commands for the gate), and `pi.sh` run with the real Pi CLI. On macOS, nothing in this section has been run.
 
-Update the workspace-local CLI with `pwsh -File scripts/Install-Workspace.ps1 -Workspace <workspace> -UpdatePi` to
-audit, then add `-Apply` to perform the update. Use `-PiVersion <version>` to pin a release, such as
-`-UpdatePi -PiVersion 1.2.0 -Apply`. Do not use `pi update --self` for this install. Pi cannot self-update a
-workspace-local npm dependency. The installer uses npm to update only `.maxstack/npm`. npm may warn that some packages
-have install scripts that are not covered. This is expected because scripts are not run. An update does not require
-another installer apply. The wrappers and `.pi\agent\settings.json` do not depend on the Pi version.
+When the workspace wrapper selected its managed local Pi, `pi update --self` asks npm for the latest package in that
+workspace's `.maxstack/npm` prefix and skips lifecycle scripts. On Windows, the command wrapper delegates validation
+to an installer-owned Node helper in `.maxstack/bin`. The wrapper refuses if that package has disappeared,
+if `MAXSTACK_PI_BIN` overrides the selection, or if any extra argument follows `--self`, including an empty argument.
+If the wrapper selected an external or global Pi, it names that path and refuses without running npm. The wrapper
+command always selects latest.
+
+You can also audit the update with `pwsh -File scripts/Install-Workspace.ps1 -Workspace <workspace> -UpdatePi`, then
+add `-Apply` to perform it. This installer path can pin a release with `-PiVersion <version>`, such as
+`-UpdatePi -PiVersion 1.2.0 -Apply`. Both paths update only `.maxstack/npm`; an update does not require another
+installer apply. The wrappers and `.pi\agent\settings.json` do not depend on the Pi version.
 
 ### Check Pi without a model
 
@@ -232,7 +241,7 @@ What Codex receives:
 - Instructions: the generated workspace root `AGENTS.md`, or an existing user `AGENTS.md` that maxstack kept. Codex reads it only when the launch arguments name `stack.lock.json`. If a root collision sends the shared text to `.maxstack/workspace-instructions.md`, Codex does not load that fallback automatically.
 - The access gate: the org layer's PreToolUse hook from `.codex/config.toml`, when approved in Codex. MCP servers and custom agents are not delivered yet.
 
-Verified: `codex debug prompt-input` from a nested repository reads the generated workspace `AGENTS.md` when the launch arguments name the marker. This probe needs no login and makes no model call. Hook discovery and trust are measured separately with `codex app-server hooks/list`. A T3 Codex session and a live gated turn are not verified.
+Verified in a corrected controlled fixture on 2026-10-22 with Codex CLI 0.163.0: the parent workspace contains `stack.lock.json` and a sentinel `AGENTS.md`, while a nested Git repository has no marker. `debug prompt-input` from the nested repository omits the parent sentinel by default and includes it with `-c project_root_markers=["stack.lock.json"]`. The rerunnable `just verify-codex-discovery <native-codex-path>` acceptance check repeats this local CLI test in a synthetic workspace and empty fixture-local `CODEX_HOME`; it prints only a validated version, status, fixed diagnostic category, and sentinel booleans. It needs no login and makes no model call. This establishes local Codex marker semantics only; it does not verify T3 launch arguments, hook invocation or trust, or model inheritance. Hook discovery and trust are measured separately with `codex app-server hooks/list`. A T3 Codex session and a live gated turn are not verified.
 
 ## Cursor and Antigravity
 

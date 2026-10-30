@@ -27,6 +27,7 @@ test('owned record verifier accepts current installer runtime shapes and rejects
     { ...common, path: '.codex/config.toml', runtime: 'codex', hookHash: `sha256:${'a'.repeat(64)}` },
     { ...common, path: '.pstack/pstack-t3-instances.json', runtime: 't3-gated-instances' },
     { ...common, path: '.maxstack/workspace-instructions.md', runtime: 'workspace-instructions' },
+    { ...common, path: '.maxstack/copilot-instructions/AGENTS.md', runtime: 'workspace-instructions' },
     { ...common, path: '.agents/skills/shared-demo', kind: 'dir', runtimes: ['antigravity', 'codex'], sha256: fileHash },
   ];
   assert.deepEqual(check(valid), []);

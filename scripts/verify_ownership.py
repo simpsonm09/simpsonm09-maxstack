@@ -278,7 +278,7 @@ def owned_runtime(path: str) -> str | None:
         return "pi"
     if path == ".pstack/pstack-t3-instances.json":
         return "t3-gated-instances"
-    if path in ("AGENTS.md", "CLAUDE.md", ".maxstack/workspace-instructions.md"):
+    if path in ("AGENTS.md", "CLAUDE.md", ".maxstack/workspace-instructions.md", ".maxstack/copilot-instructions/AGENTS.md"):
         return "workspace-instructions"
     return None
 
