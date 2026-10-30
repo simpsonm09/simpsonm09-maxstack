@@ -42,6 +42,9 @@ const ALL_LAYERS = ['pstack', ORG, PERSONAL];
 // The skills the kit's pstack fixture ships.
 const PSTACK_SKILLS = ['poteto-mode', 'setup-pstack', 'principle-laziness-protocol'];
 const LAUNCH_LINE = `-c "project_root_markers=['stack.lock.json']"`;
+const METADATA_SKILL = skillMarkdown('org-demo', {
+  extra: 'license: MIT\ncompatibility: fixture\nmetadata: {"team": "test"}\nallowed-tools: Read\nuser-invocable: false\npaths: src/**\nfuture-key: preserved\n',
+});
 
 // A SKILL.md the generator accepts: a frontmatter name equal to the folder, and a description.
 function skillMarkdown(name, { description = 'fixture skill', frontmatterName = name, extra = '' } = {}) {
@@ -226,6 +229,7 @@ function withContext(name, body, options) {
 
 withContext('codex copies each selected layer skill into .agents/skills and records each folder as owned by codex', (shared) => {
   const ctx = addWorkspace(shared, 'skills');
+  writeFile(ctx.workspace, `${LAYER_PATH[ORG]}/skills/org-demo/SKILL.md`, METADATA_SKILL);
   const run = mustRun(ctx, ['-Runtimes', 'codex']);
 
   const lock = readLock(ctx);
@@ -237,7 +241,8 @@ withContext('codex copies each selected layer skill into .agents/skills and reco
 
   const orgSource = readFileSync(join(ctx.workspace, LAYER_PATH[ORG], 'skills', 'org-demo', 'SKILL.md'), 'utf8');
   const personalSource = readFileSync(join(ctx.workspace, LAYER_PATH[PERSONAL], 'skills', 'personal-demo', 'SKILL.md'), 'utf8');
-  assert.equal(readFileSync(join(ctx.workspace, '.agents', 'skills', 'org-demo', 'SKILL.md'), 'utf8'), orgSource, 'org-demo is a byte copy');
+  assert.equal(orgSource, METADATA_SKILL, 'the fixture carries non-common and unknown frontmatter keys');
+  assert.equal(readFileSync(join(ctx.workspace, '.agents', 'skills', 'org-demo', 'SKILL.md'), 'utf8'), orgSource, 'org-demo is a byte copy including every frontmatter key');
   assert.equal(readFileSync(join(ctx.workspace, '.agents', 'skills', 'personal-demo', 'SKILL.md'), 'utf8'), personalSource, 'personal-demo is a byte copy');
   assert.match(readFileSync(join(ctx.workspace, '.agents', 'skills', 'poteto-mode', 'SKILL.md'), 'utf8'), /name: poteto-mode/, 'the pstack skill came from the pinned pstack source');
 
@@ -676,6 +681,7 @@ withContext('verify-workspace-install.py passes a codex workspace', (shared) => 
 
 withContext('antigravity copies selected layer skills once and records explicit runtime claims', (shared) => {
   const ctx = addWorkspace(shared, 'antigravity');
+  writeFile(ctx.workspace, `${LAYER_PATH[ORG]}/skills/org-demo/SKILL.md`, METADATA_SKILL);
   mustRun(ctx, ['-Runtimes', 'antigravity']);
   const antiLock = readLock(ctx);
   assert.deepEqual(antiLock.selection.runtimes, ['antigravity']);
@@ -685,6 +691,8 @@ withContext('antigravity copies selected layer skills once and records explicit 
     return true;
   }));
   assert.ok(lstatSafe(join(ctx.workspace, '.agents', 'skills', 'org-demo')));
+  assert.equal(readFileSync(join(ctx.workspace, '.agents', 'skills', 'org-demo', 'SKILL.md'), 'utf8'), METADATA_SKILL,
+    'Antigravity keeps the same source frontmatter bytes in the shared .agents/skills projection');
   const antiStatus = runInstaller(shell, ctx, ['-Status', '-Strict'], { apply: false });
   assert.equal(antiStatus.status, 0, plainOutput(antiStatus));
 

@@ -14,7 +14,7 @@ Each harness decides for itself where it looks for configuration. Most do not lo
 
 | Artifact | Across the seven runtimes |
 | --- | --- |
-| `SKILL.md` | Portable. The common frontmatter is `name`, `description`, `license`, `compatibility`, `metadata`, and `allowed-tools`. The neutral source may use more keys, such as `user-invocable` and `paths` (24 and 1 of PStack's 58 skills today). The generator strips or maps any key a runtime does not understand. Pi, for one, ignores `user-invocable`, so the principle skills only show up in its completion list. |
+| `SKILL.md` | maxstack validates `name` and `description`, rejects `model`, and copies each source file byte-for-byte to the runtime skill path. It does not strip or map other frontmatter keys. Byte-copy tests prove projection only. Harness interpretation is tracked separately in the [parity matrix](parity-matrix.md#skill-frontmatter-projection-and-interpretation); unknown behavior stays unknown. The matrix records that Pi ignores `user-invocable: false`. |
 | `AGENTS.md` | Portable. All seven read it. |
 | MCP | Mostly portable. Claude Code and Cursor share the `mcpServers` JSON shape. OpenCode and Codex (TOML) need a conversion. |
 | Hooks | A script that exits 2 on deny works in Claude Code, Copilot, Cursor, and Codex. OpenCode and Pi need a TypeScript shim. Antigravity is unchecked. |
@@ -50,7 +50,7 @@ Three behaviors constrain the design:
 
 ## Installer lifecycle
 
-The installer selects runtimes and layers, records what it wrote, and removes it with `-Remove` and `-Uninstall`. Both are dry runs until `-Apply`, and [install.md](install.md#removing-and-uninstalling) states their rules. It still declares itself Windows-only. On Windows, `update` is built as `-Update` and `-Update -Check`, with the rules in [install.md](install.md#updating-the-sources). The target is one entry point with these commands, the same on Windows and macOS:
+The installer selects runtimes and layers, records what it wrote, and removes it with `-Remove` and `-Uninstall`. Both are dry runs until `-Apply`, and [install.md](install.md#removing-and-uninstalling) states their rules. Its platform declaration includes Windows, macOS, and Linux. On Windows, `update` is built as `-Update` and `-Update -Check`, with the rules in [install.md](install.md#updating-the-sources). The target is one entry point with these commands, the same on Windows and macOS:
 
 | Command | Effect |
 | --- | --- |

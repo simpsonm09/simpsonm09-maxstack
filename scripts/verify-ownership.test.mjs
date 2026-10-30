@@ -9,10 +9,22 @@ const python = process.platform === 'win32' ? 'python' : 'python3';
 
 function check(records) {
   const source = `import json\nfrom verify_ownership import check_owned_record\nfailures=[]\nfor i, record in enumerate(json.load(__import__('sys').stdin)):\n    check_owned_record(record, f'owned[{i}]', failures)\nprint(json.dumps(failures))\n`;
-  const result = spawnSync(python, ['-c', source], {
+  const result = spawnSync(python, ['-B', '-E', '-c', source], {
     cwd: resolve(repoRoot, 'scripts'),
     encoding: 'utf8',
     input: JSON.stringify(records),
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+function checkLock(lock) {
+  const source = `import json, sys\nfrom verify_ownership import check_owned\nfailures=[]\ncheck_owned(json.load(sys.stdin), failures)\nprint(json.dumps(failures))\n`;
+  const result = spawnSync(python, ['-B', '-E', '-c', source], {
+    cwd: resolve(repoRoot, 'scripts'),
+    encoding: 'utf8',
+    input: JSON.stringify(lock),
     windowsHide: true,
   });
   assert.equal(result.status, 0, result.stderr);
@@ -39,4 +51,27 @@ test('owned record verifier accepts current installer runtime shapes and rejects
   assert.ok(check([badHookHash]).some((failure) => failure.includes('hookHash')));
   assert.ok(check([misplacedHookHash]).some((failure) => failure.includes('hookHash')));
   assert.ok(check([badRuntime]).some((failure) => failure.includes('runtime must be')));
+});
+
+test('check_owned accepts the Windows Pi self-updater installer record only as Pi', () => {
+  const record = {
+    kind: 'file',
+    path: '.maxstack/bin/pi-self-update.mjs',
+    runtime: 'pi',
+    sha256: fileHash,
+    layers: ['org-ai-plugin'],
+  };
+  const syntheticWindowsLock = {
+    ownedSchema: 2,
+    layers: [{ name: 'org-ai-plugin' }],
+    selection: { runtimes: ['claude', 'pi'], layers: ['org-ai-plugin'] },
+    owned: [record],
+  };
+  assert.deepEqual(checkLock(syntheticWindowsLock), []);
+
+  const unknownUpdaterPath = { ...record, path: '.maxstack/bin/future-updater.mjs' };
+  assert.ok(
+    checkLock({ ...syntheticWindowsLock, owned: [unknownUpdaterPath] }).some((failure) =>
+      failure.includes('runtime is pi, but its path belongs to None')),
+  );
 });
