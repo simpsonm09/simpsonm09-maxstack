@@ -52,6 +52,7 @@ Source key (short IDs used in cells):
 | PSC-MAP-CX | pstack-claude/plugins/pstack/skills/poteto-mode/references/codex-tools.md (main) |
 | PSC-MAP-PI | pstack-claude/plugins/pstack/skills/poteto-mode/references/pi-tools.md (main) |
 | FORK | pstack-max@main:plugins/pstack (branch main, pin) |
+| FORK-WIN-PIN | pstack-max@671d84b7eb799c2c38ec39b11deac54a45d524fb:plugins/pstack/hooks/pre-tool-use-windows.ps1 (selected Maxstack pin) |
 | FORK-CPH | FORK/hooks/copilot-hooks.json (bash and powershell command keys) |
 | FORK-WIN | FORK/hooks/pre-tool-use-windows.ps1 |
 | FORK-OC | FORK/opencode/ (index.ts, load.ts, routing.ts, agents/*.md) |
@@ -220,7 +221,7 @@ The macOS row marks live harness behavior as unverified; it does not mean fixtur
 ### 2.10 pstack PreToolUse hooks (file-read and subagent-model checks)
 
 - Claude: **differs**: pstack has no PreToolUse hook on Claude. `hooks.json` has SessionStart only. The file-read approval and subagent-model deny exist only in the Copilot POSIX hook. Evidence: PSC-HK, PSC-PRE.
-- Copilot: **cannot**: on Windows, `pre-tool-use-windows.ps1` is a stub that prints nothing and exits 0, so neither check runs. The POSIX `pre-tool-use.sh` implements both (approves plugin `view` and registered scripts; denies a `pstack:` task on an unsaved model), but it was not run on macOS. Evidence: FORK-WIN, PSC-PRE, PSC-MAP-CP (Plugin file access, Model names), MS-T3 (What works on Copilot).
+- Copilot: **unverified**: the selected PStack pin routes Windows `PreToolUse` to `pre-tool-use-windows.ps1`. The adapter converts Windows payload paths, calls shared `pre-tool-use.sh`, and forwards successful hook output; the installed adapter file matches the selected source file. The named adapter fixture exists in the PStack source but was not run in this environment. Copilot/T3 hook loading and invocation remain unverified. This PStack permission/model hook is separate from the organization access gate. Evidence: FORK-WIN-PIN, FORK-CPH, PSC-PRE, PSC-MAP-CP (Plugin file access, Model names).
 - OpenCode: **cannot**: the plugin has no tool hook. The subagent-model check has nothing to check, because `subagent` takes no per-call model. Evidence: FORK-OC (index.ts), FORK-MAP-OC (Model names).
 - Pi: **not built yet**. The extension has no file-read or subagent-model check. Aliases resolve through models.json only (T03). Evidence: PSC-PI (T03), PSC-MAP-PI (Model names).
 - Cursor: **not built yet**. maxstack installs the org layer's gate hook, which covers shell commands only; the file-read approval and the subagent-model deny are not implemented for Cursor. Evidence: ORG (The agent access gate).
@@ -280,7 +281,7 @@ The macOS row marks live harness behavior as unverified; it does not mean fixtur
 ### 2.16 Works in headless or RPC mode (T3-driven)
 
 - Claude: **same**. The live probe 2026-10-20 inside T3 passed all five checks: skills, workspace instructions, an allowed read, a denied write, and a subagent reply. Evidence: LIVE-1020.
-- Copilot: **same**. Verified live through the `copilotSimpsonm09` instance: SessionStart context, skills, and org gate. The PreToolUse stub from 2.10 still applies. Evidence: MS-T3 (Verified).
+- Copilot: **same**. Verified live through the `copilotSimpsonm09` instance: SessionStart context, skills, and org gate. That observation does not establish whether T3 loaded or invoked the PStack PreToolUse hook (2.10). Evidence: MS-T3 (Verified).
 - OpenCode: **same**. Verified by the live probe 2026-10-21 through the T3 OpenCode instance (opencode/deepseek-v4.1-flash-free): the probe listed the skills, quoted the workspace instructions, ran an allowed `gh repo view`, was denied the `gh label create` write, and a subagent replied. Evidence: MS-T3 (OpenCode, Checks), MS-INST (Install and reload), LIVE-1021.
 - Pi: **same**. The live probe 2026-10-20 inside T3 passed all five checks: skills, workspace instructions, an allowed read, a denied write, and a subagent reply. Evidence: LIVE-1020.
 - Cursor: **unverified**. The T3 `cursorAcp` instance could not run the live probe 2026-10-21 because of the free plan limit. Evidence: LIVE-1021.
@@ -292,7 +293,7 @@ The macOS row marks live harness behavior as unverified; it does not mean fixtur
 The installer fixture lifecycle runs in the `test-node-shard` matrix and is required by `test-node`. It covers install, strict status, reapply, Copilot removal, and uninstall for the seven runtimes listed below; it does not verify live CLI or hook behavior.
 
 - Claude: **same**. Junctions, `--plugin-dir` loading, and the Git Bash launcher were exercised on Windows. Evidence: MS-T3 (Verified), ORG (launcher).
-- Copilot: **differs**: the wrapper, SessionStart and gate are verified live on Windows. The PowerShell rewrite is not measured live, and the PreToolUse checks are a stub (2.10). Evidence: MS-T3 (Verified), ORG (Known limits), FORK-WIN.
+- Copilot: **differs**: the wrapper, SessionStart and org gate have historical Windows evidence. The PStack Windows adapter's runtime behavior and T3 loading remain unverified (2.10). Evidence: MS-T3 (Verified), ORG (Known limits), FORK-WIN-PIN.
 - OpenCode: **same**. OpenCode 2.0.24, 2.0.26, and 2.0.30 run from the Windows workspace. Caveats: `glob` with an absolute Windows path can return no matches, and OpenCode reads the user-level `%USERPROFILE%\.agents\skills` root (G6). Evidence: MS-T3 (OpenCode), FORK-MAP-OC (Tool actions).
 - Pi: **same**. The `pi.cmd` wrapper and the rpc probe ran on Windows. Caveat: Pi also loads `%USERPROFILE%\.agents\skills` (G6). Evidence: MS-T3 (Pi, Verified).
 - Cursor: **unverified**. The skills installer targets Windows, macOS, and Linux, but no live Cursor session was tested on Windows. Evidence: `scripts/Install-Cursor.ps1`, `scripts/Install-Workspace.cursor.test.mjs`.
@@ -328,7 +329,7 @@ The `test-linux` CI job runs the same POSIX installer fixture lifecycle as macOS
 Each item is a difference the docs call deliberate, or a limit the docs accept. Where the docs give no reason, the item says so.
 
 1. Skill prefixes (rows 2.1, 2.12). Claude namespaces plugin skills; other harnesses have no namespace. The skill text names both forms where they differ (RS-AS, Harnesses and Skill rules). Reason: the namespace is Claude's own mechanism.
-2. Copilot Windows PreToolUse is a stub (2.10). `pre-tool-use-windows.ps1` exits 0 on every path. Reason: Copilot denies a call whose hook exits non-zero, so the stub keeps the normal permission flow (FORK-WIN header). The cost is that the two checks do not run on Windows; that cost is a gap (G2), not a design.
+2. Copilot Windows PreToolUse has a selected PowerShell bridge (2.10). The adapter is intended to run the shared POSIX hook through Git for Windows and fail open on setup/runtime errors. Its source and one installed file were inspected, but the named adapter test was unavailable in this environment and T3 loading/invocation was not observed. PStack permission/model decisions and the organization access gate remain separate mechanisms.
 3. OpenCode rewrites a denied command instead of blocking it (2.8). Reason not recorded in the inputs. The decisions match the golden outcomes (ORG, Differences).
 4. OpenCode has no ask step (2.9). An allowed gh command gets the App token without a prompt. The docs state the behavior, not a reason: OpenCode gives these commands the token without a prompt (ORG, Known limits). The rationale is not recorded.
 5. Ask switches change only an `ask`, never a denial (2.9). Reason: T3 talks to Copilot over ACP, which auto-denies an ask; the switch keeps the denial reason and the access level (MS-T3, The ask switch; ORG).
@@ -355,7 +356,7 @@ Ranked by how much the plan's goals depend on the gap. Each gap names the eviden
 
 G1. The access gate is unproven in live Cursor and Antigravity sessions (rows 2.8, 2.9, 2.10). Codex has an adapter, an owned project hook definition, and a one-time trust step. Hook discovery and trust-state changes are measured with `hooks/list`; the live probe 2026-10-20 passed the gate check inside T3 (LIVE-1020). Cursor and Antigravity now have adapters and owned hook definitions: maxstack writes `.cursor/hooks.json` and `.agents/hooks.json` with the adapter's absolute path, and an install, status, change, removal, and uninstall are covered by `scripts/Install-Workspace.hooks.test.mjs`. No live session has run a denied command through either. Evidence: ORG (Contents), PSC-CXH, MS-MT (Phases), MS-CXG, scripts/Install-Workspace.hooks.test.mjs. Fix: record a blocked denied command in a Codex T3 session after hook approval, and run a denied command in a live Cursor and Antigravity session.
 
-G2. Copilot PreToolUse is a no-op on Windows (row 2.10). The file-read approval and the subagent-model deny do not run on the machine this workspace uses. The POSIX port exists for bash only. Fix: port `pre-tool-use.awk` to PowerShell or Node and run the same fixtures on both. Evidence: FORK-WIN, PSC-PRE, MS-T3.
+G2. The Windows Copilot PreToolUse bridge lacks a fresh adapter-test and T3 invocation observation (row 2.10). The selected source routes the PowerShell adapter to the shared POSIX hook, but source inspection and an installed-file hash do not prove runtime behavior or harness loading. Run the existing named PStack Windows adapter test in its owning repository, then record a separate T3 observation if available. Keep the organization access gate evidence separate. Evidence: FORK-WIN-PIN, FORK-CPH, PSC-PRE.
 
 G3. Gate fail-open paths are unmeasured or silent. Claude: a hook killed at Claude Code's timeout is allowed; if `node` is not on the hook shell's PATH the call runs with no gate and no error. Copilot: the hook timeout behavior is not measured. Pi: the gate has no time budget of its own. Evidence: ORG (Known limits). Fix: measure the Copilot timeout; add a SessionStart check that `node` resolves; state the deny-on-timeout rule as a test.
 
@@ -400,7 +401,7 @@ The aim is that the matrix stays honest. Each `same` and each `verified` claim m
 1. Matrix shape. Every row has all seven harness cells, each with one of the five status tokens, and each `differs` and `cannot` cell has text after the colon. Each cell cites at least one source ID, and every ID resolves to an existing file. This follows the pattern of `tests/pi-equivalence.test.mjs` in pstack.
 2. Generated output. The markdown is generated from the data file. CI fails when the committed markdown differs from the generated text.
 3. Pin agreement. `layers.json` and `pstack.lock.json` name the same commit (already in `scripts/verify-manifests.py`). Add: at the pinned commit, `hooks/copilot-hooks.json` has `bash` and `powershell` keys for each entry, and `.github/plugin/plugin.json` and `.codex-plugin/plugin.json` name hook files that exist (G7).
-4. Stub detection. A test runs `pre-tool-use-windows.ps1` against a denied fixture and asserts the exit code and the empty output. A cell marked `same` for Copilot's Windows PreToolUse fails until a real port exists (G2).
+4. Windows bridge fixture. The owning PStack repository has a named adapter test that runs `pre-tool-use-windows.ps1` against synthetic path and decision payloads and compares its output with the shared hook. Run that test from the selected PStack source; do not copy the adapter into a Maxstack fixture or treat a hand-written hook imitation as proof. A passing fixture proves only the adapter path and output contract, not Copilot/T3 loading (G2).
 5. Gate decisions across adapters. One fixture of commands by access level runs through the Claude adapter, the Copilot adapter, the OpenCode `gateShellEdit`, and the Pi adapter. Each must give the same capability decision and the same reason text. This extends the existing HEAD golden in `tests/parity.test.ts` to a cross-adapter table (rows 2.8).
 6. Ask switch exactness. Each adapter treats `AGENT_ACCESS_*_ASK` as an ask rewrite only when the value is exactly `allow`. Test `Allow`, `1`, `true`, the empty string, and an unset variable. Test that a denial stays a denial with the switch set. Test that a Pi child inherits the variable and still denies (rows 2.9).
 7. Fail-closed hook behavior. Simulate a missing `node` and a timeout; assert the Claude hook denies a write. Today the Claude path allows the call when `node` is missing (G3); the test fails until that changes.
