@@ -107,16 +107,15 @@ function Get-GitChildVariables {
     return $variables
 }
 
-# git's variables that name a repository, a worktree, a config, a program, or a transport policy. A child inherits them from the
-# installer, so one of them could point git at another repository, add a setting or run a program that the guard does not name, or
-# allow a transport the guard refuses (GIT_ALLOW_PROTOCOL overrides protocol.allow). They are removed from the child only.
+# Variables that must not flow into a guarded git child. Git's variables can name a repository, a worktree, a config, a program,
+# or a transport policy. MAXSTACK_T3_SETTINGS is installer input and is not needed by git. These are removed from the child only.
 # GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are not here: the guard reads the same file that a status reads, so a user's relocated
 # config keeps its credential helper. GIT_CONFIG_NOSYSTEM is not here either: it is a hardening flag, so the user's choice is left.
 $script:GitInheritedVariables = @(
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
     'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_ASKPASS',
     'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR', 'GIT_ALLOW_PROTOCOL', 'GIT_PROTOCOL_FROM_USER',
-    'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'
+    'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'MAXSTACK_T3_SETTINGS'
 )
 
 # Sets a git child's environment to those variables. The child inherits the installer's environment, so the variables in
@@ -431,13 +430,27 @@ function Test-CommitRef {
     return ($Ref -cmatch '^[0-9a-f]{40}\z')
 }
 
+# The ref-name rules git check-ref-format enforces for refs/heads/<name>, without starting git.
+# This lets callers reject malformed input before any guarded git command runs.
+function Test-SafeRefNameSyntax {
+    param([string] $Ref)
+
+    if ([string]::IsNullOrEmpty($Ref) -or $Ref.StartsWith('-')) { return $false }
+    if ($Ref -match '[\x00-\x20\x7f~^:?*\[\\]' -or $Ref.Contains('..') -or $Ref.Contains('@{') -or $Ref.Contains('//')) { return $false }
+    if ($Ref.StartsWith('/') -or $Ref.EndsWith('/') -or $Ref.EndsWith('.')) { return $false }
+    foreach ($part in $Ref.Split('/')) {
+        if ($part.StartsWith('.') -or $part.EndsWith('.lock', [StringComparison]::Ordinal)) { return $false }
+    }
+    return $true
+}
+
 # Whether a ref is a safe git ref name. git check-ref-format is the authority. A leading dash is refused here too,
 # because the ref is passed to git as an argument.
 function Test-SafeRefName {
     param([string] $Ref)
 
     if (Test-CommitRef $Ref) { return $true }
-    if ($Ref.StartsWith('-') -or $Ref -match '\s' -or $Ref.Contains('..')) { return $false }
+    if (-not (Test-SafeRefNameSyntax $Ref)) { return $false }
     return ((Invoke-GitGuarded -Arguments @('check-ref-format', "refs/heads/$Ref")).code -eq 0)
 }
 

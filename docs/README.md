@@ -5,6 +5,8 @@ Index for this repository.
 ## Guides
 
 - [Install and reload](install.md) covers the model rule, the runtime and layer selection, the runtimes, layer sources and their overrides, `-Update`, the ownership record, removing a runtime or layer, and uninstalling.
+- [Workspace settings](features/settings.md) describes workspace discovery and the optional selection file's additive behavior.
+- [T3 settings snapshot](features/t3-settings.md) describes the read-only allowlisted snapshot and report-only defaults.
 - [Layout](layout.md) describes every top-level path.
 - [Repository relationships](relationship.md) names the repository ownership, the one cross-repo edge, and the workspace definition.
 - [MCP servers](mcp.md) defines the workspace MCP servers and their default states.

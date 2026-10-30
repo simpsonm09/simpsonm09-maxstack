@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "verifiedAgainst": {
+    "t3": "0.0.45"
+  },
+  "instances": {
+    "claude{Workspace}": {
+      "runtime": "claude",
+      "envelope": { "driver": "claudeAgent", "enabled": true },
+      "config": {
+        "binaryPath": "claude",
+        "launchArgs": "--plugin-dir {workspace}/.claude/plugins"
+      }
+    },
+    "copilot{Workspace}": {
+      "runtime": "copilot",
+      "envelope": { "driver": "acpRegistry", "enabled": true },
+      "config": {
+        "source": "registry",
+        "agentId": "github-copilot-cli",
+        "distribution": "auto",
+        "commandPath": {
+          "$os": {
+            "windows": "{workspace}/.maxstack/bin/copilot.cmd",
+            "macos": "{workspace}/.maxstack/bin/copilot.sh"
+          }
+        }
+      }
+    },
+    "pi{Workspace}": {
+      "runtime": "pi",
+      "envelope": { "driver": "pi", "enabled": true },
+      "config": {
+        "binaryPath": "{workspace}/.maxstack/bin/pi.cmd",
+        "launchArgs": ""
+      }
+    }
+  },
+  "app": {
+    "defaultAutoPull": true,
+    "defaultThreadEnvMode": "worktree"
+  }
+}

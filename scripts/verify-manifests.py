@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from verify_ownership import check_lock_file
+from verify_settings import check_settings_files
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -339,6 +340,170 @@ def check_tracked_bytecode(failures: list[str]) -> None:
             )
 
 
+def check_t3_manifests(failures: list[str], contract_path: Path | None = None) -> None:
+    """Keep the T3 snapshot policy, defaults, and reviewed server contract aligned."""
+    allowlist = load_json(REPO_ROOT / "t3" / "allowlist.json", failures)
+    defaults = load_json(REPO_ROOT / "t3" / "defaults.json", failures)
+    fixture = load_json(REPO_ROOT / "scripts" / "fixtures" / "t3" / "server-settings-keys.json", failures)
+    if not all(isinstance(item, dict) for item in (allowlist, defaults, fixture)):
+        return
+    top = allowlist.get("top")
+    excluded = allowlist.get("excluded")
+    fixture_keys = fixture.get("keys")
+    if not isinstance(top, dict) or not isinstance(excluded, dict) or not isinstance(fixture_keys, list):
+        failures.append("T3 allowlist and server settings fixture need top, excluded, and keys objects")
+        return
+    classified = set(top) | set(excluded)
+    if set(top) & set(excluded):
+        failures.append("T3 allowlist classifies a server setting as both allowed and excluded")
+    if set(fixture_keys) != classified:
+        missing = sorted(set(fixture_keys) - classified)
+        extra = sorted(classified - set(fixture_keys))
+        failures.append(f"T3 server settings keys differ from the allowlist (unclassified={missing}, unknown-classification={extra})")
+    if fixture.get("verifiedAgainst") != allowlist.get("verifiedAgainst", {}).get("t3"):
+        failures.append("T3 server settings fixture and allowlist versions differ")
+    if defaults.get("verifiedAgainst") != allowlist.get("verifiedAgainst"):
+        failures.append("T3 defaults and allowlist versions differ")
+    enabled_defaults = allowlist.get("driverEnabledDefaults")
+    expected_drivers = {"claudeAgent", "codex", "pi", "opencode", "antigravity", "acpRegistry"}
+    if not isinstance(enabled_defaults, dict) or set(enabled_defaults) != expected_drivers or not all(type(value) is bool for value in enabled_defaults.values()):
+        failures.append("T3 allowlist driver enabled defaults do not cover the reviewed drivers")
+    drivers = allowlist.get("drivers")
+    if not isinstance(drivers, dict) or set(drivers) != expected_drivers:
+        failures.append("T3 driver policy does not cover the reviewed drivers")
+        drivers = {}
+    for driver, policy in drivers.items():
+        if not isinstance(policy, dict) or not isinstance(policy.get("allowed"), list) or not isinstance(policy.get("excluded"), list):
+            failures.append(f"T3 driver policy {driver} needs allowed and excluded lists")
+            continue
+        if set(policy["allowed"]) & set(policy["excluded"]):
+            failures.append(f"T3 driver policy {driver} classifies a config key as allowed and excluded")
+        if driver == "acpRegistry":
+            values = policy.get("values")
+            if not isinstance(values, dict) or values.get("agentId") != ["github-copilot-cli"]:
+                failures.append("T3 ACP registry policy must name the reviewed scalar agent id")
+    envelope = allowlist.get("providerEnvelope")
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("allowed"), list) or not isinstance(envelope.get("excluded"), dict):
+        failures.append("T3 provider envelope needs allowed and excluded rules")
+    elif set(envelope["allowed"]) & set(envelope["excluded"]):
+        failures.append("T3 provider envelope classifies a field as allowed and excluded")
+    commands = allowlist.get("commands")
+    launch_args = allowlist.get("launchArgs")
+    if not isinstance(commands, list) or not commands or not all(isinstance(item, str) for item in commands):
+        failures.append("T3 command allowlist must be a non-empty string list")
+    if not isinstance(launch_args, dict) or launch_args.get("allowedFlags") != ["--plugin-dir"] or not isinstance(launch_args.get("pathRoots"), list):
+        failures.append("T3 launch argument policy needs the reviewed flag and path roots")
+    for key, rule in top.items():
+        if not isinstance(rule, dict) or rule.get("rule") not in {"bool", "enum", "object", "instances"}:
+            failures.append(f"T3 allowlist top rule {key} has an unsupported shape")
+            continue
+        kind = rule["rule"]
+        if kind == "enum" and (not isinstance(rule.get("values"), list) or not all(isinstance(value, str) for value in rule["values"])):
+            failures.append(f"T3 allowlist enum {key} needs string values")
+        if kind == "object":
+            children = rule.get("keys")
+            if not isinstance(children, dict) or not children:
+                failures.append(f"T3 object rule {key} needs nested keys")
+                continue
+            for child_name, child_rule in children.items():
+                if not isinstance(child_rule, dict) or child_rule.get("rule") not in {"bool", "nullable-int"}:
+                    failures.append(f"T3 object rule {key}.{child_name} has an unsupported shape")
+                elif child_rule.get("rule") == "nullable-int" and (type(child_rule.get("minimum")) is not int or type(child_rule.get("maximum")) is not int or child_rule["minimum"] < 1 or child_rule["maximum"] < child_rule["minimum"]):
+                    failures.append(f"T3 object rule {key}.{child_name} needs valid integer bounds")
+    default_instances = defaults.get("instances")
+    if not isinstance(default_instances, dict):
+        failures.append("T3 defaults need an instances object")
+        return
+    expected_ids = {"claude{Workspace}", "copilot{Workspace}", "pi{Workspace}"}
+    if set(default_instances) != expected_ids:
+        failures.append("T3 defaults must cover the three reviewed workspace provider templates")
+    for instance_id, instance in default_instances.items():
+        if not isinstance(instance, dict):
+            failures.append(f"T3 defaults {instance_id} must be an object")
+            continue
+        if t3_contains_model_selection(instance):
+            failures.append(f"T3 defaults {instance_id} includes a model selection")
+        runtime = instance.get("runtime")
+        if runtime not in {"claude", "copilot", "pi"} or "harness" in instance:
+            failures.append(f"T3 defaults {instance_id} needs a reviewed runtime name")
+        driver = instance.get("envelope", {}).get("driver") if isinstance(instance.get("envelope"), dict) else None
+        for section_name in ("envelope", "config"):
+            section = instance.get(section_name, {})
+            if not isinstance(section, dict):
+                failures.append(f"T3 defaults {instance_id}.{section_name} must be an object")
+                continue
+            for key in section:
+                driver_policy = drivers.get(driver)
+                allowed = envelope.get("allowed", []) if section_name == "envelope" and isinstance(envelope, dict) else driver_policy.get("allowed", []) if isinstance(driver_policy, dict) else []
+                if key not in allowed:
+                    failures.append(f"T3 defaults {instance_id}.{key} is not allowed")
+        instance_envelope = instance.get("envelope")
+        if isinstance(instance_envelope, dict) and (not isinstance(instance_envelope.get("driver"), str) or type(instance_envelope.get("enabled")) is not bool):
+            failures.append(f"T3 defaults {instance_id}.envelope needs a driver and boolean enabled field")
+    if "defaultModelSelection" in defaults or "textGenerationModelSelection" in defaults:
+        failures.append("T3 defaults must not define model selections")
+    app = defaults.get("app")
+    if not isinstance(app, dict):
+        failures.append("T3 defaults app section must be an object")
+    else:
+        for key, value in app.items():
+            rule = top.get(key)
+            if not isinstance(rule, dict) or rule.get("rule") == "exclude" or key == "providerInstances":
+                failures.append(f"T3 app default {key} is not an allowed setting")
+                continue
+            kind = rule.get("rule")
+            valid = (kind == "bool" and type(value) is bool) or (kind == "enum" and (value is None and rule.get("nullable") is True or isinstance(value, str) and value in rule.get("values", [])))
+            if kind == "object" and isinstance(value, dict):
+                valid = all(name in rule.get("keys", {}) and ((rule["keys"][name].get("rule") == "bool" and type(item) is bool) or (rule["keys"][name].get("rule") == "nullable-int" and (item is None or type(item) is int and rule["keys"][name]["minimum"] <= item <= rule["keys"][name]["maximum"]))) for name, item in value.items())
+            if not valid:
+                failures.append(f"T3 app default {key} does not match its allowlist type")
+    if contract_path is not None:
+        try:
+            source = contract_path.read_text(encoding="utf-8")
+            match = re.search(r"export const ServerSettings = Schema\.Struct\(\{([\s\S]*?)\n\}\);", source)
+            if match is None:
+                raise ValueError("ServerSettings schema not found")
+            contract_keys = set(re.findall(r"(?m)^  ([A-Za-z][A-Za-z0-9]*):", match.group(1)))
+            if contract_keys != set(fixture_keys):
+                failures.append("explicit T3 contract source does not match the reviewed key fixture")
+            schema_names = {
+                "claudeAgent": "ClaudeSettings",
+                "codex": "CodexSettings",
+                "pi": "PiSettings",
+                "opencode": "OpenCodeSettings",
+                "antigravity": "AntigravitySettings",
+                "acpRegistry": "AcpRegistrySettings",
+            }
+            for driver, schema_name in schema_names.items():
+                schema_match = re.search(rf"export const {schema_name} =([\s\S]*?)(?=\nexport const |\Z)", source)
+                if schema_match is None:
+                    failures.append(f"explicit T3 contract source is missing {schema_name}")
+                    continue
+                enabled_match = re.search(r"enabled:\s*Schema\.Boolean\.pipe\([\s\S]{0,350}?withDecodingDefault\(Effect\.succeed\((true|false)\)", schema_match.group(1))
+                expected_enabled = enabled_defaults.get(driver) if isinstance(enabled_defaults, dict) else None
+                if enabled_match is None or (enabled_match.group(1) == "true") != expected_enabled:
+                    failures.append(f"explicit T3 contract source changed {driver} enabled default")
+            provider_match = re.search(r"providers:\s*Schema\.Struct\(\{([\s\S]*?)\n  \}\)\.pipe", source)
+            if provider_match is not None:
+                legacy_drivers = set(re.findall(r"(?m)^    ([A-Za-z][A-Za-z0-9]*):", provider_match.group(1)))
+                if "acpRegistry" in legacy_drivers or not {"claudeAgent", "codex", "pi", "opencode", "antigravity"}.issubset(legacy_drivers):
+                    failures.append("explicit T3 contract source changed the DEFAULT_SERVER_SETTINGS.providers driver map")
+        except (OSError, UnicodeError, ValueError):
+            failures.append("explicit T3 contract source could not be checked: invalid or unreadable source")
+
+
+def t3_contains_model_selection(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(
+            key in {"defaultModelSelection", "textGenerationModelSelection"}
+            or t3_contains_model_selection(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        return any(t3_contains_model_selection(child) for child in value)
+    return False
+
+
 def run_command(args: list[str], failures: list[str]) -> str | None:
     """Run a read-only command; record a failure and return None when it cannot answer."""
     try:
@@ -388,6 +553,7 @@ def main() -> int:
         help="also check the pinned branch with git ls-remote",
     )
     parser.add_argument("--lock", type=Path, help="check a lock's ownership record")
+    parser.add_argument("--t3-contract", type=Path, help="optionally compare an explicit local T3 settings.ts source")
     args = parser.parse_args()
 
     failures: list[str] = []
@@ -405,6 +571,8 @@ def main() -> int:
     if config:
         check_workspace_config(config, failures)
     check_surface(failures)
+    check_settings_files(REPO_ROOT, failures)
+    check_t3_manifests(failures, args.t3_contract)
     check_tracked_bytecode(failures)
     if args.online and pins:
         check_online(pins, failures)

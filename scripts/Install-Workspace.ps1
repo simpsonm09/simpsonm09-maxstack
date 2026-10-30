@@ -4,6 +4,8 @@
 param(
     [string] $Workspace = 'D:\dev\simpsonm09',
     [string] $LayersFile = '',
+    # An explicit T3 server settings JSON file. The dedicated environment variable is the only fallback.
+    [string] $T3Settings = '',
     [string[]] $LayerSource = @(),
     # Per-run layer sources: name=owner/repo@ref, name=https://host/path.git@ref, name=local:<absolute path>, or
     # name=default to drop an override. Repeatable, and comma-separable like -LayerSource.
@@ -20,6 +22,8 @@ param(
     # Layers to add to the recorded selection, by their names in layers.json, or all.
     [Alias('Layers')]
     [string[]] $RequestedLayers = @(),
+    # Prints a settings file derived from the recorded selection; with -Apply, writes it only if it is absent.
+    [switch] $InitSettings,
     [switch] $Apply,
     # Reports each owned path against the ownership record in stack.lock.json. Writes nothing.
     [switch] $Status,
@@ -40,6 +44,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$workspaceWasSpecified = $PSBoundParameters.ContainsKey('Workspace')
+. (Join-Path $PSScriptRoot 'Install-WorkspaceDiscovery.ps1')
+$workspaceResolutionArguments = @{
+    ExplicitSpecified = $workspaceWasSpecified
+    ExplicitValue = $Workspace
+    CurrentDirectory = (Get-Location).Path
+    ScriptRoot = $PSScriptRoot
+}
+if (-not $workspaceWasSpecified) { $workspaceResolutionArguments.LegacyWorkspace = $Workspace }
+$workspaceResolution = Resolve-MaxstackWorkspace @workspaceResolutionArguments
+$Workspace = $workspaceResolution.Workspace
+Write-Output "Workspace: $Workspace (from $($workspaceResolution.Origin))"
+if ($workspaceResolution.Warning) {
+    Write-Warning 'Using the legacy workspace default. Pass -Workspace or set MAXSTACK_WORKSPACE; this fallback will be removed after one release.'
+}
+
 if ($Apply -and $Status) { throw '-Apply writes the workspace and -Status only reports it. Choose one.' }
 if ($Remove -and $Uninstall) { throw '-Remove names what to remove and -Uninstall removes everything. Choose one.' }
 if (($Remove -or $Uninstall) -and $Status) { throw '-Status only reports. Choose -Status, -Remove, or -Uninstall.' }
@@ -56,13 +76,18 @@ if ($Update -and $namesRequested) { throw '-Update applies the recorded selectio
 if ($Check -and -not $Update) { throw '-Check applies to -Update.' }
 if ($Check -and $Apply) { throw '-Check writes nothing. Drop -Apply, or drop -Check to apply the update.' }
 if ($Strict -and $Update -and $Apply) { throw '-Strict with -Update reports and writes nothing. Drop -Apply or -Strict.' }
+$initConflicts = $Status -or $Remove -or $Uninstall -or $Update -or $Check -or $Strict -or $namesRequested -or $sourceNamed
+if ($InitSettings -and $initConflicts) { throw '-InitSettings takes no selection, source, status, update, remove, uninstall, check, or strict options.' }
 $removing = [bool] $Remove
 $uninstalling = [bool] $Uninstall
 $updating = [bool] $Update
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Install-LayerSources.ps1')
+. (Join-Path $PSScriptRoot 'Install-Settings.ps1')
+. (Join-Path $PSScriptRoot 'Install-T3Settings.ps1')
 $layersPath = if ($LayersFile) { $LayersFile } else { Join-Path $repoRoot 'layers.json' }
+$workspaceSettingsPath = Join-Path $Workspace 'maxstack.settings.json'
 $baseConfigFile = Join-Path $repoRoot 'workspace\opencode.jsonc'
 $configTarget = Join-Path $Workspace 'opencode.jsonc'
 $stackTarget = Join-Path $Workspace 'stack.lock.json'
@@ -306,7 +331,7 @@ function Get-OpenCodeState {
 }
 
 # Turns one layer's claude runtime into a record. A local layer is a junction under
-# .claude\plugins to its installed copy in .opencode\plugins, so both harnesses share
+# .claude\plugins to its installed copy in .opencode\plugins, so both runtimes share
 # one copy. Without the opencode runtime there is no such copy, so a local layer is copied
 # from its items. A git layer is a copy of its pinned folder.
 function Get-ClaudeRecord {
@@ -1626,6 +1651,7 @@ function Get-OwnedState {
     param($Record, $Planned)
 
     $full = Join-Path $Workspace ($Record.path -replace '/', '\')
+    if ($Record.path -ceq '.maxstack/t3/settings.snapshot.json' -and -not (Test-T3SnapshotPathSafe -Workspace $Workspace -AllowMissing)) { return 'modified' }
     $plannedSame = ($null -ne $Planned) -and ($Planned.kind -eq $Record.kind)
     switch ($Record.kind) {
         'link' {
@@ -1636,7 +1662,9 @@ function Get-OwnedState {
         }
         'file' {
             if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return 'missing' }
-            if ((Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash -ne $Record.sha256) { return 'modified' }
+            try { $diskHash = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
+            catch { if ($Record.path -ceq '.maxstack/t3/settings.snapshot.json') { return 'modified' }; throw }
+            if ($diskHash -ne $Record.sha256) { return 'modified' }
             $plannedSame = $plannedSame -and ($Planned.sha256 -eq $Record.sha256)
         }
         'dir' {
@@ -2312,6 +2340,10 @@ function Get-CreatedDirItems {
     $items = [System.Collections.Generic.List[object]]::new()
     $ordered = @($Dirs | Sort-Object -Property @{ Expression = { ($_ -split '/').Count }; Descending = $true }, @{ Expression = { $_ }; Descending = $true })
     foreach ($dir in $ordered) {
+        if ($dir.StartsWith('.maxstack/t3', [StringComparison]::Ordinal) -and -not (Test-T3SnapshotPathSafe -Workspace $Workspace -AllowMissing)) {
+            $items.Add((New-SkipItem $dir 'linked ancestor or unsafe T3 snapshot path; the created folder is kept without reading it'))
+            continue
+        }
         $entry = Resolve-WorkspaceEntry $dir
         if (-not $entry.ok) { $items.Add((New-SkipItem $dir $entry.reason)); continue }
         if ($goneFull.Contains($entry.full)) { continue }
@@ -2359,6 +2391,7 @@ function Get-StrayItems {
     $items = [System.Collections.Generic.List[object]]::new()
     $bases = @($Candidates | Where-Object { $_.kind -in @('file', 'json-entries') } | ForEach-Object { $_.path } | Sort-Object -Unique)
     foreach ($base in $bases) {
+        if ($base -ceq '.maxstack/t3/settings.snapshot.json' -and -not (Test-T3SnapshotPathSafe -Workspace $Workspace -AllowMissing)) { continue }
         $baseEntry = Resolve-WorkspaceEntry $base
         if (-not $baseEntry.ok) { continue }
         $shas = Get-KnownShas -Path $base -Known $Known -ConfigSha $ConfigSha -SettingsSha $SettingsSha
@@ -2422,6 +2455,10 @@ function Get-RemovalPlanItems {
     }
     foreach ($record in $Candidates) {
         if (Test-GroupMember $record.path) { continue }
+        if ($record.path -ceq '.maxstack/t3/settings.snapshot.json' -and -not (Test-T3SnapshotPathSafe -Workspace $Workspace -AllowMissing)) {
+            $items.Add((New-SkipItem $record.path 'linked ancestor or unsafe snapshot file; it is kept without reading it'))
+            continue
+        }
         try {
             switch ($record.kind) {
                 'file' { $items.Add((Get-FileRemovalItem $record)) }
@@ -2580,6 +2617,7 @@ function Confirm-RemovalItem {
     param($Item)
 
     if ($Item.action -eq 'none') { return }
+    if ($Item.path -ceq '.maxstack/t3/settings.snapshot.json' -and -not (Test-T3SnapshotPathSafe -Workspace $Workspace -AllowMissing)) { throw 'linked ancestor or unsafe snapshot file; it is kept without reading it' }
     $entry = Resolve-WorkspaceEntry $Item.path
     if (-not $entry.ok) { throw $entry.reason }
     $changed = 'changed since the plan: rerun the command to plan it again'
@@ -2794,10 +2832,37 @@ if ([string]::IsNullOrWhiteSpace($workspaceName)) {
     throw "Could not derive a workspace name from: $Workspace"
 }
 
+if ($InitSettings) {
+    $initManifest = Get-Content -LiteralPath $layersPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    $initLayerNames = @($initManifest.layers | ForEach-Object { [string] $_.name })
+    Invoke-InitSettings -Path $workspaceSettingsPath -WorkspaceRoot $Workspace -LayerNames $initLayerNames -Write:$Apply
+    return
+}
+
 $layerManifest = Get-Content -LiteralPath $layersPath -Raw | ConvertFrom-Json
 $layers = @($layerManifest.layers | ForEach-Object { New-LayerModel $_ })
 $layerNames = @($layers | ForEach-Object { $_.name })
 if (@($layerNames | Select-Object -Unique).Count -ne $layerNames.Count) { throw 'layers.json names a layer twice.' }
+
+# Settings syntax, fields, source shape, and apply OS are checked before source parsing or recorded-ref checks can start git.
+$workspaceSettings = [pscustomobject]@{ present = $false; value = $null; hash = $null }
+$settingsInvalid = $false
+$settingsChanged = $false
+if (-not ($removing -or $uninstalling)) {
+    try {
+        $workspaceSettings = Read-MaxstackSettings -Path $workspaceSettingsPath -LayerNames $layerNames
+    } catch {
+        if (-not $Status) { throw }
+        $settingsInvalid = $true
+        Write-Host "Settings: invalid $($_.Exception.Message)"
+    }
+}
+if ($Apply -and $workspaceSettings.present -and $workspaceSettings.value.Contains('os') -and $workspaceSettings.value.os -cne 'auto') {
+    $machineOs = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+    if ($workspaceSettings.value.os -cne $machineOs) {
+        throw "maxstack.settings.json: os targets a different machine. This apply writes for the detected OS '$machineOs'; use auto."
+    }
+}
 
 # The per-run sources the command line names: -Source, and -LayerSource as its local alias. A name not in layers.json is refused.
 $explicitSources = Read-SourceSpecs -Specs $SourceOverrides -LayerSpecs $LayerSource -LayerNames $layerNames
@@ -2835,6 +2900,80 @@ if (Test-Path -LiteralPath $stackTarget -PathType Leaf) {
     # of that lock infers, so the upgrade apply records it as created too.
     if ($priorLegacy -and @($priorOwned | Where-Object { $null -ne $_ -and $_.path -ceq 'opencode.jsonc' -and $_.kind -eq 'file' }).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Workspace 'opencode.jsonc.bak') -PathType Leaf)) {
         $priorCreatedFiles = @($priorCreatedFiles) + 'opencode.jsonc'
+    }
+}
+
+# Settings declarations override a recorded source. Status and update report declarations without resolving them;
+# their source choice remains the one in the lock. A flag always wins for this run.
+$settingsSources = @{}
+if ($workspaceSettings.present -and $workspaceSettings.value.Contains('layers') -and -not ($Status -or $updating)) {
+    foreach ($name in $workspaceSettings.value.layers.Keys) {
+        if (-not $workspaceSettings.value.layers[$name].Contains('source')) { continue }
+        $spec = [string] $workspaceSettings.value.layers[$name].source
+        $settingsSources[$name] = ConvertTo-SettingsSourceSpec -Name $name -Spec $spec -WorkspaceRoot $Workspace
+    }
+}
+if ($workspaceSettings.present -and $workspaceSettings.value.Contains('layers')) {
+    foreach ($name in $workspaceSettings.value.layers.Keys) {
+        $hasSettingsSource = $workspaceSettings.value.layers[$name].Contains('source')
+        $hasRecordedOverride = $recordedOverrides.ContainsKey($name)
+        if ($hasSettingsSource -and $hasRecordedOverride) {
+            $declaredSpec = [string] $workspaceSettings.value.layers[$name].source
+            $recordedSpec = ConvertTo-SettingsSpecFromRecord -Source $recordedOverrides[$name] -WorkspaceRoot $Workspace
+            if (-not (Test-SettingsSourceSpecEqual -Left $declaredSpec -Right $recordedSpec -Name $name -WorkspaceRoot $Workspace)) {
+                Write-Host "Settings: layers.$name.source differs from its recorded override."
+            }
+        }
+        if ($hasSettingsSource -and ($Status -or $updating)) {
+            Write-Host "Settings: layers.$name.source is declared; -Status and -Update use the recorded source until -Apply."
+            $spec = [string] $workspaceSettings.value.layers[$name].source
+            if ($spec.StartsWith('local:', [StringComparison]::Ordinal)) {
+                try {
+                    $local = Resolve-SettingsLocalPath -Name $name -Path $spec.Substring(6) -WorkspaceRoot $Workspace
+                    if ($local.missing) { Write-Host "Settings: source for $name is unavailable; declared local folder is missing and was skipped in this read-only mode." }
+                    elseif (-not (Test-SettingsLocalReadable -Path $local.path)) { Write-Host "Settings: source for $name is unreadable and was skipped in this read-only mode." }
+                    else {
+                        $localState = Get-LocalCheckoutState -Root $local.path
+                        if ($localState.unreadable) { Write-Host "Settings: source for $name is unreadable and was skipped in this read-only mode: $($localState.unreadable)." }
+                    }
+                } catch { Write-Host "Settings: source for $name is unsafe and was skipped in this read-only mode: $($_.Exception.Message)" }
+            }
+        }
+    }
+}
+if (-not ($removing -or $uninstalling)) {
+    if ($workspaceSettings.present) {
+        foreach ($name in @($recordedOverrides.Keys | Sort-Object)) {
+            $declared = $workspaceSettings.value.Contains('layers') -and
+                $workspaceSettings.value.layers.Contains($name) -and $workspaceSettings.value.layers[$name].Contains('source')
+            if (-not $declared) { Write-Host "Settings: recorded override for $name is not in settings; it remains selected." }
+        }
+    }
+}
+if (-not ($removing -or $uninstalling)) {
+    if ($workspaceSettings.present) {
+        Write-Host 'Settings: maxstack.settings.json is present; omitted names in declared dimensions are unlisted and remain selected.'
+        $priorSettings = Get-Field $priorStack 'settings'
+        if ($null -ne $priorSettings -and (Get-Field $priorSettings 'sha256') -cne $workspaceSettings.hash) {
+            $settingsChanged = $true
+            Write-Host 'Settings: changed since the last apply.'
+        }
+        foreach ($runtime in $script:SettingsRuntimeIds) {
+            if ($workspaceSettings.value.Contains('runtimes') -and $workspaceSettings.value.runtimes.Contains($runtime) -and $workspaceSettings.value.runtimes[$runtime].Contains('cli') -and $workspaceSettings.value.runtimes[$runtime].cli -ceq 'install') {
+                Write-Host "Settings: runtimes.$runtime.cli install is recorded; CLI installation is unsupported in this release."
+            }
+        }
+        if ($workspaceSettings.value.Contains('t3') -and $workspaceSettings.value.t3.Contains('cli') -and $workspaceSettings.value.t3.cli -ceq 'install') {
+            Write-Host 'Settings: t3.cli install is recorded; CLI installation is unsupported in this release.'
+        }
+    } else {
+        $priorSettings = Get-Field $priorStack 'settings'
+        if ($null -ne $priorSettings) {
+            $settingsChanged = $true
+            Write-Host 'Settings: missing since the last apply.'
+        } else {
+            Write-Host "Settings: none ($workspaceSettingsPath is absent); using the recorded selection."
+        }
     }
 }
 # The hash each replaced file held when the last apply wrote it. A backup is taken only when the file no longer
@@ -2885,6 +3024,16 @@ $runtimesNamed = $PSBoundParameters.ContainsKey('RequestedRuntimes')
 $layersNamed = $PSBoundParameters.ContainsKey('RequestedLayers')
 $namedRuntimes = if ($runtimesNamed) { Get-NamedValues -Values $RequestedRuntimes -Valid $runtimeNames -Parameter 'Runtimes' } else { @() }
 $namedLayers = if ($layersNamed) { Get-NamedValues -Values $RequestedLayers -Valid $layerNames -Parameter 'Layers' } else { @() }
+$settingsRuntimes = @()
+$settingsLayers = @()
+if (-not ($updating -or $Status)) {
+    $settingsRuntimes = @(Get-SettingsNames -Settings $workspaceSettings -Key 'runtimes')
+    $settingsLayers = @(Get-SettingsNames -Settings $workspaceSettings -Key 'layers')
+}
+$pendingRuntimes = @(Get-SettingsNames -Settings $workspaceSettings -Key 'runtimes' | Where-Object { $null -eq $recordedRuntimes -or $recordedRuntimes -cnotcontains $_ })
+$pendingLayers = @(Get-SettingsNames -Settings $workspaceSettings -Key 'layers' | Where-Object { $null -eq $recordedLayers -or $recordedLayers -cnotcontains $_ })
+$unlistedRuntimes = if ($workspaceSettings.present -and $workspaceSettings.value.Contains('runtimes')) { @($recordedRuntimes | Where-Object { (Get-SettingsNames -Settings $workspaceSettings -Key 'runtimes') -cnotcontains $_ }) } else { @() }
+$unlistedLayers = if ($workspaceSettings.present -and $workspaceSettings.value.Contains('layers')) { @($recordedLayers | Where-Object { (Get-SettingsNames -Settings $workspaceSettings -Key 'layers') -cnotcontains $_ }) } else { @() }
 if ($removing) {
     # -Remove narrows the recorded selection. A name that is not selected removes nothing. With nothing to
     # remove and no leftovers from an interrupted remove, the run ends here.
@@ -2900,9 +3049,49 @@ if ($removing) {
     $selectedLayers = @(Get-RemainingSelection -Recorded $recordedLayers -Named $namedLayers -Label 'layer')
     Assert-RemainingSelection -Runtimes $selectedRuntimes -Layers $selectedLayers
 } else {
-    $selectedRuntimes = @(Merge-Selected -Recorded $recordedRuntimes -All $runtimeNames -Named $namedRuntimes -HasNames $runtimesNamed -Label 'runtimes')
-    $selectedLayers = @(Merge-Selected -Recorded $recordedLayers -All $layerNames -Named $namedLayers -HasNames $layersNamed -Label 'layers')
+    $allNamedRuntimes = @($settingsRuntimes + $namedRuntimes)
+    $allNamedLayers = @($settingsLayers + $namedLayers)
+    $hasRuntimeNames = $runtimesNamed -or (@($settingsRuntimes).Count -gt 0)
+    $hasLayerNames = $layersNamed -or (@($settingsLayers).Count -gt 0)
+    $selectedRuntimes = @(Merge-Selected -Recorded $recordedRuntimes -All $runtimeNames -Named $allNamedRuntimes -HasNames $hasRuntimeNames -Label 'runtimes')
+    $selectedLayers = @(Merge-Selected -Recorded $recordedLayers -All $layerNames -Named $allNamedLayers -HasNames $hasLayerNames -Label 'layers')
     Assert-SelectionRuntimes -Runtimes $selectedRuntimes
+}
+$t3SnapshotEnabled = $true
+$t3SettingsDeclared = $workspaceSettings.present -and $workspaceSettings.value.Contains('t3')
+if ($t3SettingsDeclared -and $workspaceSettings.value.t3.Contains('snapshot')) { $t3SnapshotEnabled = [bool] $workspaceSettings.value.t3.snapshot }
+$t3SourceSpecified = $PSBoundParameters.ContainsKey('T3Settings') -or -not [string]::IsNullOrWhiteSpace($env:MAXSTACK_T3_SETTINGS)
+$t3SourcePath = if ($PSBoundParameters.ContainsKey('T3Settings')) { $T3Settings } else { $env:MAXSTACK_T3_SETTINGS }
+$t3Report = $null
+$t3SnapshotRecord = $null
+if (-not ($removing -or $uninstalling)) {
+    if (-not $t3SnapshotEnabled) {
+        if ($t3SettingsDeclared) { Write-Host 'T3 settings: snapshot disabled by workspace settings.' }
+    } elseif ($t3SourceSpecified) {
+        if ([string]::IsNullOrWhiteSpace($t3SourcePath)) { throw '-T3Settings needs a file path.' }
+        $t3SourcePath = [IO.Path]::GetFullPath($t3SourcePath)
+        $t3Report = Get-T3SettingsReport -Path $t3SourcePath -Workspace $Workspace -RuntimeNames $selectedRuntimes -LayerNames $layerNames
+        Write-T3SettingsReport -Report $t3Report -Workspace $Workspace -SnapshotEnabled $true
+        if ($Apply -and $t3Report.sourceState -eq 'present') { [void](Assert-T3SnapshotDestination $Workspace) }
+    } elseif ($t3SettingsDeclared) {
+        Write-Host 'T3 settings: no T3 settings source specified; provide -T3Settings or MAXSTACK_T3_SETTINGS for a read-only report.'
+    }
+}
+if (-not ($removing -or $uninstalling)) {
+    foreach ($name in $pendingRuntimes) { Write-Host "Settings: pending runtime '$name'; it will be selected on -Apply." }
+    foreach ($name in $pendingLayers) { Write-Host "Settings: pending layer '$name'; it will be selected on -Apply." }
+    foreach ($name in $unlistedRuntimes) { Write-Host "Settings: unlisted runtime '$name'; it remains selected. Remove it with -Remove -Runtimes $name." }
+    foreach ($name in $unlistedLayers) { Write-Host "Settings: unlisted layer '$name'; it remains selected. Remove it with -Remove -Layers $name." }
+    if ($workspaceSettings.present -and $workspaceSettings.value.Contains('runtimes')) {
+        foreach ($name in @($namedRuntimes | Where-Object { $workspaceSettings.value.runtimes.Keys -cnotcontains $_ })) {
+            Write-Host "Settings: runtime '$name' is selected by a flag and is not in maxstack.settings.json; add it there to keep it declared."
+        }
+    }
+    if ($workspaceSettings.present -and $workspaceSettings.value.Contains('layers')) {
+        foreach ($name in @($namedLayers | Where-Object { $workspaceSettings.value.layers.Keys -cnotcontains $_ })) {
+            Write-Host "Settings: layer '$name' is selected by a flag and is not in maxstack.settings.json; add it there to keep it declared."
+        }
+    }
 }
 # A layer or runtime that layers.json names but the selection leaves out is said so, on every run. A removal
 # leaves out what it removed on purpose, so it is not said.
@@ -2935,12 +3124,23 @@ foreach ($layer in $allLayers) {
 # write, and names the command that repairs it. The other modes warn, and the layer takes its layers.json source.
 if ($Apply) {
     foreach ($name in @($recordedInvalid.Keys | Sort-Object)) {
-        if (($explicitSources.ContainsKey($name)) -or ($selectedLayers -cnotcontains $name)) { continue }
+        if (($explicitSources.ContainsKey($name)) -or ($settingsSources.ContainsKey($name)) -or ($selectedLayers -cnotcontains $name)) { continue }
         throw "$(Format-RecordedFault $name $recordedInvalid[$name]) Repair it with: pwsh -File scripts/Install-Workspace.ps1 -Source $name=default -Apply"
     }
 }
-Write-InvalidRecordedSources -Invalid $recordedInvalid -Skip @($explicitSources.Keys)
-Set-LayerSources -Layers $allLayers -Explicit $explicitSources -Recorded $recordedOverrides -Updating $updating -SelectedLayers $selectedLayers
+$effectiveSources = @{}
+foreach ($name in $settingsSources.Keys) {
+    $spec = [string] $workspaceSettings.value.layers[$name].source
+    if ($spec.StartsWith('local:', [StringComparison]::Ordinal) -and $settingsSources[$name].settingsRelative) {
+        $resolved = Resolve-SettingsLocalPath -Name $name -Path $spec.Substring(6) -WorkspaceRoot $Workspace
+        $settingsSources[$name].path = $resolved.path
+        $settingsSources[$name].missing = $resolved.missing
+    }
+    $effectiveSources[$name] = $settingsSources[$name]
+}
+foreach ($name in $explicitSources.Keys) { $effectiveSources[$name] = $explicitSources[$name] }
+Write-InvalidRecordedSources -Invalid $recordedInvalid -Skip @($effectiveSources.Keys)
+Set-LayerSources -Layers $allLayers -Explicit $effectiveSources -Recorded $recordedOverrides -Updating $updating -SelectedLayers $selectedLayers
 $layers = @($allLayers | Where-Object { $_.runtimes.Count -gt 0 })
 $activeLayerNames = @($layers | ForEach-Object { $_.name })
 $unselectedLayerNames = @($layerNames | Where-Object { $selectedLayers -notcontains $_ })
@@ -2960,6 +3160,9 @@ foreach ($layer in $layers) {
 # settings file, and its Pi keys. The ownership record then tells the paths this install created from
 # the paths that were there first, so an uninstall never removes what it did not create.
 $installerDirs = @(Get-InstallerDirectories -Layers $layers)
+$t3MayWriteSnapshot = -not ($removing -or $uninstalling) -and ($PSBoundParameters.ContainsKey('T3Settings') -or -not [string]::IsNullOrWhiteSpace($env:MAXSTACK_T3_SETTINGS))
+if ($workspaceSettings.present -and $workspaceSettings.value.Contains('t3') -and $workspaceSettings.value.t3.Contains('snapshot') -and -not $workspaceSettings.value.t3.snapshot) { $t3MayWriteSnapshot = $false }
+if ($t3MayWriteSnapshot) { $installerDirs += @('.maxstack', '.maxstack/t3') }
 $existedBefore = @()
 $existedBeforeFiles = @()
 $settingsKeysBefore = @()
@@ -3139,6 +3342,13 @@ if ($Apply -or $removing -or $updating -or ($Status -and $null -ne $priorOwned))
         -OpenCodeSpecs $openCodeSpecs -CopilotCmdText $copilotCmdText -CopilotShText $copilotShText `
         -PiCmdText $piCmdText -PiShText $piShText -PiSettings $piSettings -PiPending $piPending -PiUnknown $piUnknown
 }
+$priorT3Plan = if ($null -ne $priorOwned) { @($priorOwned | Where-Object { $_.path -ceq '.maxstack/t3/settings.snapshot.json' -and $_.kind -eq 'file' }) } else { @() }
+$preservePriorT3Record = @($priorT3Plan).Count -gt 0 -and -not ($null -ne $t3Report -and $t3SnapshotEnabled -and $t3Report.sourceState -eq 'present')
+if ($null -ne $t3Report -and $t3SnapshotEnabled -and $t3Report.sourceState -eq 'present') {
+    $plan += [pscustomobject]@{ path = '.maxstack/t3/settings.snapshot.json'; kind = 'file'; sha256 = $t3Report.snapshotSha256; runtime = $null; layers = @() }
+} elseif (@($priorT3Plan).Count -gt 0) {
+    $plan += $priorT3Plan[0]
+}
 
 # The Claude plugin folders, and the OpenCode folders that no unselected layer owns. An unselected
 # runtime's folders and files are left alone, so neither apply nor audit touches them.
@@ -3178,7 +3388,8 @@ if ($Status) {
         "$(@($results | Where-Object { $_.state -eq $state }).Count) $state"
     }
     Write-Host ('Summary: ' + ($counts -join ', '))
-    if ($Strict -and @($results | Where-Object { $_.state -notin @('matching', 'not selected') }).Count -gt 0) { exit 1 }
+    $t3Strict = ($null -ne $t3Report) -and (@($t3Report.strictFailures).Count -gt 0)
+    if ($Strict -and (@($results | Where-Object { $_.state -notin @('matching', 'not selected') }).Count -gt 0 -or $settingsInvalid -or $settingsChanged -or @($pendingRuntimes).Count -gt 0 -or @($pendingLayers).Count -gt 0 -or @($unlistedRuntimes).Count -gt 0 -or @($unlistedLayers).Count -gt 0 -or $t3Strict)) { exit 1 }
     return
 }
 
@@ -3586,12 +3797,20 @@ foreach ($key in @('packages', 'skills')) {
     $createdHere = $settingsFileBefore -and -not ($settingsKeysBefore -ccontains $key)
     $createdKeys[$key] = [bool]($presentNow -and ($createdHere -or ($priorCreatedKeys -ccontains $key)))
 }
+$t3SnapshotSha = $null
+if ($Apply -and $null -ne $t3Report -and $t3Report.sourceState -eq 'present' -and $t3SnapshotEnabled) {
+    $t3SnapshotSha = Write-T3Snapshot -Workspace $Workspace -Report $t3Report
+    if ($t3SnapshotSha -ine $t3Report.snapshotSha256) { throw 'T3 snapshot hash changed while it was written.' }
+}
 $createdDirs = @(Get-CreatedPaths -Candidates $installerDirs -Prior $priorCreatedDirs -ExistedBefore $existedBefore -Kind 'dir')
 $createdFiles = @(Get-CreatedPaths -Candidates $replacedFileNames -Prior $priorCreatedFiles -ExistedBefore $existedBeforeFiles -Kind 'file')
 
 # The ownership record: every path this apply wrote, after the writes, so -Status and a later
 # remove or uninstall know what is theirs. It holds no path outside the workspace and not the lock.
-$owned = Get-OwnedRecords -Plan $plan -CreatedKeys $createdKeys
+$ownedPlan = if ($preservePriorT3Record) { @($plan | Where-Object { $_.path -cne '.maxstack/t3/settings.snapshot.json' }) } else { $plan }
+$owned = Get-OwnedRecords -Plan $ownedPlan -CreatedKeys $createdKeys
+if ($preservePriorT3Record) { $owned += $priorT3Plan[0] }
+$owned = @(Sort-OwnedRecords $owned)
 # A kept quarantine keeps its journal on the folder's new record, so a later removal knows which quarantine is the removal's.
 foreach ($keptPath in @($keptJournals.Keys)) {
     foreach ($record in @($owned | Where-Object { $_.path -ceq $keptPath -and $_.kind -eq 'dir' })) {
@@ -3599,7 +3818,7 @@ foreach ($keptPath in @($keptJournals.Keys)) {
     }
 }
 
-$stack = [pscustomobject]@{
+$stackValues = [ordered]@{
     generatedAt  = (Get-Date).ToUniversalTime().ToString('o')
     workspace    = $workspaceName
     selection    = [pscustomobject]@{ runtimes = @($selectedRuntimes); layers = @($selectedLayers) }
@@ -3612,6 +3831,12 @@ $stack = [pscustomobject]@{
     createdDirs  = $createdDirs
     createdFiles = $createdFiles
 }
+if ($workspaceSettings.present) {
+    $stackValues.settings = [pscustomobject]@{ file = 'maxstack.settings.json'; version = 1; sha256 = $workspaceSettings.hash }
+} elseif ($removing -and $null -ne (Get-Field $priorStack 'settings')) {
+    $stackValues.settings = Get-Field $priorStack 'settings'
+}
+$stack = [pscustomobject]$stackValues
 if ($removing) {
     # The removal writes the lock: it keeps the records this selection produces, and each record it removes
     # leaves the lock once its file is gone.

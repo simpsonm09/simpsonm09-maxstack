@@ -1,0 +1,196 @@
+{
+  "version": 1,
+  "verifiedAgainst": {
+    "t3": "0.0.45"
+  },
+  "top": {
+    "continueThreadsAfterServerUpdate": { "rule": "bool" },
+    "defaultAutoPull": { "rule": "bool", "t3Default": false },
+    "defaultThreadEnvMode": {
+      "rule": "enum",
+      "values": ["local", "worktree"],
+      "nullable": true,
+      "t3Default": null
+    },
+    "snoozeLimitedThreads": { "rule": "bool" },
+    "autoResumeLimitedThreads": { "rule": "bool" },
+    "sidebarAutoSettleOnMerge": { "rule": "bool" },
+    "removeAgentCreditsOnMerge": { "rule": "bool" },
+    "pullRequestMergeMethod": {
+      "rule": "enum",
+      "values": ["merge", "squash", "rebase"],
+      "nullable": true,
+      "t3Default": null
+    },
+    "enableDeviceSupport": { "rule": "bool" },
+    "enableAgentBrowserAccess": { "rule": "bool" },
+    "enableAgentDeviceAccess": { "rule": "bool" },
+    "enableProviderUpdateChecks": { "rule": "bool" },
+    "responseStreamingMode": {
+      "rule": "enum",
+      "values": ["turn", "paragraph"]
+    },
+    "newWorktreesStartFromOrigin": { "rule": "bool" },
+    "branchNamingMode": {
+      "rule": "enum",
+      "values": ["static", "semantic", "custom"]
+    },
+    "defaultRuntimeMode": {
+      "rule": "enum",
+      "values": [
+        "approval-required",
+        "auto-accept-edits",
+        "auto",
+        "full-access"
+      ]
+    },
+    "storageCleanup": {
+      "rule": "object",
+      "keys": {
+        "worktreeAfterDays": {
+          "rule": "nullable-int",
+          "minimum": 1,
+          "maximum": 3650
+        },
+        "worktreeOnMerge": { "rule": "bool" },
+        "worktreeOnDelete": { "rule": "bool" },
+        "worktreeUnchanged": { "rule": "bool" },
+        "browserArtifactsAfterDays": {
+          "rule": "nullable-int",
+          "minimum": 1,
+          "maximum": 3650
+        },
+        "logsAfterDays": {
+          "rule": "nullable-int",
+          "minimum": 1,
+          "maximum": 3650
+        }
+      }
+    },
+    "providerInstances": { "rule": "instances" }
+  },
+  "excluded": {
+    "worktreeCleanup": "shape not reviewed",
+    "worktreesDirectory": "machine path",
+    "previousWorktreesDirectories": "machine paths",
+    "projectAgentBrowserAccessOverrides": "per-project state keyed by project ids",
+    "defaultProjectScripts": "project scripts",
+    "projectScriptOverrides": "per-project state keyed by project ids",
+    "projectAutoPullOverrides": "per-project state keyed by project ids",
+    "defaultModelSelection": "model selection owned by the user",
+    "projectSettingsOverrides": "per-project state keyed by project ids",
+    "projectSettingsFolded": "internal migration marker",
+    "deviceOnboardingCompleted": "onboarding state",
+    "deviceHosts": "remote host configuration",
+    "sidebarAutoSettleAfterDays": "shape not reviewed",
+    "backgroundActivity": "shape not reviewed",
+    "automaticGitFetchInterval": "shape not reviewed",
+    "providerHealthRefreshInterval": "shape not reviewed",
+    "backgroundActivityProfile": "shape not reviewed",
+    "defaultTheme": "cosmetic preference",
+    "defaultThemeSetAt": "cosmetic timestamp",
+    "environmentIcon": "environment metadata",
+    "worktreeSubmodules": "shape not reviewed",
+    "addProjectBaseDirectory": "machine path",
+    "textGenerationModelSelection": "model selection owned by the user",
+    "branchNamePrefix": "free text",
+    "branchNameInstructions": "free text",
+    "sourceControlWritingStyle": "free text",
+    "sourceControlWriterModelSelection": "model selection owned by the user",
+    "providers": "legacy provider config",
+    "observability": "shape not reviewed",
+    "bitbucket": "credentials",
+    "github": "credentials",
+    "usageLimitSources": "credentials",
+    "cursorKeychainUsageEnabled": "account state",
+    "usagePriceOverrides": "model pricing data",
+    "usageModelAliases": "model aliases"
+  },
+  "providerEnvelope": {
+    "allowed": ["driver", "enabled", "config"],
+    "excluded": {
+      "displayName": "free text",
+      "accentColor": "cosmetic value",
+      "environment": "names and values may contain credentials"
+    }
+  },
+  "commands": [
+    "claude",
+    "codex",
+    "pi",
+    "opencode",
+    "antigravity",
+    "copilot",
+    "github-copilot-cli"
+  ],
+  "driverEnabledDefaults": {
+    "claudeAgent": true,
+    "codex": true,
+    "pi": false,
+    "opencode": false,
+    "antigravity": false,
+    "acpRegistry": true
+  },
+  "driverConfigDefaults": {
+    "claudeAgent": { "binaryPath": "claude", "launchArgs": "" },
+    "codex": { "binaryPath": "codex", "launchArgs": "" },
+    "pi": { "binaryPath": "pi", "launchArgs": "" },
+    "opencode": { "binaryPath": "opencode" },
+    "antigravity": { "binaryPath": "antigravity" },
+    "acpRegistry": {
+      "source": "registry",
+      "agentId": "",
+      "distribution": "auto",
+      "commandPath": "",
+      "commandArgs": []
+    }
+  },
+  "drivers": {
+    "claudeAgent": {
+      "allowed": ["binaryPath", "launchArgs", "enabled"],
+      "excluded": [
+        "homePath",
+        "shadowHomePath",
+        "customModels",
+        "authMethod",
+        "autoCompactWindow"
+      ]
+    },
+    "codex": {
+      "allowed": ["binaryPath", "launchArgs", "enabled"],
+      "excluded": ["homePath", "shadowHomePath", "customModels"]
+    },
+    "pi": {
+      "allowed": ["binaryPath", "launchArgs", "enabled"],
+      "excluded": ["homePath", "customModels"]
+    },
+    "opencode": {
+      "allowed": ["binaryPath", "enabled"],
+      "excluded": ["serverUrl", "serverPassword", "customModels"]
+    },
+    "antigravity": {
+      "allowed": ["binaryPath", "enabled"],
+      "excluded": ["authMethod", "customModels"]
+    },
+    "acpRegistry": {
+      "allowed": [
+        "source",
+        "agentId",
+        "distribution",
+        "commandPath",
+        "commandArgs",
+        "enabled"
+      ],
+      "excluded": ["authMethodId", "customModels"],
+      "values": {
+        "source": ["registry", "local"],
+        "distribution": ["auto", "binary", "npx", "uvx"],
+        "agentId": ["github-copilot-cli"]
+      }
+    }
+  },
+  "launchArgs": {
+    "allowedFlags": ["--plugin-dir"],
+    "pathRoots": [".claude/plugins", ".claude/plugins/<known-layer>"]
+  }
+}

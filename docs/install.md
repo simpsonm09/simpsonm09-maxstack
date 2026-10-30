@@ -2,6 +2,16 @@
 
 > **Requires PowerShell 7 or later (`pwsh`).** `scripts/Install-Workspace.ps1` declares `#requires -Version 7.0`. Windows PowerShell 5.1 (`powershell.exe`) stops at once with that requirement and does not run the installer. Every installer command in this document is written as `pwsh -File`.
 
+## Workspace discovery
+
+The installer resolves its target in this order: `-Workspace`, `MAXSTACK_WORKSPACE`, the nearest current-directory ancestor containing `maxstack.settings.json` or `stack.lock.json`, the repository's `projects/repos/<repo>` or `projects/worktrees/<repo>` layout, then the previous default path if it still exists. It prints the resolved absolute path and origin on the first line of a successful run. The legacy default also prints a warning; pass `-Workspace` or set `MAXSTACK_WORKSPACE` to stop using it.
+
+An explicit or environment target must already exist as a directory. Empty values, missing paths, and a non-filesystem current location are errors and do not fall through to another source. Relative explicit and environment paths resolve from the current directory. A marker is detected by its leaf name without reading its contents. A linked marker can identify a workspace, though the settings validator refuses a linked `maxstack.settings.json` input.
+
+Workspace paths with control characters are rejected before path lookup. If a path needs to appear in an error, control characters are shown as `\uXXXX` text so they cannot alter terminal output.
+
+See [Workspace settings](features/settings.md#workspace-discovery) for the resolution examples.
+
 ## Model
 
 maxstack sets no model. The workspace `opencode.jsonc` has no `model` or `small_model` key, and the installed agent profiles have no `model:` line, so each agent runs the model the session uses. You pick that model in the harness: the T3 Code model picker for a thread or project, or your own OpenCode, Claude Code, or Copilot settings. The PStack Claude plugin's per-role models are set with its own `/setup-pstack` command.
@@ -18,6 +28,8 @@ T3 Code hosts the agent sessions. It runs four providers against the same worksp
 Ubuntu WSL can also run the OpenCode CLI. It reads the same workspace files under `D:\dev\simpsonm09`, which WSL sees at `/mnt/d/dev/simpsonm09`.
 
 ## Runtime and layer selection
+
+An optional [`maxstack.settings.json`](features/settings.md) beside `stack.lock.json` can declare runtime and layer selections. Its names add to the recorded selection. Omitted names stay selected until removed with `-Remove`. On a new workspace, a dimension named in the settings file selects exactly those names. See [Workspace settings](features/settings.md) for its schema and reserved fields.
 
 The workspace installs only the runtimes and layers it selects. `-Runtimes` names runtimes: `claude`, `opencode`, `copilot`, `pi`, or `all`. `-Layers` names layers by their names in `layers.json`, or `all`. Both take comma-separated values, which `pwsh -File` passes as one token:
 
@@ -38,10 +50,10 @@ The selection is recorded in `stack.lock.json`, with each list sorted:
 
 The rules:
 
-- A plain `-Apply`, with no flags, reuses the recorded selection. It does not select a layer or runtime that `layers.json` gained after the selection was recorded.
+- A plain `-Apply`, with no flags, reuses the recorded selection. It does not select a layer or runtime that `layers.json` gained after the selection was recorded. On a new workspace, no settings selection means all runtimes and layers; a dimension named in `maxstack.settings.json` selects exactly its listed names.
 - A flag adds its names to the recorded selection, and never removes one. Naming a runtime or layer that is already selected prints `Already selected ...` and changes nothing. Removing one is `-Remove`, described in [Removing and uninstalling](#removing-and-uninstalling).
 - `all` expands to every runtime or layer that `layers.json` names at the time of the run. The lock then records the expanded names, not the word `all`, so a layer added later is not selected until a flag names it.
-- An unnamed dimension keeps its recorded value. A new workspace with no flags selects every runtime and every layer, so a plain `-Apply` installs what it did before. A new workspace with `-Runtimes` selects exactly the runtimes named, and every layer unless `-Layers` names some.
+- An unnamed dimension keeps its recorded value. A new workspace with no settings selection and no flags selects every runtime and every layer, so a plain `-Apply` installs what it did before. A new workspace with `-Runtimes` selects exactly the runtimes named, and every layer unless `-Layers` names some.
 - A layer or runtime that `layers.json` names but the selection leaves out is reported on every apply, audit, and status, with the flag that adds it, for example `-Layers <name>`. `-Status` also lists it as `not selected`. It is not installed until a flag names it.
 - A recorded name that `layers.json` no longer names, such as a layer removed from it, is dropped from the selection with a warning. The next apply removes the folders that layer installed, the same way it removes a layer that stopped installing a runtime.
 - A lock with no `selection` predates the field. It reads as all, and the next apply writes the field.
@@ -62,7 +74,7 @@ The lock is replaced whole. The installer writes the new text to `stack.lock.jso
 
 An empty, `null`, or truncated `stack.lock.json` stops every command before anything is written. The message says how to recover. Restore the lock from `stack.lock.json.bak` if that file reads, or repair it by hand. Deleting the lock is the last resort, and it has a cost: the selection resets to all runtimes and layers, and the `createdDirs` and `createdFiles` record is lost, so a later uninstall could not tell what the installer created. Keep `stack.lock.json.bak` either way.
 
-An unselected runtime's files are left alone. An apply does not write, remove, or report them as drift. `-Status` names any that exist as `not selected`, and `-Strict` does not count them. `-Status` takes no selection flags, because it reports the recorded selection, which it prints first.
+An unselected runtime's files are left alone. An apply does not write, remove, or report them as drift. `-Status` names any that exist as `not selected`, and `-Strict` does not count them. `-Status` takes no selection flags, because it reports the recorded selection before owned path status rows.
 
 ## Install and reload
 
@@ -133,6 +145,19 @@ The spec forms:
 | `name=default`, or `name=` | `pstack=default` | Drops the override, and the layer returns to its `layers.json` source. |
 
 The ref in a git spec is a branch, a tag, or a full commit. It is checked as a git ref name. A spec is refused before anything is written when it has a space or a control character, starts with a dash, holds `..`, uses a scheme other than `https`, or carries a user name in its URL. A `local:` path must be absolute, must exist, and cannot be the workspace, a folder that contains the workspace, or a folder the installer writes (`.claude`, `.opencode`, `.pi`, or `.maxstack`). Each junction and symbolic link on the path is followed before that check, and a `\\?\` prefix is ignored. A `local:` folder is a git checkout only when it is the top level of its repository. A folder inside another repository records no commit. A `-Source` value cannot hold a comma, since a comma separates entries, and a folder with an `@ref`, such as `C:\x@main`, is refused with `did you mean local:C:\x?`.
+
+The optional `maxstack.settings.json` can declare `layers.<name>.source`. Source precedence is command-line flags, then the settings declaration, then a recorded override, then the `layers.json` default. Omitting a source keeps a recorded override and reports that it is not declared. Set `source` to `default` to drop that override. A settings-only relative local source is resolved from the workspace root. It rejects `..` components, protected output paths, and links that resolve outside the workspace. An absolute local source follows the regular `-Source` rules and emits a machine-path warning.
+
+Read-only audit, status, and update check report unavailable settings sources and skip them without changing the lock. Status and update use the recorded source; they report a settings declaration without resolving its git ref. A real apply stops before writing if its chosen settings source is missing or unreadable. Remove and uninstall do not read the settings file.
+
+Seed a settings file from the lock's recorded selection and source overrides. The dry run prints the JSON and writes nothing:
+
+```powershell
+pwsh -File scripts/Install-Workspace.ps1 -InitSettings
+pwsh -File scripts/Install-Workspace.ps1 -InitSettings -Apply
+```
+
+The apply form writes only `maxstack.settings.json`, only when it does not already exist, and does not run a workspace apply or resolve a source. It refuses an existing file, directory, or link. Legacy source strings and schema 1 or 2 locks remain readable.
 
 A `local:` path that is a drive root or a share root is refused, since a layer cannot be a whole drive or share. The refusal names the reason. A long-path prefix is dropped from a drive path only: `\\?\C:\x` reads as `C:\x`, and `\\?\UNC\server\share` stays the share `\\server\share`, so it is refused the same way.
 
@@ -324,3 +349,5 @@ The workspace bundle is the only PStack install. If an older global install is e
 - `.config/opencode/agents/pstack-*.md` are absent.
 
 An old `.config/opencode/opencode.jsonc` may still hold the `model` and `default_agent` lines from that install. Delete the ones it wrote. A model you chose yourself stays.
+
+For a read-only T3 settings report, pass -T3Settings <file> or set MAXSTACK_T3_SETTINGS to an explicit settings file. Apply stores only an allowlisted snapshot inside .maxstack; it never writes the T3 profile. See [T3 settings snapshot](features/t3-settings.md).

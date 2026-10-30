@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const verifier = join(repoRoot, 'scripts', 'verify-manifests.py');
+const pythonEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' };
 
 function findPython() {
   for (const name of ['python', 'python3']) {
@@ -31,7 +32,7 @@ function shipped(path) {
 // Copies the manifests and the files the verifier reads into a temporary repository
 // layout, applies the change, and runs the verifier there.
 // tracked maps a path to content for files the temporary repository commits to its index; it makes the root a git repository.
-function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinLock = false, extraFiles = {}, lock = null, tracked = {} } = {}) {
+function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinLock = false, extraFiles = {}, lock = null, tracked = {}, t3Contract = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'maxstack-manifests-'));
   try {
     const manifest = layers(shipped('layers.json'));
@@ -39,15 +40,28 @@ function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinL
     if (!omitPinLock) writeFileSync(join(root, 'pstack.lock.json'), JSON.stringify(pinLock ?? shipped('pstack.lock.json')));
     mkdirSync(join(root, 'workspace'));
     copyFileSync(join(repoRoot, 'workspace', 'opencode.jsonc'), join(root, 'workspace', 'opencode.jsonc'));
+    copyFileSync(join(repoRoot, 'workspace', 'maxstack.settings.json'), join(root, 'workspace', 'maxstack.settings.json'));
+    mkdirSync(join(root, 'schemas'));
+    copyFileSync(join(repoRoot, 'schemas', 'maxstack.settings.schema.json'), join(root, 'schemas', 'maxstack.settings.schema.json'));
     copyFileSync(join(repoRoot, 'README.md'), join(root, 'README.md'));
     mkdirSync(join(root, 'docs'));
     copyFileSync(join(repoRoot, 'docs', 'layout.md'), join(root, 'docs', 'layout.md'));
     writeFileSync(join(root, 'docs', 'plugin-publishing.md'), '# plugin publishing\n');
     mkdirSync(join(root, 'scripts'));
     writeFileSync(join(root, 'scripts', 'Install-Workspace.ps1'), '# installer\n');
+    copyFileSync(join(repoRoot, 'scripts', 'Install-Settings.ps1'), join(root, 'scripts', 'Install-Settings.ps1'));
     copyFileSync(verifier, join(root, 'scripts', 'verify-manifests.py'));
+    copyFileSync(join(repoRoot, 'scripts', 'verify_settings.py'), join(root, 'scripts', 'verify_settings.py'));
     copyFileSync(join(repoRoot, 'scripts', 'verify_ownership.py'), join(root, 'scripts', 'verify_ownership.py'));
-    for (const [rel, content] of Object.entries(extraFiles)) writeFileSync(join(root, rel), content);
+    mkdirSync(join(root, 't3'));
+    copyFileSync(join(repoRoot, 't3', 'allowlist.json'), join(root, 't3', 'allowlist.json'));
+    copyFileSync(join(repoRoot, 't3', 'defaults.json'), join(root, 't3', 'defaults.json'));
+    mkdirSync(join(root, 'scripts', 'fixtures', 't3'), { recursive: true });
+    copyFileSync(join(repoRoot, 'scripts', 'fixtures', 't3', 'server-settings-keys.json'), join(root, 'scripts', 'fixtures', 't3', 'server-settings-keys.json'));
+    for (const [rel, content] of Object.entries(extraFiles)) {
+      mkdirSync(dirname(join(root, rel)), { recursive: true });
+      writeFileSync(join(root, rel), content);
+    }
     if (Object.keys(tracked).length > 0) {
       spawnSync('git', ['init', '-q'], { windowsHide: true, cwd: root });
       for (const [rel, content] of Object.entries(tracked)) {
@@ -57,11 +71,16 @@ function runVerifier({ layers = (manifest) => manifest, pinLock = null, omitPinL
       }
     }
     const args = [join(root, 'scripts', 'verify-manifests.py')];
+    if (t3Contract !== null) {
+      const contractPath = join(root, 't3-contract.ts');
+      writeFileSync(contractPath, t3Contract);
+      args.push('--t3-contract', contractPath);
+    }
     if (lock !== null) {
       writeFileSync(join(root, 'stack.lock.json'), JSON.stringify(lock));
       args.push('--lock', join(root, 'stack.lock.json'));
     }
-    return spawnSync(python, args, { windowsHide: true, encoding: 'utf8' });
+    return spawnSync(python, args, { windowsHide: true, encoding: 'utf8', env: pythonEnv });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -76,9 +95,157 @@ function failureOf(run) {
 }
 
 test('the shipped manifests pass the verifier', { skip }, () => {
-  const run = spawnSync(python, [verifier], { windowsHide: true, encoding: 'utf8' });
+  const run = spawnSync(python, [verifier], { windowsHide: true, encoding: 'utf8', env: pythonEnv });
   assert.equal(run.status, 0, failureOf(run));
   assert.match(run.stdout, /^PASS:/);
+});
+
+test('the settings seed is valid and schema keys match the PowerShell validator', { skip }, () => {
+  const run = spawnSync(python, [verifier], { windowsHide: true, encoding: 'utf8', env: pythonEnv });
+  assert.equal(run.status, 0, failureOf(run));
+  assert.deepEqual(shipped('workspace/maxstack.settings.json'), { version: 1 });
+});
+
+test('the manifest verifier rejects settings schema and validator key drift', { skip }, () => {
+  const validator = readFileSync(join(repoRoot, 'scripts', 'Install-Settings.ps1'), 'utf8');
+  const altered = validator.replace("'claude', 'copilot', 'opencode', 'pi'", "'claude', 'copilot', 'opencode', 'new-harness'");
+  assert.notEqual(altered, validator, 'the fixture replacement found the validator list');
+  const run = runVerifier({ extraFiles: { 'scripts/Install-Settings.ps1': altered } });
+  assert.equal(run.status, 1, failureOf(run));
+  assert.match(failureOf(run), /schema runtime ids differ/);
+});
+
+test('the T3 verifier checks runtime vocabulary, nested policy shapes, app defaults, and model exclusions', { skip }, () => {
+  const cases = [
+    [(defaults) => { defaults.instances['claude{Workspace}'].harness = defaults.instances['claude{Workspace}'].runtime; delete defaults.instances['claude{Workspace}'].runtime; }, /needs a reviewed runtime name/],
+    [(defaults) => { defaults.app.defaultThreadEnvMode = 'global'; }, /does not match its allowlist type/],
+    [(allowlist) => { allowlist.top.storageCleanup.keys.logsAfterDays.maximum = 0; }, /needs valid integer bounds/],
+    [(allowlist) => { delete allowlist.top.defaultAutoPull; }, /keys differ from the allowlist/],
+    [(defaults) => { defaults.instances['claude{Workspace}'].config.textGenerationModelSelection = { instanceId: 'safe', model: 'private' }; }, /is not allowed/],
+  ];
+  for (const [mutate, expected] of cases) {
+    const allowlist = shipped('t3/allowlist.json');
+    const defaults = shipped('t3/defaults.json');
+    if (mutate.length === 1 && mutate.toString().includes('allowlist.')) mutate(allowlist);
+    else mutate(defaults);
+    const files = mutate.toString().includes('allowlist.')
+      ? { 't3/allowlist.json': JSON.stringify(allowlist) }
+      : { 't3/defaults.json': JSON.stringify(defaults) };
+    const run = runVerifier({ extraFiles: files });
+    assert.equal(run.status, 1, failureOf(run));
+    assert.match(failureOf(run), expected);
+    assert.doesNotMatch(failureOf(run), /Traceback/);
+  }
+});
+
+test('the T3 verifier reports each policy and default mutation without tracebacks', { skip }, () => {
+  const cases = [
+    { file: 't3/allowlist.json', mutate: (value) => { value.top = []; }, expected: /need top, excluded, and keys objects/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.excluded.defaultAutoPull = {}; }, expected: /classifies a server setting as both allowed and excluded/ },
+    { file: 'scripts/fixtures/t3/server-settings-keys.json', mutate: (value) => { value.keys.pop(); }, expected: /server settings keys differ/ },
+    { file: 'scripts/fixtures/t3/server-settings-keys.json', mutate: (value) => { value.verifiedAgainst = 'fixture-version'; }, expected: /fixture and allowlist versions differ/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.verifiedAgainst.t3 = 'fixture-version'; }, expected: /defaults and allowlist versions differ/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.driverEnabledDefaults.codex = 'yes'; }, expected: /driver enabled defaults do not cover/ },
+    { file: 't3/allowlist.json', mutate: (value) => { delete value.drivers.pi; }, expected: /driver policy does not cover/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.drivers = []; }, expected: /driver policy does not cover/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.drivers.pi = {}; }, expected: /driver policy pi needs allowed and excluded lists/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.drivers.pi.excluded.push(value.drivers.pi.allowed[0]); }, expected: /driver policy pi classifies a config key as allowed and excluded/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.drivers.acpRegistry.values.agentId = 'github-copilot-cli'; }, expected: /ACP registry policy must name/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.providerEnvelope = null; }, expected: /provider envelope needs allowed and excluded rules/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.providerEnvelope.excluded.driver = {}; }, expected: /provider envelope classifies a field as allowed and excluded/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.commands = ['copilot', 1]; }, expected: /command allowlist must be a non-empty string list/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.commands = []; }, expected: /command allowlist must be a non-empty string list/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.launchArgs.allowedFlags = ['--other']; }, expected: /launch argument policy needs the reviewed flag/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.launchArgs.pathRoots = 'workspace'; }, expected: /launch argument policy needs the reviewed flag/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.top.defaultAutoPull = { rule: 'future' }; }, expected: /top rule defaultAutoPull has an unsupported shape/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.top.responseStreamingMode.values = [true]; }, expected: /enum responseStreamingMode needs string values/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.top.storageCleanup.keys = []; }, expected: /object rule storageCleanup needs nested keys/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.top.storageCleanup.keys.logsAfterDays = null; }, expected: /object rule storageCleanup.logsAfterDays has an unsupported shape/ },
+    { file: 't3/allowlist.json', mutate: (value) => { value.top.storageCleanup.keys.logsAfterDays.minimum = 0; }, expected: /object rule storageCleanup.logsAfterDays needs valid integer bounds/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances = []; }, expected: /defaults need an instances object/ },
+    { file: 't3/defaults.json', mutate: (value) => { delete value.instances['pi{Workspace}']; }, expected: /defaults must cover the three reviewed workspace provider templates/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'] = 'bad'; }, expected: /defaults claude\{Workspace\} must be an object/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'].config.defaultModelSelection = { model: 'fixture' }; }, expected: /includes a model selection/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'].runtime = 'web'; }, expected: /needs a reviewed runtime name/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'].config = null; }, expected: /defaults claude\{Workspace\}\.config must be an object/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'].envelope = null; }, expected: /defaults claude\{Workspace\}\.envelope must be an object/ },
+    { file: 't3/defaults.json', mutate: (value) => { delete value.instances['claude{Workspace}'].envelope.enabled; }, expected: /defaults claude\{Workspace\}\.envelope needs a driver and boolean enabled field/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.instances['claude{Workspace}'].config.unknownField = true; }, expected: /defaults claude\{Workspace\}\.unknownField is not allowed/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.defaultModelSelection = {}; }, expected: /defaults must not define model selections/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.app = []; }, expected: /defaults app section must be an object/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.app.github = {}; }, expected: /app default github is not an allowed setting/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.app.defaultAutoPull = 'true'; }, expected: /app default defaultAutoPull does not match its allowlist type/ },
+    { file: 't3/defaults.json', mutate: (value) => { value.app.storageCleanup = { newCleanupField: true }; }, expected: /app default storageCleanup does not match its allowlist type/ },
+  ];
+  for (const { file, mutate, expected } of cases) {
+    const value = shipped(file);
+    mutate(value);
+    const run = runVerifier({ extraFiles: { [file]: JSON.stringify(value) } });
+    assert.equal(run.status, 1, failureOf(run));
+    assert.match(failureOf(run), expected);
+    assert.doesNotMatch(failureOf(run), /Traceback/);
+  }
+});
+
+test('the optional T3 contract checker reports synthetic schema failures without reading a local checkout', { skip }, () => {
+  const keys = shipped('scripts/fixtures/t3/server-settings-keys.json').keys;
+  const enabledDefaults = shipped('t3/allowlist.json').driverEnabledDefaults;
+  const schemas = { claudeAgent: 'ClaudeSettings', codex: 'CodexSettings', pi: 'PiSettings', opencode: 'OpenCodeSettings', antigravity: 'AntigravitySettings', acpRegistry: 'AcpRegistrySettings' };
+  const contract = (options = {}) => {
+    const names = options.omit === undefined ? Object.entries(schemas) : Object.entries(schemas).filter(([driver]) => driver !== options.omit);
+    const driverSchemas = names.map(([driver, schema]) => `export const ${schema} = Schema.Struct({\n  enabled: Schema.Boolean.pipe(withDecodingDefault(Effect.succeed(${options.wrongDefault === driver ? !enabledDefaults[driver] : enabledDefaults[driver]}))),\n});`).join('\n');
+    const providers = options.providers === false ? '' : `providers: Schema.Struct({\n    ${options.badProvider ? 'acpRegistry' : 'claudeAgent'}: Schema.Unknown,\n  }).pipe(withDecodingDefault(Effect.succeed({}))),`;
+    return `export const ServerSettings = Schema.Struct({\n${keys.map((key) => `  ${key}: Schema.Unknown,`).join('\n')}\n});\n${driverSchemas}\n${providers}`;
+  };
+  const cases = [
+    { source: contract().replace('ServerSettings = Schema.Struct({', 'Different = Schema.Struct({'), expected: /could not be checked: invalid or unreadable source/ },
+    { source: Buffer.from([0xff]), expected: /could not be checked: invalid or unreadable source/ },
+    { source: contract().replace('  defaultAutoPull: Schema.Unknown,\n', ''), expected: /contract source does not match the reviewed key fixture/ },
+    ...Object.keys(schemas).map((driver) => ({ source: contract({ omit: driver }), expected: new RegExp(`explicit T3 contract source is missing ${schemas[driver]}`) })),
+    ...Object.keys(schemas).map((driver) => ({ source: contract({ wrongDefault: driver }), expected: new RegExp(`explicit T3 contract source changed ${driver} enabled default`) })),
+    { source: contract({ badProvider: true }), expected: /changed the DEFAULT_SERVER_SETTINGS\.providers driver map/ },
+  ];
+  const noLegacyProviderMap = runVerifier({ t3Contract: contract({ providers: false }) });
+  assert.equal(noLegacyProviderMap.status, 0, failureOf(noLegacyProviderMap));
+  for (const { source, expected } of cases) {
+    const run = runVerifier({ t3Contract: source });
+    assert.equal(run.status, 1, failureOf(run));
+    assert.match(failureOf(run), expected);
+    assert.doesNotMatch(failureOf(run), /Traceback/);
+  }
+});
+
+test('the manifest verifier compares settings enums and structural constraints from the shipped schema', { skip }, () => {
+  const schema = shipped('schemas/maxstack.settings.schema.json');
+  schema.properties.runtimes.propertyNames.enum = ['claude', 'copilot', 'opencode', 'changed'];
+  const run = runVerifier({ extraFiles: { 'schemas/maxstack.settings.schema.json': JSON.stringify(schema) } });
+  assert.equal(run.status, 1, failureOf(run));
+  assert.match(failureOf(run), /schema runtime ids differ/);
+});
+
+test('the manifest verifier reports malformed settings schema shapes without a traceback', { skip }, () => {
+  const cases = [
+    [(schema) => { schema.properties.runtimes = []; }, /settings schema runtimes must be an object/],
+    [(schema) => { schema.properties.runtimes.propertyNames.enum = 'claude'; }, /propertyNames must have an enum list/],
+    [(schema) => { schema.properties.runtimes.additionalProperties.properties.cli.enum = 'detect'; }, /SettingsCliModes enum must have an enum list/],
+    [(schema) => { schema.properties.layers.additionalProperties = 'object'; }, /settings schema layer entries must be objects/],
+    [(schema) => { schema.properties.t3.properties = []; }, /settings schema T3 entries need an object properties field/],
+  ];
+  for (const [mutate, expected] of cases) {
+    const schema = shipped('schemas/maxstack.settings.schema.json');
+    mutate(schema);
+    const run = runVerifier({ extraFiles: { 'schemas/maxstack.settings.schema.json': JSON.stringify(schema) } });
+    assert.equal(run.status, 1, failureOf(run));
+    assert.match(failureOf(run), expected);
+    assert.doesNotMatch(failureOf(run), /Traceback/);
+  }
+});
+
+test('the manifest verifier reports invalid UTF-8 settings files without a traceback', { skip }, () => {
+  const run = runVerifier({ extraFiles: { 'schemas/maxstack.settings.schema.json': Buffer.from([0xff]) } });
+  assert.equal(run.status, 1, failureOf(run));
+  assert.match(failureOf(run), /maxstack\.settings\.schema\.json is not valid UTF-8/);
+  assert.doesNotMatch(failureOf(run), /Traceback|UnicodeDecodeError/);
 });
 
 test('the shipped pstack layer is one git source with all four runtimes', { skip }, () => {

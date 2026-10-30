@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "maxstack.settings.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "type": "integer", "const": 1 },
+    "os": { "enum": ["auto", "windows", "macos", "linux"], "default": "auto" },
+    "runtimes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "enum": ["claude", "copilot", "opencode", "pi"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cli": { "enum": ["detect", "install"], "default": "detect" }
+        }
+      }
+    },
+    "layers": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        }
+      }
+    },
+    "t3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cli": { "enum": ["detect", "install"], "default": "detect" },
+        "snapshot": { "type": "boolean", "default": true },
+        "defaults": {
+          "enum": ["leave-alone", "apply-defaults"],
+          "default": "leave-alone"
+        }
+      }
+    }
+  }
+}
