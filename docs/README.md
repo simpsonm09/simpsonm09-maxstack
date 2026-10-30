@@ -11,6 +11,7 @@ Index for this repository.
 - [Current alignment](features/current-alignment.md) records the verified delivery state and the remaining acceptance work against the end goal.
 - [Antigravity skills](features/antigravity.md) documents the opt-in Antigravity runtime and its shared skill ownership.
 - [Codex discovery check](features/codex-discovery-check.md) describes the local marker acceptance tool and its limits.
+- [Copilot Windows PreToolUse bridge](features/copilot-windows-pretool-bridge.md) records the pinned adapter evidence and its test and live-loading limits.
 - [Layout](layout.md) describes every top-level path.
 - [Repository relationships](relationship.md) names the repository ownership, the one cross-repo edge, and the workspace definition.
 - [MCP servers](mcp.md) defines the workspace MCP servers and their default states.
@@ -25,6 +26,7 @@ Index for this repository.
 
 ## Release notes
 
+- [Copilot Windows PreToolUse bridge](release-notes/2026-10-24-copilot-windows-pretool-bridge.md) records the documentation correction and evidence limits.
 - [Copilot workspace instructions](release-notes/2026-10-23-copilot-workspace-instructions.md) describes the offline wrapper projection and keeps live T3 ACP/Copilot consumption explicitly pending.
 - [POSIX installer fixture coverage](release-notes/2026-10-23-posix-installer-fixture-coverage.md) records the existing macOS and Linux fixture lifecycle coverage and keeps live macOS CLI and hook behavior explicitly unverified.
 - [Non-Claude instruction collision](release-notes/2026-10-23-non-claude-claude-instructions-collision.md) records that a user `CLAUDE.md` does not block generated `AGENTS.md` when Claude is not selected.
