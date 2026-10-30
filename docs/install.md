@@ -123,7 +123,6 @@ What each runtime writes:
 - `opencode`: `opencode.jsonc`, `.opencode\plugins`, and the agent profiles.
 - `copilot`: `.maxstack\bin\copilot.cmd` and `copilot.sh`.
 - `pi`: `.maxstack\bin\pi.cmd` and `pi.sh`, and `.pi\agent\settings.json`.
-- `codex`: `.agents\skills` and, when a selected layer has a Codex gate hook, `.codex\config.toml`.
 - `cursor`: `.cursor\skills`, one folder per skill.
 - `codex`: `.agents\skills\<name>\`, one copy of each skill of each selected layer, in layer order. A skill is a folder with a `SKILL.md` whose frontmatter `name` is the folder name and whose `description` is set. Two layers cannot name a skill the same, even by case, and a skill that sets a `model` is refused. When a selected layer ships the Codex gate hook and its OpenCode copy is installed, maxstack also owns `.codex/config.toml` with the `PreToolUse` definition. Existing unowned files are kept. Edited owned files are kept; remove and uninstall delete only unchanged files. The lock records the hook hash for the Codex status check. The installer never reads or writes `CODEX_HOME`, user config, `auth.json`, or a model. The T3 instance uses the fixed marker argument `-c 'project_root_markers=["stack.lock.json"]'`.
 
