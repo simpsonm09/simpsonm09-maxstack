@@ -19,6 +19,18 @@ function check(records) {
   return JSON.parse(result.stdout);
 }
 
+function checkLock(lock) {
+  const source = `import json, sys\nfrom verify_ownership import check_owned\nfailures=[]\ncheck_owned(json.load(sys.stdin), failures)\nprint(json.dumps(failures))\n`;
+  const result = spawnSync(python, ['-B', '-E', '-c', source], {
+    cwd: resolve(repoRoot, 'scripts'),
+    encoding: 'utf8',
+    input: JSON.stringify(lock),
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 const fileHash = 'A'.repeat(64);
 const common = { kind: 'file', sha256: fileHash, layers: ['org-ai-plugin'] };
 
@@ -40,4 +52,31 @@ test('owned record verifier accepts current installer runtime shapes and rejects
   assert.ok(check([badHookHash]).some((failure) => failure.includes('hookHash')));
   assert.ok(check([misplacedHookHash]).some((failure) => failure.includes('hookHash')));
   assert.ok(check([badRuntime]).some((failure) => failure.includes('runtime must be')));
+});
+
+test('check_owned attributes only the exact Windows Pi self-updater path to Pi', () => {
+  const record = {
+    kind: 'file',
+    path: '.maxstack/bin/pi-self-update.mjs',
+    runtime: 'pi',
+    sha256: fileHash,
+    layers: ['org-ai-plugin'],
+  };
+  const syntheticWindowsLock = {
+    ownedSchema: 2,
+    layers: [{ name: 'org-ai-plugin' }],
+    selection: { runtimes: ['claude', 'pi'], layers: ['org-ai-plugin'] },
+    owned: [record],
+  };
+  assert.deepEqual(checkLock(syntheticWindowsLock), []);
+
+  for (const runtime of ['claude', 'copilot']) {
+    const failures = checkLock({ ...syntheticWindowsLock, owned: [{ ...record, runtime }] });
+    assert.ok(failures.some((failure) => failure.includes(`runtime is ${runtime}, but its path belongs to pi`)));
+  }
+
+  for (const path of ['.maxstack/bin/future-updater.mjs', '.maxstack/bin/pi-self-update.mjs.bak']) {
+    const failures = checkLock({ ...syntheticWindowsLock, owned: [{ ...record, path }] });
+    assert.ok(failures.some((failure) => failure.includes('runtime is pi, but its path belongs to None')));
+  }
 });
