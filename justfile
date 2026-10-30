@@ -88,6 +88,10 @@ generate-layers runtime out layers check="":
 verify-pi:
     node scripts/verify-pi-harness.mjs
 
+# Check local Codex project-root marker behavior without a model request. Pass the native Codex executable.
+verify-codex-discovery codex:
+    node scripts/verify-codex-discovery.mjs --codex {{ if os_family() == "windows" { "'" + replace(codex, "'", "''") + "'" } else { quote(codex) } }}
+
 # Run the Biome complexity gate over the repository.
 complexity:
     mise exec -- biome lint .

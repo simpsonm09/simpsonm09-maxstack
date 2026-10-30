@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, writeFileSync, chmodSync, realpathSync, readFileSync, mkdirSync, renameSync, rmSync, statSync, mkdtempSync, appendFileSync, rmdirSync, symlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, chmodSync, realpathSync, readFileSync, mkdirSync, renameSync, rmSync, statSync, mkdtempSync, appendFileSync, rmdirSync, symlinkSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -48,17 +48,38 @@ function fakePiNpm(ctx) {
   mkdirSync(bin);
   const argsLog = join(ctx.base, 'npm-args.txt');
   const fakeScript = join(ctx.base, 'fake-pi-update-npm.mjs');
-  writeFileSync(fakeScript, `import { readFileSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst args = process.argv.slice(2);\nwriteFileSync(process.env.FAKE_NPM_ARGS, JSON.stringify(args));\nconst prefix = args[args.indexOf('--prefix') + 1];\nconst pkg = join(prefix, 'node_modules/@earendil-works/pi-coding-agent/package.json');\nconst old = JSON.parse(readFileSync(pkg, 'utf8'));\nold.version = args.at(-1).split('@').at(-1) === 'latest' ? '1.2.0' : args.at(-1).split('@').at(-1);\nwriteFileSync(pkg, JSON.stringify(old));\n`);
-  if (process.platform === 'win32') writeFileSync(join(bin, 'npm.cmd'), `@echo off\r\n"${process.execPath}" "${fakeScript}" %*\r\n`);
+  writeFileSync(fakeScript, `import { existsSync, readFileSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst args = process.argv.slice(2);\nwriteFileSync(process.env.FAKE_NPM_ARGS, JSON.stringify(args));\nif (process.env.FAKE_NPM_EXIT) process.exit(Number(process.env.FAKE_NPM_EXIT));\nconst prefix = args[args.indexOf('--prefix') + 1];\nconst pkg = join(prefix, 'node_modules/@earendil-works/pi-coding-agent/package.json');\nif (!existsSync(pkg)) process.exit(0);\nconst old = JSON.parse(readFileSync(pkg, 'utf8'));\nold.version = args.at(-1).split('@').at(-1) === 'latest' ? '1.2.0' : args.at(-1).split('@').at(-1);\nwriteFileSync(pkg, JSON.stringify(old));\n`);
+  if (process.platform === 'win32') {
+    writeFileSync(join(bin, 'npm.cmd'), `@echo off\r\n"${process.execPath}" "${fakeScript}" %*\r\nexit /b %ERRORLEVEL%\r\n`);
+    mkdirSync(join(bin, 'node_modules', 'npm', 'bin'), { recursive: true });
+    copyFileSync(fakeScript, join(bin, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+    const posixNpm = join(bin, 'npm');
+    writeFileSync(posixNpm, `#!/bin/sh\nexec node "${fakeScript}" "$@"\n`);
+    chmodSync(posixNpm, 0o755);
+  }
   else {
     const npm = join(bin, 'npm');
     writeFileSync(npm, `#!/bin/sh\nexec "${process.execPath}" "${fakeScript}" "$@"\n`);
     chmodSync(npm, 0o755);
   }
   const env = { ...(ctx.env ?? process.env), FAKE_NPM_ARGS: argsLog };
-  const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
-  env[pathKey] = `${bin}${process.platform === 'win32' ? ';' : ':'}${env[pathKey]}`;
+  const existingPath = Object.entries(env).find(([key]) => key.toUpperCase() === 'PATH')?.[1] ?? '';
+  for (const key of Object.keys(env)) if (key.toUpperCase() === 'PATH') delete env[key];
+  env.PATH = `${bin}${process.platform === 'win32' ? ';' : ':'}${existingPath}`;
   return { env, argsLog };
+}
+
+function assertPiBridgeDispatch(ctx, shPath, bash, npmEnv, argsLog, fake) {
+  const shCases = process.platform === 'win32' ? [['update', '--self']] : [['update', '--self'], ['update'], ['status']];
+  for (const args of shCases) {
+    const result = spawnSync(bash, [shPath, ...args], { windowsHide: true, encoding: 'utf8', env: { ...npmEnv, MAXSTACK_PI_BIN: args.length === 1 ? fake : undefined } });
+    assert.equal(result.status, 0, plainOutput(result));
+    if (args.length === 2) {
+      assert.deepEqual(JSON.parse(readFileSync(argsLog, 'utf8')), ['install', '--prefix', join(ctx.workspace, '.maxstack', 'npm').replaceAll('\\', '/'), '--ignore-scripts', '--no-audit', '--no-fund', '@earendil-works/pi-coding-agent@latest']);
+    } else {
+      assert.match(plainOutput(result), new RegExp(`ARGS=${args.join(' ')}`));
+    }
+  }
 }
 
 withWorkspace('Pi update audit does not invoke npm or change the package', (ctx) => {
@@ -118,12 +139,18 @@ withWorkspace('Pi apply refreshes old wrappers and status is clean', (ctx) => {
   assert.deepEqual(problemRows(runStatus(ctx)), [], 'status found drift after wrapper refresh');
 }, { fixture: { npm: true } });
 
-withWorkspace('Pi wrappers intercept update self and pass plain update through', (ctx) => {
+withWorkspace('Pi wrappers bridge update self to the managed npm package and pass plain update through', (ctx) => {
+  seedPiPackage(ctx);
+  const localBin = join(ctx.workspace, '.maxstack', 'npm', 'node_modules', '.bin');
+  mkdirSync(localBin, { recursive: true });
   let fake;
   if (process.platform === 'win32') {
+    writeFileSync(join(localBin, 'pi.cmd'), '@echo off\r\necho ARGS=%*\r\n');
     fake = join(ctx.base, 'fake-pi-args.cmd');
     writeFileSync(fake, '@echo off\r\necho ARGS=%*\r\n');
   } else {
+    writeFileSync(join(localBin, 'pi'), '#!/bin/sh\nprintf "ARGS=%s\\n" "$*"\n');
+    chmodSync(join(localBin, 'pi'), 0o755);
     fake = join(ctx.base, 'fake-pi-args');
     writeFileSync(fake, '#!/bin/sh\nprintf "ARGS=%s\\n" "$*"\n');
     chmodSync(fake, 0o755);
@@ -131,30 +158,203 @@ withWorkspace('Pi wrappers intercept update self and pass plain update through',
   mustApply(ctx, []);
   const cmdPath = join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd');
   assert.match(readFileSync(cmdPath, 'utf8'), /%~1/);
+  const helperPath = join(ctx.workspace, '.maxstack', 'bin', 'pi-self-update.mjs');
+  assert.ok(existsSync(helperPath), 'the durable Pi updater helper was not installed');
+  assert.match(readFileSync(cmdPath, 'utf8'), /pi-self-update\.mjs/);
+  const piLock = readJson(lockPath(ctx));
+  assert.ok(ownedRecord(piLock, '.maxstack/bin/pi-self-update.mjs', 'file'), 'the lock does not own the updater helper');
+  const { env: npmEnv, argsLog } = fakePiNpm(ctx);
   const bash = findBash();
   assert.ok(bash, 'Git Bash is needed to execute pi.sh');
   const shPath = join(ctx.workspace, '.maxstack', 'bin', 'pi.sh');
   assert.match(readFileSync(shPath, 'utf8'), /\[ "\$2" = --self \]/);
-  const shCases = process.platform === 'win32' ? [['update', '--self']] : [['update', '--self'], ['update'], ['status']];
-  for (const args of shCases) {
-    const result = spawnSync(bash, [shPath, ...args], { windowsHide: true, encoding: 'utf8', env: { ...process.env, MAXSTACK_PI_BIN: fake } });
-    if (args.length === 2) {
-      assert.notEqual(result.status, 0);
-      assert.match(plainOutput(result), /Install-Workspace\.ps1 -UpdatePi -Apply/);
-    } else {
-      assert.equal(result.status, 0, plainOutput(result));
-      assert.match(plainOutput(result), new RegExp(`ARGS=${args.join(' ')}`));
-    }
-  }
+  assertPiBridgeDispatch(ctx, shPath, bash, npmEnv, argsLog, fake);
+  const refused = spawnSync(bash, [shPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: { ...npmEnv, MAXSTACK_PI_BIN: fake } });
+  assert.equal(refused.status, 2, plainOutput(refused));
+  assert.match(plainOutput(refused), /Refusing to update an overridden Pi/);
+  const extra = spawnSync(bash, [shPath, 'update', '--self', '&& touch injected'], { windowsHide: true, encoding: 'utf8', env: npmEnv });
+  assert.equal(extra.status, 2, plainOutput(extra));
+  assert.doesNotMatch(readFileSync(argsLog, 'utf8'), /injected/);
+  const removedPackage = piPackagePath(ctx);
+  const npmLogBeforeRemoval = readFileSync(argsLog, 'utf8');
+  rmSync(removedPackage, { recursive: true, force: true });
+  const missingPackage = spawnSync(bash, [shPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: npmEnv });
+  assert.equal(missingPackage.status, 2, plainOutput(missingPackage));
+  assert.match(plainOutput(missingPackage), /Managed Pi package is missing/);
+  assert.equal(readFileSync(argsLog, 'utf8'), npmLogBeforeRemoval, 'missing package invoked npm');
+  seedPiPackage(ctx);
+  const emptyExtraSh = spawnSync(bash, [shPath, 'update', '--self', ''], { windowsHide: true, encoding: 'utf8', env: npmEnv });
+  assert.equal(emptyExtraSh.status, 2, plainOutput(emptyExtraSh));
+  assert.equal(readFileSync(argsLog, 'utf8'), npmLogBeforeRemoval, 'empty extra argument invoked npm');
+  const noNpmEnv = { ...npmEnv, PATH: '' };
+  const missingNpm = spawnSync(bash, [shPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: noNpmEnv });
+  assert.equal(missingNpm.status, 127, plainOutput(missingNpm));
+  assert.match(plainOutput(missingNpm), /npm was not found on PATH/);
+  const failedNpm = spawnSync(bash, [shPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: { ...npmEnv, FAKE_NPM_EXIT: '19' } });
+  assert.equal(failedNpm.status, 19, plainOutput(failedNpm));
   if (process.platform === 'win32') {
-    const cmd = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: process.env });
-    assert.notEqual(cmd.status, 0);
-    assert.match(plainOutput(cmd), /Install-Workspace\.ps1 -UpdatePi -Apply/);
-    const passed = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update'], { windowsHide: true, encoding: 'utf8', env: process.env });
+    const cmd = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: npmEnv });
+    assert.equal(cmd.status, 0, plainOutput(cmd));
+    const cmdNpmArgs = JSON.parse(readFileSync(argsLog, 'utf8'));
+    cmdNpmArgs[2] = cmdNpmArgs[2].replaceAll('\\', '/');
+    assert.deepEqual(cmdNpmArgs, ['install', '--prefix', join(ctx.workspace, '.maxstack', 'npm').replaceAll('\\', '/'), '--ignore-scripts', '--no-audit', '--no-fund', '@earendil-works/pi-coding-agent@latest']);
+    const plantedCwd = join(ctx.base, 'planted-npm-cwd');
+    const plantedMarker = join(ctx.base, 'planted-npm-marker');
+    mkdirSync(join(plantedCwd, 'node_modules', 'npm', 'bin'), { recursive: true });
+    writeFileSync(join(plantedCwd, 'npm.cmd'), '@echo off\r\nexit /b 0\r\n');
+    writeFileSync(join(plantedCwd, 'node_modules', 'npm', 'bin', 'npm-cli.js'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(plantedMarker)}, 'planted cwd npm ran');\n`);
+    const trustedPathCmd = join(join(npmEnv.PATH.split(';')[0]), 'npm.cmd');
+    assert.ok(existsSync(trustedPathCmd), 'trusted npm PATH stub is missing');
+    const plantedCwdRun = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: npmEnv, cwd: plantedCwd });
+    assert.equal(plantedCwdRun.error, undefined, plantedCwdRun.error?.message);
+    assert.equal(typeof plantedCwdRun.status, 'number', plainOutput(plantedCwdRun));
+    assert.equal(plantedCwdRun.status, 0, plainOutput(plantedCwdRun));
+    assert.equal(existsSync(plantedMarker), false, 'npm from the working directory ran');
+    const trustedNpmArgs = JSON.parse(readFileSync(argsLog, 'utf8'));
+    trustedNpmArgs[2] = trustedNpmArgs[2].replaceAll('\\', '/');
+    assert.deepEqual(trustedNpmArgs, ['install', '--prefix', join(ctx.workspace, '.maxstack', 'npm').replaceAll('\\', '/'), '--ignore-scripts', '--no-audit', '--no-fund', '@earendil-works/pi-coding-agent@latest'], 'trusted PATH npm stub did not run');
+    const failedCmd = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env: { ...npmEnv, FAKE_NPM_EXIT: '19' } });
+    assert.equal(failedCmd.status, 19, plainOutput(failedCmd));
+    const runCmdVerbatim = (extra, env = npmEnv) => {
+      const quotedExtra = extra === null ? '' : ` "${extra.replaceAll('"', '""')}"`;
+      const result = spawnSync('cmd.exe', ['/d', '/s', '/c', `""${cmdPath}" update --self${quotedExtra}"`], {
+        windowsHide: true, encoding: 'utf8', env, windowsVerbatimArguments: true,
+      });
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.equal(typeof result.status, 'number', plainOutput(result));
+      return result;
+    };
+    const extraCmd = runCmdVerbatim('&& echo injected');
+    assert.equal(extraCmd.status, 2, plainOutput(extraCmd));
+    assert.match(plainOutput(extraCmd), /Usage: pi update --self/);
+    const emptyExtraCmd = runCmdVerbatim('');
+    assert.equal(emptyExtraCmd.status, 2, plainOutput(emptyExtraCmd));
+    assert.match(plainOutput(emptyExtraCmd), /Usage: pi update --self/);
+    const npmLogBeforeCmdRemoval = readFileSync(argsLog, 'utf8');
+    rmSync(removedPackage, { recursive: true, force: true });
+    assert.equal(existsSync(join(removedPackage, 'package.json')), false, 'fixture package was not removed');
+    const missingPackageCmd = runCmdVerbatim(null);
+    assert.equal(missingPackageCmd.status, 2, `${plainOutput(missingPackageCmd)}\n${readFileSync(cmdPath, 'utf8')}`);
+    assert.match(plainOutput(missingPackageCmd), /Managed Pi package is missing/);
+    assert.equal(readFileSync(argsLog, 'utf8'), npmLogBeforeCmdRemoval, 'missing package invoked npm');
+    seedPiPackage(ctx);
+    const noNpmEnv = { ...npmEnv };
+    for (const key of Object.keys(noNpmEnv)) if (key.toUpperCase() === 'PATH') delete noNpmEnv[key];
+    const nodeOnly = join(ctx.base, 'node-only-path');
+    mkdirSync(nodeOnly);
+    copyFileSync(process.execPath, join(nodeOnly, 'node.exe'));
+    noNpmEnv.PATH = `${nodeOnly};${join(process.env.SystemRoot ?? 'C:\\Windows', 'System32')}`;
+    const missingNpmCmd = runCmdVerbatim(null, noNpmEnv);
+    assert.equal(missingNpmCmd.status, 127, plainOutput(missingNpmCmd));
+    assert.match(plainOutput(missingNpmCmd), /npm(?:\.cmd)? was not found on PATH/);
+    const hostileMarker = join(ctx.base, 'pi-wrapper-injected-marker');
+    rmSync(hostileMarker, { force: true });
+    const argsBeforeHostile = readFileSync(argsLog, 'utf8');
+    const hostile = runCmdVerbatim(`x"=="" (echo INJ>${hostileMarker}) & rem "`);
+    assert.equal(hostile.status, 2, plainOutput(hostile));
+    assert.match(plainOutput(hostile), /Usage: pi update --self/);
+    assert.equal(readFileSync(argsLog, 'utf8'), argsBeforeHostile, 'quote/ampersand input invoked npm');
+    assert.equal(existsSync(hostileMarker), false, 'a quote/ampersand payload ran a marker command');
+    const overrideCmd = runCmdVerbatim(null, { ...npmEnv, MAXSTACK_PI_BIN: fake });
+    assert.equal(overrideCmd.status, 2, plainOutput(overrideCmd));
+    assert.match(plainOutput(overrideCmd), /Refusing to update an overridden Pi/);
+    const passed = spawnSync('cmd.exe', ['/d', '/s', '/c', `"${cmdPath}" update`], { windowsHide: true, encoding: 'utf8', env: process.env, windowsVerbatimArguments: true });
     assert.equal(passed.status, 0, plainOutput(passed));
     assert.match(plainOutput(passed), /ARGS=update/);
   }
 }, { fixture: { npm: true } });
+
+withWorkspace('external Pi selection refuses update self and names the selected path', (ctx) => {
+  seedPiPackage(ctx);
+  const { env, argsLog } = fakePiNpm(ctx);
+  const external = process.platform === 'win32' ? join(ctx.base, 'external-pi.cmd') : join(ctx.base, 'external-pi');
+  writeFileSync(external, process.platform === 'win32' ? '@echo off\r\necho external\r\n' : '#!/bin/sh\necho external\n');
+  if (process.platform !== 'win32') chmodSync(external, 0o755);
+  const run = runInstaller(shell, ctx, ['-PiCommand', external], { env });
+  assertOk(run, 'external Pi apply failed');
+  const cmdPath = join(ctx.workspace, '.maxstack', 'bin', 'pi.cmd');
+  const shPath = join(ctx.workspace, '.maxstack', 'bin', 'pi.sh');
+  assert.match(readFileSync(cmdPath, 'utf8'), new RegExp(external.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(readFileSync(shPath, 'utf8'), /selected external Pi/);
+  const bash = findBash();
+  assert.ok(bash, 'Git Bash is needed to execute pi.sh');
+  const npmArgsBeforeBridge = readFileSync(argsLog, 'utf8');
+  const refused = spawnSync(bash, [shPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env });
+  assert.equal(refused.status, 2, plainOutput(refused));
+  assert.match(plainOutput(refused), new RegExp(external.replaceAll('\\', '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(readFileSync(argsLog, 'utf8'), npmArgsBeforeBridge, 'external Pi update invoked npm');
+  if (process.platform === 'win32') {
+    const refusedCmd = spawnSync('cmd.exe', ['/d', '/c', cmdPath, 'update', '--self'], { windowsHide: true, encoding: 'utf8', env });
+    assert.equal(refusedCmd.status, 2, plainOutput(refusedCmd));
+    assert.match(plainOutput(refusedCmd), /Refusing to update selected external Pi/);
+    assert.equal(readFileSync(argsLog, 'utf8'), npmArgsBeforeBridge, 'external Pi cmd update invoked npm');
+  }
+}, { fixture: { npm: true } });
+
+if (process.platform === 'win32') {
+  withWorkspace('missing Pi helper remains owned and apply fails closed while status reports it', (ctx) => {
+    const localPi = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const helper = join(ctx.workspace, '.maxstack', 'bin', 'pi-self-update.mjs');
+    rmSync(localPi);
+    rmSync(helper);
+    const apply = runInstaller(shell, ctx, ['-PiCommand', MISSING_PI]);
+    assert.equal(apply.status, 1, plainOutput(apply));
+    assert.match(plainOutput(apply), /helper .* is missing or changed/);
+    assert.match(plainOutput(apply), /status and uninstall can still report it/);
+    assert.ok(ownedRecord(readJson(lockPath(ctx)), '.maxstack/bin/pi-self-update.mjs', 'file'), 'apply dropped helper ownership');
+    const status = runStatus(ctx, ['-PiCommand', MISSING_PI]);
+    assert.ok(statusRows(status).some((row) => row.label === '.maxstack/bin/pi-self-update.mjs' && row.state === 'missing'), plainOutput(status));
+  }, {});
+
+  withWorkspace('modified Pi helper remains owned and apply refuses to overwrite it while Pi is absent', (ctx) => {
+    const localPi = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const helper = join(ctx.workspace, '.maxstack', 'bin', 'pi-self-update.mjs');
+    appendFileSync(helper, '\n// locally modified\n');
+    const changed = readFileSync(helper, 'utf8');
+    rmSync(localPi);
+    const apply = runInstaller(shell, ctx, ['-PiCommand', MISSING_PI]);
+    assert.equal(apply.status, 1, plainOutput(apply));
+    assert.match(plainOutput(apply), /helper .* is missing or changed/);
+    assert.equal(readFileSync(helper, 'utf8'), changed, 'apply overwrote a modified helper');
+    assert.ok(ownedRecord(readJson(lockPath(ctx)), '.maxstack/bin/pi-self-update.mjs', 'file'), 'apply dropped helper ownership');
+    const status = runStatus(ctx, ['-PiCommand', MISSING_PI]);
+    assert.ok(statusRows(status).some((row) => row.label === '.maxstack/bin/pi-self-update.mjs' && row.state === 'modified'), plainOutput(status));
+  }, {});
+
+  withWorkspace('local to external Pi transition cleans only the unchanged owned helper', (ctx) => {
+    const localPi = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const helper = join(ctx.workspace, '.maxstack', 'bin', 'pi-self-update.mjs');
+    const external = join(ctx.base, 'external-pi.cmd');
+    writeFileSync(external, '@echo off\r\necho external\r\n');
+    rmSync(localPi);
+    const transitioned = runInstaller(shell, ctx, ['-PiCommand', external]);
+    assert.equal(transitioned.status, 0, plainOutput(transitioned));
+    assert.match(plainOutput(transitioned), /Removed the stale wrapper .*pi-self-update\.mjs/);
+    assert.equal(existsSync(helper), false, 'unchanged owned helper remained after transition');
+    assert.equal(ownedRecord(readJson(lockPath(ctx)), '.maxstack/bin/pi-self-update.mjs', 'file'), undefined, 'lock retained stale helper ownership');
+  }, {});
+
+  withWorkspace('local to external Pi transition preserves and reports a modified helper', (ctx) => {
+    const localPi = writeLocalPi(ctx);
+    mustApply(ctx, ['-PiCommand', MISSING_PI]);
+    const helper = join(ctx.workspace, '.maxstack', 'bin', 'pi-self-update.mjs');
+    appendFileSync(helper, '\n// locally modified\n');
+    const changed = readFileSync(helper, 'utf8');
+    const external = join(ctx.base, 'external-pi.cmd');
+    writeFileSync(external, '@echo off\r\necho external\r\n');
+    rmSync(localPi);
+    const transitioned = runInstaller(shell, ctx, ['-PiCommand', external]);
+    assert.equal(transitioned.status, 0, plainOutput(transitioned));
+    assert.match(plainOutput(transitioned), /changed since the last apply, so it was not removed/);
+    assert.equal(readFileSync(helper, 'utf8'), changed, 'transition overwrote modified helper');
+    assert.ok(ownedRecord(readJson(lockPath(ctx)), '.maxstack/bin/pi-self-update.mjs', 'file'), 'lock forgot modified helper ownership');
+    const status = runStatus(ctx, ['-PiCommand', external]);
+    assert.ok(statusRows(status).some((row) => row.label === '.maxstack/bin/pi-self-update.mjs' && row.state === 'modified'), plainOutput(status));
+  }, {});
+}
 
 withWorkspace('the Claude runtime uses a platform directory link for local layers and a pinned sparse copy for pstack', (ctx) => {
   mustApply(ctx);
@@ -603,6 +803,9 @@ test('a Pi installed under the workspace is found with none on PATH, and its wra
     const lock = readJson(lockPath(ctx));
     assert.ok(ownedRecord(lock, '.maxstack/bin/pi.cmd', 'file'), 'the lock dropped the Pi wrapper it recorded');
     assert.ok(ownedRecord(lock, '.maxstack/bin/pi.sh', 'file'), 'the lock dropped the Pi script it recorded');
+    if (process.platform === 'win32') {
+      assert.ok(ownedRecord(lock, '.maxstack/bin/pi-self-update.mjs', 'file'), 'the lock dropped the updater helper it recorded');
+    }
   }));
 
   await t.test('(d) status reports the kept wrappers as matching', () => withFreshWorkspace((ctx) => {
@@ -616,6 +819,10 @@ test('a Pi installed under the workspace is found with none on PATH, and its wra
     for (const rows of [withStub, statusRows(run)]) {
       for (const name of ['.maxstack/bin/pi.cmd', '.maxstack/bin/pi.sh']) {
         assert.deepEqual(rows.find((row) => row.label === name), { state: 'matching', label: name }, `${name} is not reported as matching`);
+      }
+      if (process.platform === 'win32') {
+        const helper = '.maxstack/bin/pi-self-update.mjs';
+        assert.deepEqual(rows.find((row) => row.label === helper), { state: 'matching', label: helper }, `${helper} is not reported as matching`);
       }
     }
   }));

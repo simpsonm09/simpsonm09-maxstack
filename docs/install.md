@@ -6,7 +6,7 @@
 
 ## Platforms
 
-Windows is supported. The informational `test-macos` and `test-linux` CI jobs run the same fixture lifecycle for Claude, OpenCode, Copilot, Pi, Codex, Cursor, and Antigravity. They verify installer output, strict status, runtime removal, and uninstall on hosted macOS and Linux; they do not exercise installed CLIs or their hooks. The Windows installer suite also runs the lifecycle fixture in `test-node-shard`. The Codex, Cursor, and Antigravity fixture declarations are opt-in test data; the shipped layers currently declare Claude, OpenCode, Copilot, and Pi only. macOS and Linux installs write only POSIX wrappers (`copilot.sh`, and `pi.sh` when Pi is selected); their lock records own those files and never record `.cmd` wrappers. Windows keeps writing and recording both `.cmd` and `.sh` wrappers. Claude plugin folders use directory symlinks on macOS and Linux and junctions on Windows when shared with OpenCode, with link-safe ownership, hashing, status, replacement, and removal. Windows lock records keep the `junction` kind; POSIX records `symlink`.
+Windows is supported. The `test-macos` and `test-linux` CI jobs run the same fixture lifecycle for Claude, OpenCode, Copilot, Pi, Codex, Cursor, and Antigravity outside the required `test-node` aggregate. Neither uses `continue-on-error`, so a failure makes the workflow run fail. They verify installer output, strict status, runtime removal, and uninstall on hosted macOS and Linux; they do not exercise installed CLIs or their hooks. The Windows installer suite also runs the lifecycle fixture in `test-node-shard`. The Codex, Cursor, and Antigravity fixture declarations are opt-in test data; the shipped layers currently declare Claude, OpenCode, Copilot, and Pi only. macOS and Linux installs write only POSIX wrappers (`copilot.sh`, and `pi.sh` when Pi is selected); their lock records own those files and never record `.cmd` wrappers. Windows keeps writing and recording both `.cmd` and `.sh` wrappers. Claude plugin folders use directory symlinks on macOS and Linux and junctions on Windows when shared with OpenCode, with link-safe ownership, hashing, status, replacement, and removal. Windows lock records keep the `junction` kind; POSIX records `symlink`.
 
 PowerShell 7 is preinstalled on GitHub's hosted macOS runner. On a Mac without `pwsh`, install it with Microsoft's package or, if Homebrew is already installed, run `brew install powershell`. The Homebrew formula is community maintained.
 
@@ -134,9 +134,9 @@ Cursor and Antigravity gate hooks follow the same ownership rule. When a selecte
 
 Any selected layer can declare `"workspaceInstructions": "path/to/file.md"` in its `layer.json`. The path is relative to the layer folder. The file must be regular UTF-8 Markdown, at most 4096 bytes, and cannot be a link or escape the layer folder. Layers without the field add nothing. maxstack joins declared files in layer order, with a generated header and a source marker before each file. The combined file is limited to 8192 bytes. A refusal names the layer. An oversized composition reports its measured size and each layer's contribution.
 
-When no unowned root `AGENTS.md` or `CLAUDE.md` blocks the output, maxstack writes the composition to `AGENTS.md`. It writes a generated `CLAUDE.md` containing `@AGENTS.md` only when Claude is selected. Both files are owned in `stack.lock.json`. The output is generated whenever at least one runtime is selected, even when that runtime is not Claude or OpenCode. OpenCode receives a relative `instructions` entry for `./AGENTS.md` when selected.
+When no unowned root file that this run would write blocks the output, maxstack writes the composition to `AGENTS.md` and, only when Claude is selected, writes a generated `CLAUDE.md` containing `@AGENTS.md`. Thus `AGENTS.md` is a candidate output for every nonempty runtime selection, while `CLAUDE.md` is a candidate only when Claude is selected. Both files are owned in `stack.lock.json`. OpenCode receives a relative `instructions` entry for `./AGENTS.md` when selected.
 
-If either root file exists and is not recorded as maxstack-owned, maxstack keeps it byte for byte and writes the composition to `.maxstack/workspace-instructions.md`. It does not create the other root file. It prints a line naming each kept root file and the fallback path. OpenCode points at the fallback file when selected. Add a reference to that fallback in your own instructions if you need it loaded by another harness.
+If a candidate output exists and is not recorded as maxstack-owned, maxstack keeps it byte for byte and writes the composition to `.maxstack/workspace-instructions.md`. Only candidate outputs can collide: `AGENTS.md` for every nonempty runtime selection and `CLAUDE.md` only when Claude is selected. It does not create a non-candidate root file. It prints a line naming each kept root file and the fallback path. OpenCode points at the fallback file when selected. Add a reference to that fallback in your own instructions if you need it loaded by another harness.
 
 An edited generated file is reported and kept. Apply does not overwrite it. `-Status` reports it as modified. `-Remove` and `-Uninstall` delete only unchanged generated files and keep edited ones in the lock for a later retry. When no selected layer declares instructions, no new file or OpenCode entry is produced. Previously generated files are removed through the same ownership rules.
 
@@ -193,9 +193,14 @@ To test the wrapper without an install, pass a different executable: `-CopilotCo
 
 ### Update Pi
 
-The workspace Pi CLI is managed by npm under `.maxstack/npm`. `pi update --self` cannot update it because Pi does not
-self-update a workspace-local npm dependency. Run the installer from the maxstack checkout to update it to the latest
-version:
+When the selected Pi is the workspace managed copy under `.maxstack/npm`, the generated wrapper handles
+`pi update --self` by asking npm for `@earendil-works/pi-coding-agent@latest` with lifecycle scripts disabled. On
+Windows, `pi.cmd` dispatches this command to the installer-owned Node helper in `.maxstack/bin`; Node validates the
+complete argument vector before starting npm. It
+refuses the command if the managed package has been removed, `MAXSTACK_PI_BIN` overrides the selected Pi, or any extra
+argument (including an empty argument) follows `--self`. When the selected Pi is external or global, the wrapper names
+its path and refuses the update without running npm. Run the installer from the maxstack checkout to audit an update or
+pin a version:
 
   ```powershell
   pwsh -File scripts/Install-Workspace.ps1 -Workspace <workspace> -UpdatePi
@@ -209,6 +214,9 @@ install scripts that are not covered. This is expected because scripts are not r
 initial npm install normally saves a caret range. An exact pin means npm used `save-exact` when the dependency was
 saved, or the range was set explicitly. Updating Pi does not require another installer apply. Its wrapper paths and
 `.pi\agent\settings.json` do not depend on the Pi version.
+
+The wrapper always selects `latest`; use `-PiVersion <version>` with `Install-Workspace.ps1 -UpdatePi -Apply` when you
+need a pinned installer update.
 
 ## Audit and apply
 

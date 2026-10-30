@@ -20,7 +20,7 @@ node scripts/generate-layers.mjs --runtime <claude|copilot|opencode|pi> --out <d
 
 A layer may contain:
 
-- `skills/<skill>/`. Each directory directly under `skills/` is one skill. It must contain a file named exactly `SKILL.md`. The frontmatter `name` must equal the folder name, `description` must be non-empty, and a `model` key is refused because maxstack sets no model. The reader is tolerant. It reads only those three lines, and it does not parse YAML. Dotfiles at the top of `skills/` are ignored. Other loose files there are ignored with a warning. A `node_modules` directory inside a skill is not copied.
+- `skills/<skill>/`. Each directory directly under `skills/` is one skill. It must contain a file named exactly `SKILL.md`. The reader requires a delimited frontmatter block, extracts simple key/value lines, requires `name` to match the folder name and a non-empty `description`, and rejects a `model` key because maxstack sets no model. It is not a YAML parser and does not interpret other keys. Dotfiles at the top of `skills/` are ignored. Other loose files there are ignored with a warning. A `node_modules` directory inside a skill is not copied.
 - `.claude-plugin/plugin.json`, optional. Its `name` must equal the layer name, and it follows the same JSON rules as the fragment.
 - `opencode.fragment.jsonc`, optional. It must be strict JSON whose only key is `mcp`. JSON files may not start with a byte order mark, and their whitespace is only space, tab, CR, and LF. Within the fragment, `mcp.servers` is in the OpenCode V2 shape: `{"type": "local", "command": [...]}` or `{"type": "remote", "url": "..."}`, plus optional `"disabled": true`. Environment and header references are refused. A URL must be `http` or `https`, with no whitespace, no control characters, and no credentials. Duplicate keys are refused.
 
@@ -67,7 +67,7 @@ Known limit: ownership is caller-trusted, not authenticated. A forged record ins
 
 ## Limits
 
-- The generator does not validate, parse, or translate skill frontmatter for any runtime. Each runtime reads its own frontmatter.
+- The generator does not interpret other frontmatter keys or rewrite frontmatter. Harness interpretation of those keys is tracked separately in the [parity matrix](parity-matrix.md#skill-frontmatter-projection-and-interpretation).
 - Nonempty MCP is projected only for OpenCode. Claude, Copilot, and Pi refuse it until their delivery is verified.
 - Instructions, agents, and hooks are not projected.
 - Runtime discovery, installer wiring, and removal of a previous install are not tested here.
