@@ -274,11 +274,13 @@ def owned_runtime(path: str) -> str | None:
         return "claude"
     if path in (".maxstack/bin/copilot.cmd", ".maxstack/bin/copilot.sh"):
         return "copilot"
-    if path.startswith((".maxstack/bin/pi.", ".pi/")):
+    if path == ".maxstack/bin/pi-self-update.mjs" or path.startswith(
+        (".maxstack/bin/pi.", ".pi/")
+    ):
         return "pi"
     if path == ".pstack/pstack-t3-instances.json":
         return "t3-gated-instances"
-    if path in ("AGENTS.md", "CLAUDE.md", ".maxstack/workspace-instructions.md"):
+    if path in ("AGENTS.md", "CLAUDE.md", ".maxstack/workspace-instructions.md", ".maxstack/copilot-instructions/AGENTS.md"):
         return "workspace-instructions"
     return None
 

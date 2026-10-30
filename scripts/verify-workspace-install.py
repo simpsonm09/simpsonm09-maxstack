@@ -342,6 +342,28 @@ def check_copilot(lock: dict, workspace: pathlib.Path, failures: list[str]) -> N
         if name.endswith(".sh"):
             check_shell_bit(path, failures)
 
+    projection = workspace / ".maxstack" / "copilot-instructions" / "AGENTS.md"
+    projected = any(
+        record.get("path") == ".maxstack/copilot-instructions/AGENTS.md"
+        and record.get("runtime") == "workspace-instructions"
+        and not record.get("preserve")
+        for record in lock.get("owned", [])
+    )
+    for name in COPILOT_WRAPPERS:
+        path = bin_dir / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if projected:
+            expected_dir = str(projection.parent)
+            if name.endswith(".sh"):
+                expected_dir = expected_dir.replace("\\", "/")
+                expected_dir = "'" + expected_dir.replace("'", "'\\''") + "'"
+            if "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" not in text or expected_dir not in text:
+                failures.append(f"{path} does not project the owned Copilot AGENTS.md directory {expected_dir}")
+        elif "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" in text:
+            failures.append(f"{path} sets COPILOT_CUSTOM_INSTRUCTIONS_DIRS without an owned instruction projection")
+
     cmd = bin_dir / "copilot.cmd"
     if cmd.is_file():
         text = cmd.read_text(encoding="utf-8")

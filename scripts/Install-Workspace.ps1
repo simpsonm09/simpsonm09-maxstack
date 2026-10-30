@@ -73,6 +73,9 @@ if ($Status -and $namesRequested) { throw '-Status reports the recorded selectio
 if ($Uninstall -and $namesRequested) { throw '-Uninstall removes everything the lock records, so it takes no -Runtimes or -Layers. Use -Remove to name what to remove.' }
 if ($Remove -and -not $namesRequested) { throw '-Remove names what to remove: give -Runtimes or -Layers. Use -Uninstall to remove everything.' }
 $sourceNamed = $PSBoundParameters.ContainsKey('SourceOverrides') -or $PSBoundParameters.ContainsKey('LayerSource')
+function Get-PiNpmSafetyArgs {
+    return @('--ignore-scripts', '--no-audit', '--no-fund')
+}
 if ($UpdatePi -and ($Update -or $Remove -or $Uninstall -or $Status -or $InitSettings -or $namesRequested -or $sourceNamed -or $Check -or $Strict -or $PSBoundParameters.ContainsKey('LayersFile') -or $PSBoundParameters.ContainsKey('PiCommand') -or $PSBoundParameters.ContainsKey('CopilotCommand'))) { throw '-UpdatePi only accepts -Workspace, optional -PiVersion, and optional -Apply.' }
 if ($PiVersion -and -not $UpdatePi) { throw '-PiVersion applies only to -UpdatePi.' }
 if ($UpdatePi) {
@@ -90,17 +93,19 @@ if ($UpdatePi) {
     $before = $piPackage.version
     Write-Host "Pi version before: $before"
     $packageSpec = '@earendil-works/pi-coding-agent@' + $(if ($PiVersion) { $PiVersion } else { 'latest' })
-    Write-Host "Would run: npm install --prefix $piPrefix --ignore-scripts --no-audit --no-fund $packageSpec"
+    $piNpmSafetyArgs = Get-PiNpmSafetyArgs
+    Write-Host "Would run: npm install --prefix $piPrefix $($piNpmSafetyArgs -join ' ') $packageSpec"
     if (-not $Apply) {
         Write-Host 'Audit only. No files or workspace configuration changed. Rerun with -UpdatePi -Apply after reviewing.'
         return
     }
-    & npm install --prefix $piPrefix --ignore-scripts --no-audit --no-fund $packageSpec
+    & npm install --prefix $piPrefix @piNpmSafetyArgs $packageSpec
     if ($LASTEXITCODE -ne 0) { throw "npm install failed in $piPrefix" }
     $after = (Get-Content -LiteralPath $piManifest -Raw | ConvertFrom-Json).version
     Write-Host "Pi version after: $after"
     return
 }
+
 if (($Status -or $Remove -or $Uninstall) -and $sourceNamed) { throw '-Source sets a layer source for an apply or an audit. -Status, -Remove, and -Uninstall read the recorded sources.' }
 if ($Update -and ($Remove -or $Uninstall -or $Status)) { throw '-Update re-resolves the recorded sources. It is not -Remove, -Uninstall, or -Status.' }
 if ($Update -and $sourceNamed) { throw '-Update re-resolves the recorded sources. Set a source with -Source and an apply, then -Update.' }
@@ -161,7 +166,7 @@ $retiredOpenCodeFolders = @('pstack-opencode')
 # each record's runtime and layers, which -Remove and -Uninstall need to pick the records to delete.
 $ownedSchemaVersion = 2
 # File outputs whose creation state is recorded for uninstall. Config and Pi settings can also have backups.
-$replacedFileNames = @('opencode.jsonc', '.pi/agent/settings.json', 'AGENTS.md', 'CLAUDE.md', '.maxstack/workspace-instructions.md', '.pstack/pstack-t3-instances.json', '.codex/config.toml', '.cursor/hooks.json', '.agents/hooks.json')
+$replacedFileNames = @('opencode.jsonc', '.pi/agent/settings.json', 'AGENTS.md', 'CLAUDE.md', '.maxstack/workspace-instructions.md', '.maxstack/copilot-instructions/AGENTS.md', '.pstack/pstack-t3-instances.json', '.codex/config.toml', '.cursor/hooks.json', '.agents/hooks.json')
 
 # The text an installed profile holds once its model line is removed, or $null when the profile
 # has no frontmatter, which leaves the copy as it is.
@@ -386,6 +391,7 @@ function Get-WorkspaceInstructionPlan {
     if ($ValidateOnly) { return [pscustomobject]@{ text = $composed; files = @(); sourceLayers = @($sources | ForEach-Object { $_.layer }) } }
     $collisionNames = @()
     foreach ($name in @('AGENTS.md', 'CLAUDE.md')) {
+        if ((Test-OrdinalEqual $name 'CLAUDE.md') -and -not (Test-OrdinalIn 'claude' $SelectedRuntimes)) { continue }
         $path = Join-MaxstackPath $Workspace $name
         if (-not (Test-Path -LiteralPath $path)) { continue }
         $record = Get-PriorWorkspaceInstructionRecord $name
@@ -409,6 +415,9 @@ function Get-WorkspaceInstructionPlan {
     $files.Add([pscustomobject]@{ path = $instructionPath; text = $instructionText; runtime = $script:WorkspaceInstructionRuntime; layers = @($sources | ForEach-Object { $_.layer }) })
     if ((Test-OrdinalIn 'claude' $SelectedRuntimes) -and $collisionNames.Count -eq 0) {
         $files.Add([pscustomobject]@{ path = 'CLAUDE.md'; text = $script:WorkspaceClaudeHeader + "@AGENTS.md`n"; runtime = $script:WorkspaceInstructionRuntime; layers = @($sources | ForEach-Object { $_.layer }) })
+    }
+    if (Test-OrdinalIn 'copilot' $SelectedRuntimes) {
+        $files.Add([pscustomobject]@{ path = '.maxstack/copilot-instructions/AGENTS.md'; text = $composed; runtime = $script:WorkspaceInstructionRuntime; layers = @($sources | ForEach-Object { $_.layer }) })
     }
     foreach ($file in $files) {
         $full = Join-MaxstackPath $Workspace (ConvertTo-MaxstackPath $file.path)
@@ -1323,58 +1332,74 @@ function Assert-QuotablePath {
     }
 }
 
+function Assert-CopilotInstructionDirectory {
+    param([string] $Path)
+
+    Assert-QuotablePath @($Path)
+    if ($Path.Contains(',')) { throw "Copilot instruction directory '$Path' contains a comma, which is ambiguous in COPILOT_CUSTOM_INSTRUCTIONS_DIRS." }
+    if ($Path.Contains('!')) { throw "Copilot instruction directory '$Path' contains '!', which cmd delayed expansion can remove. Rename the workspace directory and rerun." }
+}
+
 # The Windows wrapper. A .cmd or .bat executable must run through call, or cmd.exe
 # would end this script after it returns.
 function New-CopilotCmdText {
-    param([string] $Executable, [string[]] $PluginDirs)
+    param([string] $Executable, [string[]] $PluginDirs, [string] $InstructionDirectory)
 
     Assert-QuotablePath (@($Executable) + @($PluginDirs))
+    if ($InstructionDirectory) { Assert-CopilotInstructionDirectory $InstructionDirectory }
     $plugins = @($PluginDirs | ForEach-Object { " --plugin-dir ""$_""" }) -join ''
     $invoke = if (Test-OrdinalIn ([IO.Path]::GetExtension($Executable)) @('.cmd', '.bat')) { 'call ' } else { '' }
-    $lines = @(
-        '@echo off',
-        'rem Generated by scripts\Install-Workspace.ps1. Rerun the installer instead of editing this file.',
-        'rem Starts the GitHub Copilot CLI with the workspace plugin folders, in layer order.',
-        'rem T3 has no one to answer a hook confirmation, so the org gate ask is allowed here.',
-        'rem Denials and the repo access level still apply. A plain copilot keeps the prompt.',
-        'set "AGENT_ACCESS_COPILOT_ASK=allow"',
-        "$invoke""$Executable""$plugins %*"
-    )
-    return (($lines -join "`r`n") + "`r`n")
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @('@echo off', 'rem Generated by scripts\Install-Workspace.ps1. Rerun the installer instead of editing this file.', 'rem Starts the GitHub Copilot CLI with the workspace plugin folders, in layer order.', 'rem T3 has no one to answer a hook confirmation, so the org gate ask is allowed here.', 'rem Denials and the repo access level still apply. A plain copilot keeps the prompt.', 'set "AGENT_ACCESS_COPILOT_ASK=allow"')) { $lines.Add($line) }
+    if ($InstructionDirectory) {
+        $lines.Add('if defined COPILOT_CUSTOM_INSTRUCTIONS_DIRS set "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=%COPILOT_CUSTOM_INSTRUCTIONS_DIRS%,' + $InstructionDirectory + '"')
+        $lines.Add('if not defined COPILOT_CUSTOM_INSTRUCTIONS_DIRS set "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=' + $InstructionDirectory + '"')
+    }
+    $lines.Add("$invoke""$Executable""$plugins %*")
+    return (($lines.ToArray() -join "`r`n") + "`r`n")
 }
 
 # The POSIX wrapper. It runs the copilot that PATH finds, with the same plugin folders,
 # using forward slashes so Git Bash passes them to the Windows executable as written.
 function New-CopilotShText {
-    param([string[]] $PluginDirs)
+    param([string[]] $PluginDirs, [string] $InstructionDirectory)
 
     Assert-QuotablePath $PluginDirs
+    if ($InstructionDirectory) { Assert-CopilotInstructionDirectory $InstructionDirectory }
     $plugins = @($PluginDirs | ForEach-Object { ' --plugin-dir "' + ($_ -replace '\\', '/') + '"' }) -join ''
     $reference = if ($IsWindows) { ' See copilot.cmd.' } else { '' }
-    $lines = @(
-        '#!/bin/sh',
-        '# Generated by scripts/Install-Workspace.ps1. Rerun the installer instead of editing this file.',
-        ('# Starts the GitHub Copilot CLI with the workspace plugin folders, in layer order.' + $reference),
-        'export AGENT_ACCESS_COPILOT_ASK=allow',
-        'command -v copilot >/dev/null 2>&1 || { echo "copilot is not on PATH" >&2; exit 127; }',
-        ('exec copilot' + $plugins + ' "$@"')
-    )
-    return (($lines -join "`n") + "`n")
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @('#!/bin/sh', '# Generated by scripts/Install-Workspace.ps1. Rerun the installer instead of editing this file.', ('# Starts the GitHub Copilot CLI with the workspace plugin folders, in layer order.' + $reference), 'export AGENT_ACCESS_COPILOT_ASK=allow')) { $lines.Add($line) }
+    if ($InstructionDirectory) {
+        $escaped = $InstructionDirectory.Replace('\', '/').Replace("'", "'\''")
+        $lines.Add('export COPILOT_CUSTOM_INSTRUCTIONS_DIRS="${COPILOT_CUSTOM_INSTRUCTIONS_DIRS:+${COPILOT_CUSTOM_INSTRUCTIONS_DIRS},}"' + "'$escaped'")
+    }
+    $lines.Add('command -v copilot >/dev/null 2>&1 || { echo "copilot is not on PATH" >&2; exit 127; }')
+    $lines.Add('exec copilot' + $plugins + ' "$@"')
+    return (($lines.ToArray() -join "`n") + "`n")
 }
 
 # The Windows Pi wrapper. It sets the workspace agent folder, so Pi's settings there load the
 # layers, and runs the Pi CLI found at install time. MAXSTACK_PI_BIN names another at run time.
 function New-PiCmdText {
-    param([string] $Executable, [string] $AgentDir)
+    param([string] $Executable, [string] $AgentDir, [string] $NpmPrefix, [bool] $PiLocal)
 
-    Assert-QuotablePath @($Executable, $AgentDir)
+    Assert-QuotablePath @($Executable, $AgentDir, $NpmPrefix)
+    $updateAction = [System.Collections.Generic.List[string]]::new()
+    if ($PiLocal) {
+        $updateAction.Add('node "%~dp0pi-self-update.mjs" %*')
+        $updateAction.Add('exit /b %ERRORLEVEL%')
+    } else {
+        $updateAction.Add(('echo Refusing to update selected external Pi at "{0}"; only the managed workspace local Pi can use update --self. 1>&2' -f $Executable))
+        $updateAction.Add('exit /b 2')
+    }
     $lines = @(
         '@echo off',
         'rem Generated by scripts\Install-Workspace.ps1. Rerun the installer instead of editing this file.',
         'rem Starts Pi with the workspace agent folder, so its settings load the pstack, org, and personal layers.',
         'rem T3 has no one to answer a hook confirmation, so the org gate ask is allowed here.',
         'rem Denials and the repo access level still apply. A plain pi keeps the prompt.',
-        'if "%~1"=="update" if "%~2"=="--self" (echo Workspace Pi is updated with Install-Workspace.ps1 -UpdatePi -Apply. 1>&2& exit /b 1)',
+        'if "%~1"=="update" if "%~2"=="--self" goto update_pi',
         ('set "PI_CODING_AGENT_DIR={0}"' -f $AgentDir),
         'set "AGENT_ACCESS_PI_ASK=allow"',
         ('set "PI_BIN={0}"' -f $Executable),
@@ -1385,8 +1410,11 @@ function New-PiCmdText {
         '"%PI_BIN%" %*',
         'exit /b %ERRORLEVEL%',
         ':call_pi',
-        'call "%PI_BIN%" %*'
+        'call "%PI_BIN%" %*',
+        'exit /b %ERRORLEVEL%',
+        ':update_pi'
     )
+    $lines += $updateAction.ToArray()
     return (($lines -join "`r`n") + "`r`n")
 }
 
@@ -1406,9 +1434,11 @@ function Assert-ShellPath {
 # The POSIX Pi wrapper. It runs the Pi the installer found in the workspace when there is one, and otherwise the pi that
 # PATH finds at run time. MAXSTACK_PI_BIN names another in both cases.
 function New-PiShText {
-    param([string] $AgentDir, [string] $LocalExecutable = '')
+    param([string] $AgentDir, [string] $LocalExecutable = '', [string] $NpmPrefix, [bool] $PiLocal, [string] $SelectedExecutable)
 
-    Assert-ShellPath @($AgentDir)
+    Assert-ShellPath @($AgentDir, $NpmPrefix)
+    Assert-ShellPath @($SelectedExecutable)
+    $safeArgs = (Get-PiNpmSafetyArgs) -join ' '
     $resolve = 'pi_bin="${MAXSTACK_PI_BIN:-$(command -v pi 2>/dev/null)}"'
     if ($LocalExecutable) {
         # A closing brace would end the ${...} parameter expansion early, so it is refused on its own.
@@ -1417,11 +1447,26 @@ function New-PiShText {
         $resolve = 'pi_bin="${MAXSTACK_PI_BIN:-' + ($LocalExecutable -replace '\\', '/') + '}"'
     }
     $reference = if ($IsWindows) { ' See pi.cmd.' } else { '' }
+    if ($PiLocal) {
+        $updateAction = (@(
+            '  [ "$#" -eq 2 ] || { echo "Usage: pi update --self" >&2; exit 2; } # ordinal-ok: POSIX shell argument count is numeric ASCII',
+            '  [ -z "${MAXSTACK_PI_BIN:-}" ] || { echo "MAXSTACK_PI_BIN is set. Refusing to update an overridden Pi; selected local Pi: __SELECTED__" >&2; exit 2; }',
+            '  [ -f "__PREFIX__/node_modules/@earendil-works/pi-coding-agent/package.json" ] || { echo "Managed Pi package is missing at __PREFIX__. Refusing to create a new install." >&2; exit 2; }',
+            '  command -v npm >/dev/null 2>&1 || { echo "npm was not found on PATH. Refusing to update selected local Pi: __SELECTED__" >&2; exit 127; }',
+            '  npm install --prefix "__PREFIX__" __SAFE_ARGS__ @earendil-works/pi-coding-agent@latest',
+            '  exit $?'
+        ) -join "`n")
+        $updateAction = $updateAction -replace '__PREFIX__', ($NpmPrefix -replace '\\', '/') -replace '__SAFE_ARGS__', $safeArgs -replace '__SELECTED__', ($SelectedExecutable -replace '\\', '/')
+    } else {
+        $updateAction = '  echo "Refusing to update selected external Pi at __SELECTED__; only the managed workspace local Pi can use update --self." >&2; exit 2' -replace '__SELECTED__', ($SelectedExecutable -replace '\\', '/')
+    }
     $lines = @(
         '#!/bin/sh',
         '# Generated by scripts/Install-Workspace.ps1. Rerun the installer instead of editing this file.',
         ('# Starts Pi with the workspace agent folder, so its settings load the pstack, org, and personal layers.' + $reference),
-        'if [ "$#" -ge 2 ] && [ "$1" = update ] && [ "$2" = --self ]; then echo "Workspace Pi is updated with Install-Workspace.ps1 -UpdatePi -Apply." >&2; exit 1; fi',
+        'if [ "$#" -ge 2 ] && [ "$1" = update ] && [ "$2" = --self ]; then',
+        $updateAction,
+        'fi',
         ('export PI_CODING_AGENT_DIR="' + ($AgentDir -replace '\\', '/') + '"'),
         'export AGENT_ACCESS_PI_ASK=allow',
         $resolve,
@@ -1909,6 +1954,8 @@ function Get-OwnedPlan {
         [string] $CopilotShText,
         [string] $PiCmdText,
         [string] $PiShText,
+        [string] $PiUpdaterText,
+        $PiUpdaterPreserveRecord,
         $PiSettings,
         [bool] $PiPending,
         [hashtable] $PiUnknown,
@@ -1988,8 +2035,10 @@ function Get-OwnedPlan {
     }
     if ($PiCmdText) {
         if ($IsWindows) { $records.Add((New-OwnedRecord -Path '.maxstack/bin/pi.cmd' -Kind 'file' -Sha256 (Get-TextSha256 $PiCmdText) -Runtime 'pi')) }
+        if ($IsWindows -and $PiUpdaterText) { $records.Add((New-OwnedRecord -Path '.maxstack/bin/pi-self-update.mjs' -Kind 'file' -Sha256 (Get-TextSha256 $PiUpdaterText) -Runtime 'pi')) }
         $records.Add((New-OwnedRecord -Path '.maxstack/bin/pi.sh' -Kind 'file' -Sha256 (Get-TextSha256 $PiShText) -Runtime 'pi'))
     }
+    if ($null -ne $PiUpdaterPreserveRecord) { $records.Add($PiUpdaterPreserveRecord) }
 
     foreach ($skill in $CodexSkills) {
         $skillSha = if (Test-IsTrue (Get-Field $skill 'preserve')) { $skill.prior.sha256 } else { $skill.sha256 }
@@ -2277,7 +2326,7 @@ function Remove-FolderExtras {
 # The directories an install may create, named relative to the workspace. An apply reads this list
 # before and after its writes, to tell what it created from what was there first.
 function Get-InstallerDirectories {
-    param([object[]] $Layers, [switch] $Codex, [switch] $Cursor)
+    param([object[]] $Layers, [switch] $Codex, [switch] $Cursor, [switch] $CopilotInstructions)
 
     $dirs = [System.Collections.Generic.List[string]]::new()
     foreach ($dir in @('.claude', '.claude/plugins', '.claude/cache', '.opencode', '.opencode/plugins', '.opencode/agents', '.maxstack', '.maxstack/bin', '.pi', '.pi/agent', '.pstack')) {
@@ -2285,6 +2334,7 @@ function Get-InstallerDirectories {
     }
     if ($Codex) { $dirs.Add('.agents'); $dirs.Add('.agents/skills'); $dirs.Add('.codex') }
     if ($Cursor) { $dirs.Add('.cursor'); $dirs.Add('.cursor/skills') }
+    if ($CopilotInstructions) { $dirs.Add('.maxstack/copilot-instructions') }
     foreach ($layer in $Layers) {
         $dirs.Add(".claude/plugins/$($layer.name)")
         $dirs.Add(".claude/cache/$($layer.name)")
@@ -3594,7 +3644,7 @@ foreach ($layer in $layers) {
 # Before any write, an apply records what already exists: the directories an install may create, the
 # settings file, and its Pi keys. The ownership record then tells the paths this install created from
 # the paths that were there first, so an uninstall never removes what it did not create.
-$installerDirs = @(Get-InstallerDirectories -Layers $layers -Codex:($codexSelected -or $antigravitySelected) -Cursor:$cursorSelected)
+$installerDirs = @(Get-InstallerDirectories -Layers $layers -Codex:($codexSelected -or $antigravitySelected) -Cursor:$cursorSelected -CopilotInstructions:$copilotSelected)
 if ($Apply -and $null -ne $t3Report -and (Test-OrdinalEqual $t3Report.sourceState 'present')) { $installerDirs += @('.maxstack', '.maxstack/t3') }
 $existedBefore = @()
 $existedBeforeFiles = @()
@@ -3693,6 +3743,11 @@ foreach ($layer in @($layers | Where-Object { $null -ne $_.url })) { $layer.root
 # Validate and compose layer instructions before any workspace file is written.
 $workspaceInstructionPlan = Get-WorkspaceInstructionPlan -Layers $layers -SelectedRuntimes $selectedRuntimes
 $workspaceInstructionFiles = @($workspaceInstructionPlan.files)
+$copilotInstructionDirectory = $null
+if ($copilotSelected -and $workspaceInstructionPlan.text) {
+    $copilotInstructionDirectory = Join-MaxstackPath $Workspace '.maxstack/copilot-instructions'
+    Assert-CopilotInstructionDirectory $copilotInstructionDirectory
+}
 $t3InstancesPlan = Get-T3InstancesPlan -Layers $layers -SelectedLayers $selectedLayers -Settings $workspaceSettings
 if ($removing) { $t3InstancesPlan = $null }
 
@@ -3733,8 +3788,8 @@ $copilotShText = $null
 $copilotKept = $false
 $skippedRuntimeWrappers = [System.Collections.Generic.List[object]]::new()
 if ($copilotExecutable) {
-    $copilotCmdText = New-CopilotCmdText -Executable $copilotExecutable -PluginDirs $copilotDirs
-    $copilotShText = New-CopilotShText -PluginDirs $copilotDirs
+    $copilotCmdText = New-CopilotCmdText -Executable $copilotExecutable -PluginDirs $copilotDirs -InstructionDirectory $copilotInstructionDirectory
+    $copilotShText = New-CopilotShText -PluginDirs $copilotDirs -InstructionDirectory $copilotInstructionDirectory
 } elseif ($copilotLayers.Count -gt 0) {
     # Without a Copilot on this run, the wrappers the lock records stay as they are on disk, as the Pi wrappers do.
     $copilotKeptPair = Get-KeptWrapperPair '.maxstack/bin/copilot.cmd' '.maxstack/bin/copilot.sh'
@@ -3766,10 +3821,28 @@ $piExecutable = if ($piLayers.Count -gt 0) { Find-PiExecutable } else { $null }
 $piLocal = [bool]$piExecutable -and (Test-OrdinalEqual (Split-Path -Parent $piExecutable) $piLocalBinTarget)
 $piCmdText = $null
 $piShText = $null
+$piUpdaterText = $null
+$piUpdaterPreserveRecord = $null
+$piUpdaterRemoveStale = $false
 $piKept = $false
 if ($piExecutable) {
-    $piCmdText = New-PiCmdText -Executable $piExecutable -AgentDir $piAgentDir
-    $piShText = New-PiShText -AgentDir $piAgentDir -LocalExecutable $(if ($piLocal) { $piExecutable } else { '' })
+    $piNpmPrefix = Join-MaxstackPath $Workspace '.maxstack/npm'
+    $piCmdText = New-PiCmdText -Executable $piExecutable -AgentDir $piAgentDir -NpmPrefix $piNpmPrefix -PiLocal $piLocal
+    if ($IsWindows -and $piLocal) { $piUpdaterText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-self-update.mjs')) }
+    $piShText = New-PiShText -AgentDir $piAgentDir -LocalExecutable $(if ($piLocal) { $piExecutable } else { '' }) -NpmPrefix $piNpmPrefix -PiLocal $piLocal -SelectedExecutable $piExecutable
+    if ($IsWindows -and -not $piLocal) {
+        $helperRelative = '.maxstack/bin/pi-self-update.mjs'
+        $helperRecord = Get-PriorOwnedFileRecord $helperRelative
+        if ($null -ne $helperRecord) {
+            $helperPath = Join-MaxstackPath $Workspace $helperRelative
+            if (Test-RecordedFile -Full $helperPath -Sha256 $helperRecord.sha256) {
+                $piUpdaterRemoveStale = $true
+            } else {
+                Write-Warning "Kept ${helperPath}: it changed since the last apply, so it was not removed during the external Pi transition."
+                $piUpdaterPreserveRecord = [pscustomobject]@{ path = $helperRecord.path; kind = $helperRecord.kind; sha256 = $helperRecord.sha256; runtime = $helperRecord.runtime; layers = @($helperRecord.layers); preserve = $true }
+            }
+        }
+    }
 } elseif ($piLayers.Count -gt 0) {
     # Without a Pi on this run, the wrappers the lock records stay as they are on disk, so this run never rewrites or
     # removes them and the lock keeps recording them.
@@ -3778,6 +3851,15 @@ if ($piExecutable) {
     if ($piKept) {
         $piCmdText = $piKeptPair.cmd
         $piShText = $piKeptPair.sh
+        $helperPath = Join-MaxstackPath $Workspace '.maxstack/bin/pi-self-update.mjs'
+        $helperRecord = Get-PriorOwnedFileRecord '.maxstack/bin/pi-self-update.mjs'
+        if ($IsWindows -and $null -ne $helperRecord -and (Test-Path -LiteralPath $helperPath -PathType Leaf) -and (Test-OrdinalEqual (Get-FileHash -LiteralPath $helperPath -Algorithm SHA256).Hash $helperRecord.sha256)) {
+            $piUpdaterText = [IO.File]::ReadAllText($helperPath)
+        } elseif ($IsWindows -and $null -ne $helperRecord) {
+            Write-Warning "Kept Pi updater ownership for ${helperPath}: the helper is missing or changed, so status and uninstall can still report it."
+            $piUpdaterPreserveRecord = [pscustomobject]@{ path = $helperRecord.path; kind = $helperRecord.kind; sha256 = $helperRecord.sha256; runtime = $helperRecord.runtime; layers = @($helperRecord.layers); preserve = $true }
+            if ($Apply) { throw "Pi updater helper $helperPath is missing or changed. Restore the recorded helper before applying while Pi is unavailable." }
+        }
     }
     $notFound = "no '$PiCommand' application outside .maxstack\bin, and no pi under $piLocalBinTarget"
     if ($piKept) {
@@ -3901,7 +3983,7 @@ $plan = @()
 if ($Apply -or $removing -or $updating -or ($null -ne $priorOwned)) {
     $plan = Get-OwnedPlan -Document $document -Layers $layers -ClaudeRecords $claudeRecords -OpenCodeLayers $openCodeLayers `
         -OpenCodeSpecs $openCodeSpecs -CopilotCmdText $copilotCmdText -CopilotShText $copilotShText `
-        -PiCmdText $piCmdText -PiShText $piShText -PiSettings $piSettings -PiPending $piPending -PiUnknown $piUnknown `
+        -PiCmdText $piCmdText -PiShText $piShText -PiUpdaterText $piUpdaterText -PiUpdaterPreserveRecord $piUpdaterPreserveRecord -PiSettings $piSettings -PiPending $piPending -PiUnknown $piUnknown `
         -CodexSkills $codexSkills -SkillRuntimeClaims @(if ($codexSelected) { 'codex' }; if ($antigravitySelected) { 'antigravity' }) `
         -CursorSkills $cursorSkills -WorkspaceInstructionFiles $workspaceInstructionFiles -AgentHookPlans $agentHookPlans
     if ($null -ne $t3InstancesPlan) { $plan += [pscustomobject]@{ path = $t3InstancesPlan.path; kind = 'file'; sha256 = $t3InstancesPlan.sha256; runtime = $t3InstancesPlan.runtime; layers = @($t3InstancesPlan.layers); preserve = $t3InstancesPlan.preserve } }
@@ -4265,6 +4347,11 @@ if ($piKept) {
     New-Item -ItemType Directory -Path $copilotBinTarget -Force | Out-Null
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     if ($IsWindows) { [IO.File]::WriteAllText($piCmdTarget, $piCmdText, $utf8) }
+    if ($IsWindows -and $piUpdaterText) { [IO.File]::WriteAllText((Join-MaxstackPath $Workspace '.maxstack/bin/pi-self-update.mjs'), $piUpdaterText, $utf8) }
+    if ($IsWindows -and $piUpdaterRemoveStale) {
+        $staleUpdaterPath = Join-MaxstackPath $Workspace '.maxstack/bin/pi-self-update.mjs'
+        Remove-WrapperIfRecorded -Path $staleUpdaterPath
+    }
     [IO.File]::WriteAllText($piShTarget, $piShText, $utf8)
     Set-ShellExecutable $piShTarget
     if ($IsWindows) { Write-Host "Wrote $piCmdTarget and $piShTarget" } else { Write-Host "Wrote $piShTarget" }

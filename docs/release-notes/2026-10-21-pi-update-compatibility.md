@@ -1,0 +1,3 @@
+# Pi update compatibility
+
+The generated Pi wrapper handles `pi update --self` for a selected managed local Pi by asking npm for the latest workspace package with lifecycle scripts disabled. On Windows, the thin command wrapper delegates validation to an installer-owned Node helper that checks the complete argument vector. It refuses when the package has disappeared, an external Pi is selected, `MAXSTACK_PI_BIN` overrides the selection, npm is missing, or any extra argument, including an empty argument, follows `--self`. Use `Install-Workspace.ps1 -UpdatePi -Apply` to update the managed package, or add `-PiVersion <version>` to pin it.

@@ -33,11 +33,11 @@ function nativeFromShim(shim) {
   return null;
 }
 
-function resolveCommand(command) {
+export function resolveCommand(command, pathValue = process.env.PATH ?? '') {
   if (process.platform !== 'win32') return command;
   const candidates = isAbsolute(command) || command.includes('/') || command.includes('\\')
     ? [command]
-    : (process.env.PATH ?? '').split(delimiter).filter(Boolean).flatMap((directory) =>
+    : pathValue.split(delimiter).filter(Boolean).flatMap((directory) =>
       ['.exe', '.cmd', '.bat', ''].map((extension) => join(directory, command + extension)));
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
